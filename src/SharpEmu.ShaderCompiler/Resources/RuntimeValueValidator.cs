@@ -32,15 +32,16 @@ public sealed class RuntimeValueValidator
         ScalarOperation.BitFieldInsert or ScalarOperation.BitFieldUExtract or ScalarOperation.BitFieldSExtract or
         ScalarOperation.IAdd32 or ScalarOperation.IAdd64 or ScalarOperation.AddCarry32 or
         ScalarOperation.ISub32 or ScalarOperation.ISub64 or ScalarOperation.IMul32 or ScalarOperation.IMul64 or
-        ScalarOperation.UMin32 or ScalarOperation.SMin32 or ScalarOperation.SMax32 or
+        ScalarOperation.UMin32 or ScalarOperation.SMin32 or ScalarOperation.SMax32 or ScalarOperation.UMulHi32 or
         ScalarOperation.ShiftLeft32 or ScalarOperation.ShiftLeft64 or
         ScalarOperation.ShiftRightLogical32 or ScalarOperation.ShiftRightLogical64 or
         ScalarOperation.ShiftRightArithmetic32 or ScalarOperation.ShiftRightArithmetic64 or
         ScalarOperation.And32 or ScalarOperation.And64 or ScalarOperation.Or32 or ScalarOperation.Xor32 or ScalarOperation.Not32 or
-        ScalarOperation.ULessThan32 or ScalarOperation.IEqual32 or ScalarOperation.UGreaterThan32 or ScalarOperation.INotEqual32 or
+        ScalarOperation.ULessThan32 or ScalarOperation.ULessThanEqual32 or
+        ScalarOperation.IEqual32 or ScalarOperation.UGreaterThan32 or ScalarOperation.INotEqual32 or
         ScalarOperation.LogicalOr or ScalarOperation.LogicalAnd or ScalarOperation.LogicalXor or ScalarOperation.LogicalNot or
         ScalarOperation.FLessThanEqual or ScalarOperation.FGreaterThanEqual or ScalarOperation.FIsNan or
-        ScalarOperation.FMul or ScalarOperation.FTrunc => true,
+        ScalarOperation.FMul or ScalarOperation.FDiv or ScalarOperation.FTrunc => true,
         _ => false,
     };
 
@@ -166,8 +167,25 @@ public sealed class RuntimeValueValidator
             return false;
         }
 
-        var kind = _graph.Memory[value.MemoryIndex].Kind;
+        var memory = _graph.Memory[value.MemoryIndex];
+        var kind = memory.Kind;
         return (value.Kind == ScalarValueKind.ScalarAddressWord && kind == MemoryResourceKind.ScalarAddress) ||
-            (value.Kind == ScalarValueKind.ScalarBufferWord && kind == MemoryResourceKind.ScalarBuffer);
+            (value.Kind == ScalarValueKind.ScalarBufferWord &&
+                (kind == MemoryResourceKind.ScalarBuffer || IsUniformBufferRead(memory, value)));
     }
+
+    private static bool IsUniformBufferRead(MemoryAccessInfo memory, ScalarValue value) =>
+        memory.Kind == MemoryResourceKind.Buffer &&
+        memory.Access == MemoryAccess.Read &&
+        memory.DataBits == 32 &&
+        memory.DataDwords == 1 &&
+        !memory.Typed &&
+        !memory.Formatted &&
+        !memory.IndexEnabled &&
+        !memory.OffsetEnabled &&
+        !memory.Glc &&
+        !memory.Slc &&
+        value.Operands.Length == 2 &&
+        value.Operands[1].IsConstant &&
+        (ulong)memory.Offset + value.Operands[1].ConstantU32 <= uint.MaxValue;
 }

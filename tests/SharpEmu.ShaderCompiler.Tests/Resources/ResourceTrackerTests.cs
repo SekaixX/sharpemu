@@ -128,6 +128,23 @@ public sealed class ResourceTrackerTests
     }
 
     [Fact]
+    public void VectorBufferWithUnprovenLaneDescriptor_IsRejected()
+    {
+        // A lane-derived V# with no proven guest-memory descriptor source must
+        // not be treated as an arbitrary physical GPU address.
+        var program = Program(
+            ReadFirstLane(0, 12, 0),
+            MoveScalar(4, 13, 0),
+            MoveScalar(8, 14, 16),
+            MoveScalar(12, 15, 0),
+            BufferLoad(16, 12),
+            EndProgram(24));
+
+        var error = Assert.Throws<ResourcePlanException>(() => Extract(program));
+        Assert.Contains("BufferHandle dword 0 is not a valid runtime value", error.Message);
+    }
+
+    [Fact]
     public void SamplerWithDivergentBits_IsRejected()
     {
         var program = Program(
@@ -214,7 +231,11 @@ public sealed class ResourceTrackerTests
 
     // The material table s[0:3], the heap s[4:7], the key selector in s8; the image words
     // come from the heap record the key selects.
-    internal static Gen5ShaderProgram IndirectImageProgram(bool malformed, int materialImmediate = 0, bool memoryBackedMaterial = false)
+    internal static Gen5ShaderProgram IndirectImageProgram(
+        bool malformed,
+        int materialImmediate = 0,
+        bool memoryBackedMaterial = false,
+        bool r128 = false)
     {
         var instructions = new List<Gen5ShaderInstruction>();
         uint pc = 0x1000;
@@ -251,7 +272,7 @@ public sealed class ResourceTrackerTests
             Add(At(current => MoveScalar(current, 24 + index, 0)));
         }
 
-        Add(At(current => Image(current, "ImageSample", 16, 24)));
+        Add(At(current => Image(current, "ImageSample", 16, 24, r128: r128)));
         Add(At(EndProgram));
         return Program([.. instructions]);
     }
@@ -602,6 +623,38 @@ public sealed class ResourceTrackerTests
         var changedSpecialization = new ResourceSpecialization();
         Assert.True(ResourceMaterializer.Materialize(plan, Inputs(userData), ref changedSnapshot, ref changedSpecialization));
         Assert.NotEqual(specialization, changedSpecialization);
+    }
+
+    [Fact]
+    public void ResourceLimits_AcceptExactlySixtyFourBuffers()
+    {
+        var instructions = new List<Gen5ShaderInstruction>();
+        uint pc = 0;
+        for (uint index = 0; index < ShaderResourceInfo.MaxBuffers; index++)
+        {
+            for (uint dword = 0; dword < 4; dword++)
+            {
+                instructions.Add(MoveScalar(pc, 8 + dword, index + dword + 0x100));
+                pc += 8;
+            }
+
+            instructions.Add(BufferLoad(pc, 8));
+            pc += 8;
+        }
+
+        instructions.Add(EndProgram(pc));
+        var plan = Extract(Program([.. instructions]));
+        var layout = BindingLayout.Allocate(plan.Info, [], false, false, false);
+        var buffers = Assert.Single(layout.Descriptors, descriptor =>
+            descriptor.Kind == DescriptorBindingKind.Buffers);
+
+        Assert.Equal(ShaderResourceInfo.MaxBuffers, plan.Info.Buffers.Count);
+        Assert.Equal(ShaderResourceInfo.MaxBuffers, plan.DescriptorSources.Count);
+        Assert.Equal(Enumerable.Range(0, ShaderResourceInfo.MaxBuffers).Select(index => (uint)index),
+            plan.Info.Buffers.Select(buffer => buffer.Source));
+        Assert.Equal((uint)ShaderResourceInfo.MaxBuffers, layout.MemoryOffsetCount);
+        Assert.Equal((uint)(ShaderResourceInfo.MaxBuffers - 1), buffers.Resources[^1]);
+        Assert.Equal(ShaderResourceInfo.MaxBuffers, buffers.Resources.Count);
     }
 
     [Fact]

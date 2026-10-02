@@ -13,22 +13,24 @@ public readonly record struct ImageViewDescription(
     ImageAspectFlags Aspect,
     uint BaseLevel,
     uint LevelCount,
+    uint MinLod,
     uint BaseLayer,
     uint LayerCount,
     ComponentMapping Mapping,
     ImageUsageFlags Usage)
 {
-    public static ImageViewDescription Default => new(Format.Undefined, ImageViewType.Type2D, ImageAspectFlags.ColorBit, 0, 1, 0, 1, default, ImageUsageFlags.SampledBit);
+    public static ImageViewDescription Default => new(Format.Undefined, ImageViewType.Type2D, ImageAspectFlags.ColorBit, 0, 1, 0, 0, 1, default, ImageUsageFlags.SampledBit);
 
     public bool Equals(ImageViewDescription other) =>
         Format == other.Format && Type == other.Type && Aspect == other.Aspect &&
-        BaseLevel == other.BaseLevel && LevelCount == other.LevelCount &&
+        BaseLevel == other.BaseLevel && LevelCount == other.LevelCount && MinLod == other.MinLod &&
         BaseLayer == other.BaseLayer && LayerCount == other.LayerCount &&
         Mapping.R == other.Mapping.R && Mapping.G == other.Mapping.G &&
         Mapping.B == other.Mapping.B && Mapping.A == other.Mapping.A && Usage == other.Usage;
 
     public override int GetHashCode() =>
-        HashCode.Combine(Format, Type, Aspect, BaseLevel, LevelCount, BaseLayer, LayerCount, HashCode.Combine(Mapping.R, Mapping.G, Mapping.B, Mapping.A, Usage));
+        HashCode.Combine(Format, Type, Aspect, BaseLevel, LevelCount, MinLod, BaseLayer,
+            HashCode.Combine(LayerCount, Mapping.R, Mapping.G, Mapping.B, Mapping.A, Usage));
 }
 
 // Which host formats may view which image formats, and which guest swizzles are legal.
@@ -247,6 +249,46 @@ public static class ViewFormatRules
         ToComponentSwizzle(DestinationSelect(swizzle, 1)),
         ToComponentSwizzle(DestinationSelect(swizzle, 2)),
         ToComponentSwizzle(DestinationSelect(swizzle, 3)));
+
+    public static ComponentMapping ComponentMapping(uint swizzle, ColorComponentMap hostToStorage)
+    {
+        return new ComponentMapping(
+            ToStorageComponentSwizzle(DestinationSelect(swizzle, 0), hostToStorage),
+            ToStorageComponentSwizzle(DestinationSelect(swizzle, 1), hostToStorage),
+            ToStorageComponentSwizzle(DestinationSelect(swizzle, 2), hostToStorage),
+            ToStorageComponentSwizzle(DestinationSelect(swizzle, 3), hostToStorage));
+    }
+
+    private static ComponentSwizzle ToStorageComponentSwizzle(uint selector, ColorComponentMap hostToStorage) =>
+        (ComponentSelector)selector switch
+        {
+            ComponentSelector.Zero => ComponentSwizzle.Zero,
+            ComponentSelector.One => ComponentSwizzle.One,
+            ComponentSelector.Red => StorageComponent(hostToStorage, 0),
+            ComponentSelector.Green => StorageComponent(hostToStorage, 1),
+            ComponentSelector.Blue => StorageComponent(hostToStorage, 2),
+            ComponentSelector.Alpha => StorageComponent(hostToStorage, 3),
+            _ => throw SubmissionScheduler.Fatal($"The component selector is unknown: selector={selector}."),
+        };
+
+    private static ComponentSwizzle StorageComponent(ColorComponentMap hostToStorage, uint storageComponent)
+    {
+        for (uint hostComponent = 0; hostComponent < 4; hostComponent++)
+        {
+            if (hostToStorage.Map(hostComponent) == storageComponent)
+            {
+                return hostComponent switch
+                {
+                    0 => ComponentSwizzle.R,
+                    1 => ComponentSwizzle.G,
+                    2 => ComponentSwizzle.B,
+                    _ => ComponentSwizzle.A,
+                };
+            }
+        }
+
+        throw SubmissionScheduler.Fatal($"The host-to-storage component map is invalid: map=0x{hostToStorage.Packed:X2}.");
+    }
 
     public static Format SrgbStorageFormat(Format imageFormat) => imageFormat switch
     {

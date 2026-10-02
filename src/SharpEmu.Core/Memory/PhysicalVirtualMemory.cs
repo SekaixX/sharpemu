@@ -145,9 +145,22 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         _hostMemory = hostMemory ?? CrossPlatformHostMemory.Instance;
         if (viewHost != null)
         {
-            _backedSpace = new GuestSpaceOwner(viewHost, backingBytes, preReserveGuestAddressSpace);
+            _backedSpace = preReserveGuestAddressSpace
+                ? new GuestSpaceOwner(viewHost, backingBytes, GuestMemoryLayout.VirtualAddressPlacement)
+                : new GuestSpaceOwner(viewHost, backingBytes, 0, 0, 0);
             RunBackingSelfTest();
         }
+    }
+
+    // Retain the local test seam's named argument while keeping the public main API.
+    internal PhysicalVirtualMemory(
+        IHostMemory? hostMemory,
+        IHostViewMemory? viewHost,
+        ulong backingBytes,
+        bool reserveGuestAddressSpace,
+        byte compatibilityOverload = 0)
+        : this(hostMemory, viewHost, backingBytes, preReserveGuestAddressSpace: reserveGuestAddressSpace)
+    {
     }
 
     // Run both backing self-tests during initialization. Stop if either test fails.
@@ -318,7 +331,22 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         // reserve-only + lazy commit only when a huge non-exec commit fails —
         // that is the Poppy / large-reservation path #608 was aiming for.
         var reservedOnly = false;
-        var result = TryAllocateFixedThroughGranules(desiredAddress, alignedSize, hostProtection, traceReject: false);
+        var ownedPrivate = false;
+        var result = 0UL;
+        if (TryAllocateOwnedPrivate(desiredAddress, alignedSize, hostProtection, out var targetsOwnedRange))
+        {
+            result = desiredAddress;
+            ownedPrivate = true;
+        }
+        else if (targetsOwnedRange)
+        {
+            return false;
+        }
+        else
+        {
+            result = TryAllocateFixedThroughGranules(desiredAddress, alignedSize, hostProtection, traceReject: false);
+        }
+
         if (result == 0)
         {
             result = _hostMemory.Allocate(desiredAddress, alignedSize, hostProtection);
@@ -354,6 +382,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 Size = alignedSize,
                 IsExecutable = executable,
                 IsReservedOnly = reservedOnly,
+                IsOwnedPrivate = ownedPrivate,
                 Protection = protection
             });
         }
@@ -402,16 +431,26 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             alignedSize >= LargeDataReserveThreshold &&
             alignedSize > FullCommitRegionLimit;
         var reservedOnly = false;
+        var ownedPrivate = false;
 
         // Prefer a full commit. Only fall back to reserve-only when a large
         // non-executable commit cannot be satisfied (see TryAllocateAtExact).
         ulong result = 0;
+        var targetsOwnedRange = false;
         if (desiredAddress != 0)
         {
-            result = TryAllocateFixedThroughGranules(desiredAddress, alignedSize, hostProtection, traceReject: false);
+            if (TryAllocateOwnedPrivate(desiredAddress, alignedSize, hostProtection, out targetsOwnedRange))
+            {
+                result = desiredAddress;
+                ownedPrivate = true;
+            }
+            else if (!targetsOwnedRange)
+            {
+                result = TryAllocateFixedThroughGranules(desiredAddress, alignedSize, hostProtection, traceReject: false);
+            }
         }
 
-        if (result == 0)
+        if (result == 0 && !targetsOwnedRange)
         {
             result = _hostMemory.Allocate(desiredAddress, alignedSize, hostProtection);
         }
@@ -466,6 +505,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 Size = alignedSize,
                 IsExecutable = executable,
                 IsReservedOnly = reservedOnly,
+                IsOwnedPrivate = ownedPrivate,
                 Protection = protection
             });
         }
@@ -480,6 +520,16 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         TraceVmem($"Allocated {allocationKind}: 0x{actualAddress:X16} - 0x{actualAddress + alignedSize:X16} ({alignedSize} bytes) lazy_prime={lazyPrimeState}");
 
         return actualAddress;
+    }
+
+    private bool TryAllocateOwnedPrivate(
+        ulong address,
+        ulong size,
+        HostPageProtection protection,
+        out bool targetsOwnedRange)
+    {
+        targetsOwnedRange = address != 0 && _backedSpace?.OwnsReservedRange(address, size) == true;
+        return targetsOwnedRange && _backedSpace!.AllocatePrivate(address, size, protection);
     }
 
     /// <summary>
@@ -732,7 +782,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         // MemoryRegions are inserted only once every gap in the range has been
         // backed. If any gap fails to back, every earlier host allocation is freed
         // and no region is inserted, so the address space is left untouched.
-        var stagedAllocations = new List<(ulong Address, ulong Size, bool GranuleTracked)>();
+        var stagedAllocations = new List<(ulong Address, ulong Size, bool GranuleTracked, bool OwnedPrivate)>();
 
         var cursor = start;
         while (cursor < end)
@@ -751,23 +801,35 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 goto Rollback;
             }
 
+            var runSize = runEnd - cursor;
+            if (TryAllocateOwnedPrivate(cursor, runSize, hostProtection, out var targetsOwnedRange))
+            {
+                stagedAllocations.Add((cursor, runSize, false, true));
+                TraceVmem($"Backed fixed range from an owned placeholder: 0x{cursor:X16} - 0x{runEnd:X16} ({runSize} bytes)");
+                cursor = runEnd;
+                continue;
+            }
+
+            if (targetsOwnedRange)
+            {
+                goto Rollback;
+            }
+
             var needsGranuleAwareBacking = OperatingSystem.IsWindows() &&
                 (info.State == HostRegionState.Free || info.State == HostRegionState.Reserved);
 
             if (needsGranuleAwareBacking)
             {
-                var runSize = runEnd - cursor;
                 if (TryAllocateFixedThroughGranules(cursor, runSize, hostProtection, traceReject: false) != cursor)
                 {
                     goto Rollback;
                 }
 
-                stagedAllocations.Add((cursor, runSize, true));
+                stagedAllocations.Add((cursor, runSize, true, false));
                 TraceVmem($"Backed fixed range gap: 0x{cursor:X16} - 0x{runEnd:X16} ({runSize} bytes)");
             }
             else if (info.State == HostRegionState.Free)
             {
-                var runSize = runEnd - cursor;
                 var allocated = _hostMemory.Allocate(cursor, runSize, hostProtection);
                 if (allocated != cursor)
                 {
@@ -779,7 +841,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     goto Rollback;
                 }
 
-                stagedAllocations.Add((cursor, runSize, false));
+                stagedAllocations.Add((cursor, runSize, false, false));
                 TraceVmem($"Backed fixed range gap: 0x{cursor:X16} - 0x{runEnd:X16} ({runSize} bytes)");
             }
 
@@ -797,7 +859,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         _gate.EnterWriteLock();
         try
         {
-            foreach (var (gapAddress, gapSize, _) in stagedAllocations)
+            foreach (var (gapAddress, gapSize, _, ownedPrivate) in stagedAllocations)
             {
                 InsertRegionSorted(new MemoryRegion
                 {
@@ -805,6 +867,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     Size = gapSize,
                     IsExecutable = executable,
                     IsReservedOnly = false,
+                    IsOwnedPrivate = ownedPrivate,
                     Protection = protection
                 });
             }
@@ -817,9 +880,13 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         return true;
 
     Rollback:
-        foreach (var (gapAddress, _, granuleTracked) in stagedAllocations)
+        foreach (var (gapAddress, gapSize, granuleTracked, ownedPrivate) in stagedAllocations)
         {
-            if (!granuleTracked)
+            if (ownedPrivate)
+            {
+                _backedSpace!.FreePrivate(gapAddress, gapSize);
+            }
+            else if (!granuleTracked)
             {
                 _hostMemory.Free(gapAddress);
             }
@@ -1227,7 +1294,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     public bool TryHoldRangeAtOrAbove(ulong searchStart, ulong size, ulong alignment, out ulong address)
     {
         address = 0;
-        const ulong limit = 0x0000_00FC_0000_0000;
+        const ulong limit = GuestMemoryLayout.GuestAddressLimit;
         if (size == 0 || size % GuestMemoryLayout.GuestPage != 0 || size >= limit)
         {
             return false;
@@ -1408,7 +1475,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             return false;
         }
 
-        using (GpuMemoryAccessProfile.MeasureAddressSpaceProtectionWait()) _gate.EnterReadLock();
+        // Pointer-based reads, writes and copies hold the read side while they touch host
+        // memory. Protect must take the write side so a page cannot become inaccessible
+        // in the middle of one of those operations.
+        using (GpuMemoryAccessProfile.MeasureAddressSpaceProtectionWait()) _gate.EnterWriteLock();
         try
         {
             var access = ResolveProtection(protection);
@@ -1459,7 +1529,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
         finally
         {
-            _gate.ExitReadLock();
+            _gate.ExitWriteLock();
         }
     }
 
@@ -1530,7 +1600,11 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     var freedBases = new HashSet<ulong>();
                     foreach (var region in _regions)
                     {
-                        if (!region.IsBackedView && freedBases.Add(region.VirtualAddress))
+                        if (region.IsOwnedPrivate)
+                        {
+                            _backedSpace!.FreePrivate(region.VirtualAddress, region.Size);
+                        }
+                        else if (!region.IsBackedView && freedBases.Add(region.VirtualAddress))
                         {
                             _hostMemory.Free(region.VirtualAddress);
                         }
@@ -1545,7 +1619,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     }
 
                     _fixedGranuleReservationBases.Clear();
-                    _backedSpace?.ReleaseAddressRanges();
+                    _backedSpace?.ResetAddressRanges();
                     _regions.Clear();
                     _pageProtections.Clear();
                     lock (_allocationSearchHintGate)
@@ -2308,12 +2382,14 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             var mergePrevious = previous is not null &&
                 !previous.IsReservedOnly &&
                 !previous.IsBackedView &&
+                previous.IsOwnedPrivate == region.IsOwnedPrivate &&
                 previous.IsExecutable == region.IsExecutable &&
                 previous.Protection == region.Protection &&
                 previous.VirtualAddress + previous.Size == region.VirtualAddress;
             var mergeNext = next is not null &&
                 !next.IsReservedOnly &&
                 !next.IsBackedView &&
+                next.IsOwnedPrivate == region.IsOwnedPrivate &&
                 next.IsExecutable == region.IsExecutable &&
                 next.Protection == region.Protection &&
                 region.VirtualAddress + region.Size == next.VirtualAddress;
@@ -2641,6 +2717,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         public bool IsExecutable { get; set; }
         public bool IsReservedOnly { get; set; }
         public bool IsBackedView { get; set; }
+        public bool IsOwnedPrivate { get; set; }
         public uint Protection { get; set; }
     }
 

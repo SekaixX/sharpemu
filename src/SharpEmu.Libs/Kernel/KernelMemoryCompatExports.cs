@@ -20,6 +20,11 @@ namespace SharpEmu.Libs.Kernel;
 public static partial class KernelMemoryCompatExports
 {
     private const int MaxGuestStringLength = 4096;
+    // POSIX file names are directory entries, not locks on an open file
+    // description. Windows requires delete sharing for rename/unlink to keep
+    // an existing guest descriptor usable after the directory entry changes.
+    internal const FileShare GuestFileShare =
+        FileShare.ReadWrite | FileShare.Delete;
     private const int WideCharSize = sizeof(ushort);
     private const int MemsetChunkSize = 16 * 1024;
     private static readonly byte[] _zeroChunk = new byte[MemsetChunkSize];
@@ -69,6 +74,7 @@ public static partial class KernelMemoryCompatExports
     private const int Enomem = 12;
     private const int Eacces = 13;
     private const int Efault = 14;
+    private const int Eexist = 17;
     private const int Einval = 22;
     private const int Erange = 34;
     private const int Struncate = 80;
@@ -1431,7 +1437,9 @@ public static partial class KernelMemoryCompatExports
         ExportName = "_open",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelOpenUnderscore(CpuContext ctx)
+    public static int KernelOpenUnderscore(CpuContext ctx) => PosixOpen(ctx);
+
+    internal static int KernelOpenCore(CpuContext ctx)
     {
         var pathAddress = ctx[CpuRegister.Rdi];
         var flags = unchecked((int)ctx[CpuRegister.Rsi]);
@@ -1511,7 +1519,7 @@ public static partial class KernelMemoryCompatExports
             }
 
             EnsureOpenParentDirectoryExists(guestPath, hostPath, flags);
-            var stream = new FileStream(hostPath, mode, access, FileShare.ReadWrite);
+            var stream = new FileStream(hostPath, mode, access, GuestFileShare);
             if ((flags & O_APPEND) != 0)
             {
                 stream.Seek(0, SeekOrigin.End);
@@ -1648,6 +1656,7 @@ public static partial class KernelMemoryCompatExports
             (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT => Einval,
             (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT => Efault,
             (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED => Eacces,
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_ALREADY_EXISTS => Eexist,
             _ => notFoundErrno,
         };
         KernelRuntimeCompatExports.TrySetErrno(ctx, errno);
@@ -1669,11 +1678,11 @@ public static partial class KernelMemoryCompatExports
     }
 
     // POSIX open(2): translates a failed raw open into -1/errno. On success
-    // KernelOpenUnderscore already writes the fd into RAX (the import bridge
+    // KernelOpenCore already writes the fd into RAX (the import bridge
     // prefers a written RAX over the return value), so returning 0 is correct.
     public static int PosixOpen(CpuContext ctx)
     {
-        var result = KernelOpenUnderscore(ctx);
+        var result = KernelOpenCore(ctx);
         return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
             ? 0
             : PosixFailure(ctx, result);
@@ -2065,6 +2074,19 @@ public static partial class KernelMemoryCompatExports
     }
 
     [SysAbiExport(
+        Nid = "VAzswvTOCzI",
+        ExportName = "unlink",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixUnlink(CpuContext ctx)
+    {
+        var result = KernelUnlink(ctx);
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? ctx.SetReturn(0)
+            : PosixFailure(ctx, result);
+    }
+
+    [SysAbiExport(
         Nid = "1-LFLmRFxxM",
         ExportName = "sceKernelMkdir",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -2126,6 +2148,21 @@ public static partial class KernelMemoryCompatExports
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
+    }
+
+    [SysAbiExport(
+        Nid = "JGMio+21L4c",
+        ExportName = "mkdir",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixMkdir(CpuContext ctx)
+    {
+        // The host sandbox controls effective permissions; the guest mode is
+        // nevertheless accepted through RSI as required by the POSIX ABI.
+        var result = KernelMkdir(ctx);
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? ctx.SetReturn(0)
+            : PosixFailure(ctx, result);
     }
 
     [SysAbiExport(
@@ -2279,6 +2316,16 @@ public static partial class KernelMemoryCompatExports
         if (stream is null)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        // A host movie watchdog may have closed the decoder while the guest
+        // still owns its Bink file descriptor. Return EOF so the guest closes
+        // that descriptor and proceeds to the next movie instead of waiting
+        // forever on a stale native decoder.
+        if (HostMovieBridge.ShouldForceGuestMovieEof(stream.Name))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
         long positionBefore;
@@ -2775,13 +2822,22 @@ public static partial class KernelMemoryCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
             }
 
-            var searchStart = searchStartRaw < 0 ? 0UL : (ulong)searchStartRaw;
-            var searchEnd = searchEndRaw <= 0
-                ? GuestMemoryLayout.DirectBytes
-                : Math.Min((ulong)searchEndRaw, GuestMemoryLayout.DirectBytes);
-            if (searchStart >= searchEnd)
+            // Initialize both outputs even when the interval has no free span.
+            if (!ctx.TryWriteUInt64(outAddress, 0) || !ctx.TryWriteUInt64(outSize, 0))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            if (searchStartRaw < 0 || searchEndRaw < 0)
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+            }
+
+            var searchStart = (ulong)searchStartRaw;
+            var searchEnd = Math.Min((ulong)searchEndRaw, GuestMemoryLayout.DirectBytes);
+            if (searchStart >= searchEnd)
+            {
+                return MemoryNoSpace;
             }
 
             bool foundSpan;
@@ -2799,7 +2855,7 @@ public static partial class KernelMemoryCompatExports
 
             if (!foundSpan)
             {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+                return MemoryNoSpace;
             }
 
             if (!ctx.TryWriteUInt64(outAddress, candidate) || !ctx.TryWriteUInt64(outSize, rangeAvailable))
@@ -3582,6 +3638,22 @@ public static partial class KernelMemoryCompatExports
 
         if (!found)
         {
+            // A find-next walk terminates with a successful zero-length range
+            // at the end of physical memory. Returning EACCES here makes
+            // allocator enumerators treat a normal end marker as a hard query
+            // failure and can leave their worker/bootstrap state incomplete.
+            if (findNext && offset < GuestMemoryLayout.DirectBytes)
+            {
+                if (!ctx.TryWriteUInt64(infoAddress, GuestMemoryLayout.DirectBytes) ||
+                    !ctx.TryWriteUInt64(infoAddress + sizeof(ulong), GuestMemoryLayout.DirectBytes) ||
+                    !TryWriteInt32(ctx, infoAddress + (sizeof(ulong) * 2), 0))
+                {
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                }
+
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DELETED;
         }
 
@@ -4760,6 +4832,19 @@ public static partial class KernelMemoryCompatExports
             return ResolveTemp0Root();
         }
 
+        // Some Gen5 SDK/runtime paths use /temp while others use /temp0.
+        // They name the same per-title scratch mount on hardware.
+        if (guestPath.StartsWith("/temp/", StringComparison.OrdinalIgnoreCase))
+        {
+            var relative = NormalizeMountRelativePath(guestPath["/temp/".Length..]);
+            return CombineWithinMount(ResolveTemp0Root(), relative);
+        }
+
+        if (string.Equals(guestPath, "/temp", StringComparison.OrdinalIgnoreCase))
+        {
+            return ResolveTemp0Root();
+        }
+
         if (guestPath.StartsWith("/download0/", StringComparison.OrdinalIgnoreCase))
         {
             var relative = NormalizeMountRelativePath(guestPath["/download0/".Length..]);
@@ -5164,24 +5249,45 @@ public static partial class KernelMemoryCompatExports
     {
         const string temp0VariableName = "SHARPEMU_TEMP0_DIR";
         var configuredRoot = Environment.GetEnvironmentVariable(temp0VariableName);
+        string root;
         if (!string.IsNullOrWhiteSpace(configuredRoot))
         {
-            return Path.GetFullPath(configuredRoot);
+            root = Path.GetFullPath(configuredRoot);
         }
-
-        var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
-        var appName = string.IsNullOrWhiteSpace(app0Root)
-            ? "default"
-            : Path.GetFileName(Path.TrimEndingDirectorySeparator(app0Root));
-        if (string.IsNullOrWhiteSpace(appName))
+        else
         {
-            appName = "default";
+            var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
+            var appName = string.IsNullOrWhiteSpace(app0Root)
+                ? "default"
+                : Path.GetFileName(Path.TrimEndingDirectorySeparator(app0Root));
+            if (string.IsNullOrWhiteSpace(appName))
+            {
+                appName = "default";
+            }
+
+            var invalidChars = Path.GetInvalidFileNameChars();
+            appName = new string(appName.Select(ch => invalidChars.Contains(ch) ? '_' : ch).ToArray());
+            root = Path.Combine(AppContext.BaseDirectory, "user", "temp", appName, "temp0");
+            Environment.SetEnvironmentVariable(temp0VariableName, root);
         }
 
-        var invalidChars = Path.GetInvalidFileNameChars();
-        appName = new string(appName.Select(ch => invalidChars.Contains(ch) ? '_' : ch).ToArray());
-        var root = Path.Combine(AppContext.BaseDirectory, "user", "temp", appName, "temp0");
-        Environment.SetEnvironmentVariable(temp0VariableName, root);
+        // A mount root exists before guest code can create children within it.
+        // Without this, a first mkdir("/temp0/...") incorrectly returns ENOENT.
+        // Mount resolution runs outside several syscall try/catch blocks, so a bad
+        // configured host root must remain a guest-visible I/O failure rather than
+        // escaping through the HLE boundary as a host exception.
+        try
+        {
+            Directory.CreateDirectory(root);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            LogOpenTrace($"temp mount root is not writable: '{root}'");
+        }
+        catch (IOException)
+        {
+            LogOpenTrace($"temp mount root could not be created: '{root}'");
+        }
         return root;
     }
 
@@ -7102,6 +7208,17 @@ public static partial class KernelMemoryCompatExports
         if (normalized[0] != '/')
         {
             normalized = "/" + normalized;
+        }
+
+        // Canonicalize the SDK's two names for the same scratch mount so
+        // negative-stat caching and explicit mount registration cannot disagree.
+        if (string.Equals(normalized, "/temp", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = "/temp0";
+        }
+        else if (normalized.StartsWith("/temp/", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = "/temp0" + normalized[5..];
         }
 
         return normalized;

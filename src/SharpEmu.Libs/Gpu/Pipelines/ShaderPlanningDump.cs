@@ -27,6 +27,7 @@ internal static class ShaderPlanningDump
 
     public static void WriteGraph(ShaderSource source, ShaderResourcePlan plan) => Write(source, "resource-graph.txt", writer =>
     {
+        writer.WriteLine($"wave_size={plan.Graph.WaveSize}");
         var pending = new Queue<ScalarValue>();
         var visited = new HashSet<ScalarValue>();
         void AddRoot(string name, ScalarValue? value)
@@ -67,7 +68,7 @@ internal static class ShaderPlanningDump
 
     private static void Write(ShaderSource source, string suffix, Action<TextWriter> write)
     {
-        if (!CompiledShaderDump.ShouldWrite(source.Address)) return;
+        if (!CompiledShaderDump.ShouldWrite(source.Address, source.Hash)) return;
         try
         {
             var path = $"{CompiledShaderDump.GetBasePath(source.Label, source.Address, source.Hash)}.{suffix}";

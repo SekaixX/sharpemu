@@ -16,6 +16,71 @@ using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 
+internal readonly record struct VulkanGraphicsPipelineStagePolicy(
+    ShaderStage ResourceStage,
+    ShaderStageFlags VulkanStage,
+    bool UsesVertexInput)
+{
+    public ShaderStageFlags PushConstantStages => VulkanStage | ShaderStageFlags.FragmentBit;
+}
+
+internal static class VulkanGraphicsPipelinePolicy
+{
+    internal static VulkanGraphicsPipelineStagePolicy For(ShaderStageKind stage) => stage switch
+    {
+        ShaderStageKind.Vertex => new(ShaderStage.Vertex, ShaderStageFlags.VertexBit, UsesVertexInput: true),
+        ShaderStageKind.Mesh => new(ShaderStage.Mesh, ShaderStageFlags.MeshBitExt, UsesVertexInput: false),
+        _ => throw SubmissionScheduler.Fatal($"A graphics pipeline has an invalid first stage: stage={stage}."),
+    };
+
+    internal static bool UsesRectangleListStages(ShaderStageKind stage, PrimitiveTopology topology) =>
+        stage != ShaderStageKind.Mesh && topology == PrimitiveTopology.PatchList;
+
+    internal static RectangleListShaderParameter[] RectangleListParameters(
+        GraphicsPipelineDescription description)
+    {
+        if (description.PixelInfo is not { } pixelInfo ||
+            description.PixelStage is not { } pixelStage ||
+            pixelStage.PixelParameterInputs.Length == 0)
+        {
+            return [];
+        }
+
+        var activeInputs = pixelStage.PixelParameterInputs;
+        var controls = pixelInfo.InterpolatorSettings;
+        var controlCount = (int)Math.Min(pixelInfo.InputCount, (uint)controls.Length);
+        var outputLocations = Gen5PixelInputMapping.ResolveLocations(
+            controls.AsSpan(0, controlCount),
+            activeInputs);
+        var usedOutputs = new bool[PixelInputInfo.InterpolatorCount];
+        var parameters = new List<RectangleListShaderParameter>(activeInputs.Length);
+        for (var index = 0; index < activeInputs.Length; index++)
+        {
+            var input = activeInputs[index];
+            var control = input < pixelInfo.InputCount && input < (uint)controls.Length
+                ? controls[(int)input]
+                : input;
+            var inputLocation = control & 0x1Fu;
+            var outputLocation = outputLocations[index];
+            if (inputLocation >= 32 || outputLocation >= (uint)usedOutputs.Length ||
+                (description.VertexStage.ParameterExportMask & (1u << (int)inputLocation)) == 0 ||
+                usedOutputs[(int)outputLocation])
+            {
+                continue;
+            }
+
+            parameters.Add(new RectangleListShaderParameter(
+                inputLocation,
+                outputLocation,
+                (control & 0x400u) != 0 &&
+                (input >= 32 || (pixelInfo.CustomInterpolationMask & (1u << (int)input)) == 0)));
+            usedOutputs[(int)outputLocation] = true;
+        }
+
+        return parameters.ToArray();
+    }
+}
+
 // This partial creates the graphics and compute pipelines of the shader cache and the presentation pipeline.
 internal static unsafe partial class VulkanVideoPresenter
 {
@@ -31,10 +96,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private const uint PushConstantBytes = PushData.ByteSize;
         private static int _shaderModuleDumpSequence;
-        private static int _vertexSwizzleLines;
         private static int _vertexOutOfBoundsLines;
 
-        // One created pipeline with the layout it binds and the description its rectangle-list variants derive from.
+        // One created pipeline and the descriptor layout it binds.
         private sealed class RenderPipelineEntry
         {
             public ulong Id;
@@ -43,14 +107,10 @@ internal static unsafe partial class VulkanVideoPresenter
             public DescriptorSetLayout SetLayout;
             public DescriptorSetDemand Demand;
             public bool UsesPushDescriptors;
-            public GraphicsPipelineDescription? Description;
-            public Pipeline StripVariant;
-            public Pipeline ListVariant;
+            public ShaderStageFlags PushConstantStages;
             public ulong ProfileVertexHash;
             public ulong ProfilePixelHash;
             public ulong ProfileComputeHash;
-
-            public bool RectangleList => Description is { StaticParameters.Topology: PrimitiveTopology.PatchList };
         }
 
         private readonly Dictionary<ulong, ShaderModule> _shaderModules = new();
@@ -64,9 +124,27 @@ internal static unsafe partial class VulkanVideoPresenter
         // Wave64 compute runs natively when the device's subgroup is that wide; smaller devices emulate it.
         bool IShaderPipelineHost.ComputeWave64Supported => Volatile.Read(ref _nativeSubgroupSize) >= 64;
 
+        uint IShaderPipelineHost.ComputeSubgroupSize => unchecked((uint)Volatile.Read(ref _nativeSubgroupSize));
+
         bool IShaderPipelineHost.GraphicsSubgroupOperationsEnabled => GraphicsSubgroupOperationsEnabled;
 
+        bool IShaderPipelineHost.BufferInt64AtomicsSupported => _supportsBufferInt64Atomics;
+
+        bool IShaderPipelineHost.ShaderFloat64Supported => _supportsShaderFloat64;
+
+        bool IShaderPipelineHost.ShaderSignedZeroInfNanPreserveFloat32Supported =>
+            _supportsShaderSignedZeroInfNanPreserveFloat32;
+
         RenderHostLimits IShaderPipelineHost.Limits => _renderHostLimits;
+
+        bool IShaderPipelineHost.MeshShadersSupported =>
+            _meshShaderCapabilities.Supported;
+
+        uint IShaderPipelineHost.MeshSubgroupSize =>
+            unchecked((uint)Volatile.Read(ref _nativeSubgroupSize));
+
+        MeshShaderHostCapabilities IShaderPipelineHost.MeshShaderCapabilities =>
+            _meshShaderCapabilities;
 
         SampleCountFlags IShaderPipelineHost.NoAttachmentSampleCounts => _noAttachmentSampleCounts;
 
@@ -75,6 +153,13 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             word = 0;
+            // Dynamic descriptors can be inspected before a draw has supplied a
+            // valid guest address. Keep invalid ranges out of the page tracker.
+            if (!_guestMemory.CanRead(address, sizeof(uint)))
+            {
+                return false;
+            }
+
             if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
                 SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
             {
@@ -96,6 +181,11 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
             word = 0;
+            if (!_guestMemory.CanRead(address, sizeof(uint)))
+            {
+                return false;
+            }
+
             if (_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) ||
                 _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) ||
                 _imageCache.HasGpuModifiedImageBytes(address, sizeof(uint)))
@@ -116,6 +206,9 @@ internal static unsafe partial class VulkanVideoPresenter
         public ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramCompile);
+            // VkShaderModule is stage-neutral, but resolve the stage here so a
+            // mesh module is admitted only when it has a valid Vulkan stage.
+            _ = DescriptorWriter.ShaderStageFlag(stage);
             var module = CreateShaderModule(shader.Payload);
             SetDebugName(ObjectType.ShaderModule, module.Handle, $"SharpEmu {stage} 0x{hash:X16}");
             _shaderModules.Add(programId, module);
@@ -367,8 +460,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw SubmissionScheduler.Fatal($"The draw binds more color attachments than the device supports: count={description.Rendering.ColorCount} max={_maxColorAttachments}.");
             }
 
+            var stagePolicy = VulkanGraphicsPipelinePolicy.For(description.VertexStage.Stage);
             var bindings = new List<DescriptorSetLayoutBinding>();
-            CollectLayoutBindings(bindings, description.VertexStage, ShaderStage.Vertex);
+            CollectLayoutBindings(bindings, description.VertexStage, stagePolicy.ResourceStage);
             if (description.PixelStage is { } pixelStage)
             {
                 CollectLayoutBindings(bindings, pixelStage, ShaderStage.Pixel);
@@ -379,17 +473,13 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 SetLayout = setLayout,
                 Demand = demand,
-                Layout = CreatePipelineLayout(setLayout, ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit),
+                Layout = CreatePipelineLayout(setLayout, stagePolicy.PushConstantStages),
                 UsesPushDescriptors = usesPushDescriptors,
-                Description = description,
+                PushConstantStages = stagePolicy.PushConstantStages,
                 ProfileVertexHash = description.VertexStage.Hash,
                 ProfilePixelHash = description.PixelStage?.Hash ?? 0,
             };
-            // A rectangle list draws through a strip or list variant chosen by its vertex count.
-            if (!entry.RectangleList)
-            {
-                entry.Pipeline = CreateRenderPipeline(description, description.StaticParameters.Topology, entry.Layout);
-            }
+            entry.Pipeline = CreateRenderPipeline(description, description.StaticParameters.Topology, entry.Layout);
 
             return RegisterPipeline(entry);
         }
@@ -426,7 +516,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var descriptor = resource.Descriptor;
                 var compiledComponents = description.VertexStage.VertexFetchComponents[index];
                 var usedComponents = compiledComponents > 0 ? compiledComponents : (uint)resource.RegisterCount;
-                var format = VertexAttributeFormats.Resolve(in descriptor, usedComponents, out var attributeSize);
+                var format = VertexAttributeFormats.Resolve(in descriptor, usedComponents, out _);
                 if (descriptor.OutOfBounds != 0 && Interlocked.Exchange(ref _vertexOutOfBoundsLines, 1) == 0)
                 {
                     Console.Error.WriteLine($"[LOADER][INFO] vertex_input accepted the out-of-bounds mode {descriptor.OutOfBounds} of an attribute buffer");
@@ -442,7 +532,6 @@ internal static unsafe partial class VulkanVideoPresenter
                     throw SubmissionScheduler.Fatal($"A vertex attribute buffer is swizzled: attribute={index} hash=0x{description.VertexStage.Hash:X16}.");
                 }
 
-                CheckVertexSwizzle(in descriptor, (int)usedComponents, attributeSize, index);
                 attributes[index] = new VertexInputAttributeDescription
                 {
                     Location = (uint)index,
@@ -453,76 +542,26 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private static uint DestinationSelect(uint x, uint y = 0, uint z = 0, uint w = 0) => x | (y << 3) | (z << 6) | (w << 9);
-
-        // A destination select the fixed-function fetch cannot apply is logged once and accepted.
-        private static void CheckVertexSwizzle(in BufferDescriptorWords descriptor, int fetchedComponents, uint attributeSize, int index)
-        {
-            uint swizzle;
-            uint expected;
-            var supported = true;
-            switch (fetchedComponents)
-            {
-                case 1:
-                    swizzle = descriptor.DestinationSelectX;
-                    expected = DestinationSelect(4);
-                    supported = swizzle == expected;
-                    break;
-                case 2:
-                    swizzle = descriptor.DestinationSelectXY;
-                    expected = attributeSize == 1 ? DestinationSelect(4, 0) : DestinationSelect(4, 5);
-                    supported = swizzle == expected;
-                    break;
-                case 3:
-                    swizzle = descriptor.DestinationSelectXYZ;
-                    expected = attributeSize switch
-                    {
-                        1 => DestinationSelect(4, 0, 0),
-                        2 => DestinationSelect(4, 5, 0),
-                        _ => DestinationSelect(4, 5, 6),
-                    };
-                    supported = swizzle == expected;
-                    break;
-                case 4:
-                    swizzle = descriptor.DestinationSelectXYZW;
-                    switch (attributeSize)
-                    {
-                        case 1:
-                            expected = DestinationSelect(4, 0, 0, 1);
-                            supported = swizzle == expected;
-                            break;
-                        case 2:
-                            expected = DestinationSelect(4, 5, 0, 1);
-                            supported = swizzle == expected;
-                            break;
-                        case 3:
-                            expected = DestinationSelect(4, 5, 6, 1);
-                            supported = swizzle == expected || swizzle == DestinationSelect(4, 5, 6, 0);
-                            break;
-                        default:
-                            expected = DestinationSelect(4, 5, 6, 7);
-                            supported = swizzle == expected || swizzle == DestinationSelect(4, 5, 6, 1) || swizzle == DestinationSelect(4, 5, 6, 0);
-                            break;
-                    }
-
-                    break;
-                default:
-                    throw SubmissionScheduler.Fatal($"A vertex attribute fetch uses an invalid component count: attribute={index} components={fetchedComponents}.");
-            }
-
-            if (!supported && Interlocked.Exchange(ref _vertexSwizzleLines, 1) == 0)
-            {
-                Console.Error.WriteLine(
-                    $"[LOADER][INFO] vertex_input accepted an unsupported destination select attribute={index} size={attributeSize} " +
-                    $"components={fetchedComponents} swizzle=0x{swizzle:X3} expected=0x{expected:X3}");
-            }
-        }
-
         // One graphics pipeline for dynamic rendering: the attachment formats travel in the create info.
         private Pipeline CreateRenderPipeline(GraphicsPipelineDescription description, PrimitiveTopology topology, PipelineLayout layout)
         {
+            var stagePolicy = VulkanGraphicsPipelinePolicy.For(description.VertexStage.Stage);
             var parameters = description.StaticParameters;
             var rendering = description.Rendering;
+            var rectangleList = VulkanGraphicsPipelinePolicy.UsesRectangleListStages(
+                description.VertexStage.Stage,
+                topology);
+            if (rectangleList && !_supportsTessellationShader)
+            {
+                throw SubmissionScheduler.Fatal(
+                    "The host does not support the tessellation stages required by rectangle lists.");
+            }
+            if (parameters.ProvokingVertexLast && !_supportsProvokingVertexLast)
+            {
+                throw SubmissionScheduler.Fatal(
+                    "The host cannot use the guest's last provoking vertex mode.");
+            }
+
             var vertexModule = new ShaderModule(description.VertexProgram.Module);
             var pixelModule = description.PixelStage is null ? default : new ShaderModule(description.PixelProgram.Module);
             if (vertexModule.Handle == 0 || (description.PixelStage is not null && pixelModule.Handle == 0))
@@ -531,17 +570,45 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
+            ShaderModule rectangleControlModule = default;
+            ShaderModule rectangleEvaluationModule = default;
             try
             {
-                var shaderStages = stackalloc PipelineShaderStageCreateInfo[2];
+                if (rectangleList)
+                {
+                    var rectangleShaders = RectangleListShaderBuilder.Build(
+                        VulkanGraphicsPipelinePolicy.RectangleListParameters(description));
+                    rectangleControlModule = CreateShaderModule(rectangleShaders.Control);
+                    rectangleEvaluationModule = CreateShaderModule(rectangleShaders.Evaluation);
+                }
+
+                var shaderStages = stackalloc PipelineShaderStageCreateInfo[4];
                 var stageCount = 1u;
                 shaderStages[0] = new PipelineShaderStageCreateInfo
                 {
                     SType = StructureType.PipelineShaderStageCreateInfo,
-                    Stage = ShaderStageFlags.VertexBit,
+                    Stage = stagePolicy.VulkanStage,
                     Module = vertexModule,
                     PName = entryPoint,
                 };
+                if (rectangleList)
+                {
+                    shaderStages[stageCount++] = new PipelineShaderStageCreateInfo
+                    {
+                        SType = StructureType.PipelineShaderStageCreateInfo,
+                        Stage = ShaderStageFlags.TessellationControlBit,
+                        Module = rectangleControlModule,
+                        PName = entryPoint,
+                    };
+                    shaderStages[stageCount++] = new PipelineShaderStageCreateInfo
+                    {
+                        SType = StructureType.PipelineShaderStageCreateInfo,
+                        Stage = ShaderStageFlags.TessellationEvaluationBit,
+                        Module = rectangleEvaluationModule,
+                        PName = entryPoint,
+                    };
+                }
+
                 if (pixelModule.Handle != 0)
                 {
                     shaderStages[stageCount++] = new PipelineShaderStageCreateInfo
@@ -553,9 +620,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     };
                 }
 
-                var vertexBindings = new VertexInputBindingDescription[description.VertexInput.BindingCount];
-                var vertexAttributes = new VertexInputAttributeDescription[description.VertexInput.AttributeCount];
-                BuildVertexAttributes(description, vertexAttributes, vertexBindings);
+                var vertexBindings = stagePolicy.UsesVertexInput
+                    ? new VertexInputBindingDescription[description.VertexInput.BindingCount]
+                    : [];
+                var vertexAttributes = stagePolicy.UsesVertexInput
+                    ? new VertexInputAttributeDescription[description.VertexInput.AttributeCount]
+                    : [];
+                if (stagePolicy.UsesVertexInput)
+                {
+                    BuildVertexAttributes(description, vertexAttributes, vertexBindings);
+                }
                 var colorCount = (int)parameters.ColorCount;
                 var blends = new PipelineColorBlendAttachmentState[colorCount];
                 for (var index = 0; index < colorCount; index++)
@@ -593,6 +667,13 @@ internal static unsafe partial class VulkanVideoPresenter
                     cullMode |= CullModeFlags.FrontBit;
                 }
 
+                if (!VulkanPolygonModePolicy.IsSupported(parameters.PolygonMode, _supportsFillModeNonSolid))
+                {
+                    throw SubmissionScheduler.Fatal(
+                        $"The host cannot use the guest polygon mode: mode={parameters.PolygonMode} " +
+                        $"fillModeNonSolid={_supportsFillModeNonSolid}.");
+                }
+
                 fixed (VertexInputBindingDescription* bindingPointer = vertexBindings)
                 fixed (VertexInputAttributeDescription* attributePointer = vertexAttributes)
                 fixed (PipelineColorBlendAttachmentState* blendPointer = blends)
@@ -612,6 +693,11 @@ internal static unsafe partial class VulkanVideoPresenter
                         Topology = topology,
                         PrimitiveRestartEnable = parameters.PrimitiveRestartEnable,
                     };
+                    var tessellation = new PipelineTessellationStateCreateInfo
+                    {
+                        SType = StructureType.PipelineTessellationStateCreateInfo,
+                        PatchControlPoints = 3,
+                    };
                     var depthClipControl = new PipelineViewportDepthClipControlCreateInfoEXT
                     {
                         SType = StructureType.PipelineViewportDepthClipControlCreateInfoExt,
@@ -621,19 +707,33 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         SType = StructureType.PipelineViewportStateCreateInfo,
                         PNext = _supportsDepthClipControl ? &depthClipControl : null,
-                        ViewportCount = 1,
-                        ScissorCount = 1,
+                        // The matching counts are supplied by vkCmdSet*WithCount.
+                        ViewportCount = 0,
+                        ScissorCount = 0,
                     };
                     var depthClip = new PipelineRasterizationDepthClipStateCreateInfoEXT
                     {
                         SType = StructureType.PipelineRasterizationDepthClipStateCreateInfoExt,
                         DepthClipEnable = parameters.DepthClipEnable,
                     };
+                    var provokingVertex = new PipelineRasterizationProvokingVertexStateCreateInfoEXT
+                    {
+                        SType = StructureType.PipelineRasterizationProvokingVertexStateCreateInfoExt,
+                        PNext = _supportsDepthClipEnable ? &depthClip : null,
+                        ProvokingVertexMode = VulkanProvokingVertexPolicy.Mode(parameters.ProvokingVertexLast),
+                    };
                     var rasterization = new PipelineRasterizationStateCreateInfo
                     {
                         SType = StructureType.PipelineRasterizationStateCreateInfo,
-                        PNext = _supportsDepthClipEnable ? &depthClip : null,
-                        PolygonMode = PolygonMode.Fill,
+                        PNext = _supportsProvokingVertexLast
+                            ? &provokingVertex
+                            : (_supportsDepthClipEnable ? &depthClip : null),
+                        // The PS5 depth block clamps after polygon offset. Kyty uses
+                        // the same host feature for every graphics pipeline; keeping
+                        // it disabled loses otherwise-valid 3D primitives whenever
+                        // guest depth clipping is disabled.
+                        DepthClampEnable = _supportsDepthClamp,
+                        PolygonMode = parameters.PolygonMode,
                         CullMode = cullMode,
                         FrontFace = parameters.FrontFaceClockwise ? FrontFace.Clockwise : FrontFace.CounterClockwise,
                         LineWidth = 1,
@@ -662,9 +762,9 @@ internal static unsafe partial class VulkanVideoPresenter
                         MinDepthBounds = parameters.DepthMinBounds,
                         MaxDepthBounds = parameters.DepthMaxBounds,
                     };
-                    var dynamicStates = stackalloc DynamicState[13];
-                    dynamicStates[0] = DynamicState.Viewport;
-                    dynamicStates[1] = DynamicState.Scissor;
+                    var dynamicStates = stackalloc DynamicState[14];
+                    dynamicStates[0] = DynamicState.ViewportWithCount;
+                    dynamicStates[1] = DynamicState.ScissorWithCount;
                     dynamicStates[2] = DynamicState.LineWidth;
                     dynamicStates[3] = DynamicState.DepthTestEnableExt;
                     dynamicStates[4] = DynamicState.DepthWriteEnableExt;
@@ -680,6 +780,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     if (_colorWriteEnableApi is not null && colorCount != 0)
                     {
                         dynamicStates[dynamicStateCount++] = DynamicState.ColorWriteEnableExt;
+                    }
+
+                    if (_attachmentFeedbackLoopApi is not null)
+                    {
+                        dynamicStates[dynamicStateCount++] = DynamicState.AttachmentFeedbackLoopEnableExt;
                     }
 
                     var dynamicState = new PipelineDynamicStateCreateInfo
@@ -702,8 +807,9 @@ internal static unsafe partial class VulkanVideoPresenter
                         PNext = &renderingInfo,
                         StageCount = stageCount,
                         PStages = shaderStages,
-                        PVertexInputState = &vertexInput,
-                        PInputAssemblyState = &inputAssembly,
+                        PVertexInputState = stagePolicy.UsesVertexInput ? &vertexInput : null,
+                        PInputAssemblyState = stagePolicy.UsesVertexInput ? &inputAssembly : null,
+                        PTessellationState = rectangleList ? &tessellation : null,
                         PViewportState = &viewportState,
                         PRasterizationState = &rasterization,
                         PMultisampleState = &multisample,
@@ -725,6 +831,15 @@ internal static unsafe partial class VulkanVideoPresenter
             finally
             {
                 SilkMarshal.Free((nint)entryPoint);
+                if (rectangleEvaluationModule.Handle != 0)
+                {
+                    _vk.DestroyShaderModule(_device, rectangleEvaluationModule, null);
+                }
+
+                if (rectangleControlModule.Handle != 0)
+                {
+                    _vk.DestroyShaderModule(_device, rectangleControlModule, null);
+                }
             }
         }
 
@@ -775,6 +890,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 SetLayout = setLayout,
                 Demand = demand,
                 UsesPushDescriptors = usesPushDescriptors,
+                PushConstantStages = ShaderStageFlags.ComputeBit,
                 ProfileComputeHash = description.Stage.Hash,
             };
             return RegisterPipeline(entry);
@@ -784,12 +900,9 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             foreach (var entry in _pipelineEntries.Values)
             {
-                foreach (var pipeline in new[] { entry.Pipeline, entry.StripVariant, entry.ListVariant })
+                if (entry.Pipeline.Handle != 0)
                 {
-                    if (pipeline.Handle != 0)
-                    {
-                        _vk.DestroyPipeline(_device, pipeline, null);
-                    }
+                    _vk.DestroyPipeline(_device, entry.Pipeline, null);
                 }
 
                 _vk.DestroyPipelineLayout(_device, entry.Layout, null);

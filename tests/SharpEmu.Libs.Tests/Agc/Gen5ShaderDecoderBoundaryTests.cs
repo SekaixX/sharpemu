@@ -117,6 +117,39 @@ public sealed class Gen5ShaderDecoderBoundaryTests
         Assert.Equal(words.Length, memory.Reads.Count);
     }
 
+    [Fact]
+    public void TrailingBackwardBranch_StopsBeforeMetadataTrailer()
+    {
+        const uint cBranchScc0OverEndPgm = 0xBF840001u;
+        const uint branchBackToStart = 0xBF82FFFCu;
+        const uint metadataWord = 0x5D000040u;
+        var memory = RecordingCpuMemory.FromWords(
+            ShaderAddress,
+            cBranchScc0OverEndPgm, EndPgm, Nop, branchBackToStart, metadataWord);
+
+        var decoded = Decode(memory, ShaderAddress, out var program, out var error);
+
+        Assert.True(decoded, error);
+        Assert.Equal(4, program.Instructions.Count);
+        Assert.Equal("SBranch", program.Instructions[^1].Opcode);
+    }
+
+    [Fact]
+    public void DebuggerBranchPastEndPgm_DoesNotDecodeDebuggerStub()
+    {
+        const uint cBranchCdbgsysOverEndPgm = 0xBF970001u;
+        const uint stubMove = 0xBE8003FFu;
+        var memory = RecordingCpuMemory.FromWords(
+            ShaderAddress,
+            cBranchCdbgsysOverEndPgm, EndPgm, stubMove);
+
+        var decoded = Decode(memory, ShaderAddress, out var program, out var error);
+
+        Assert.True(decoded, error);
+        Assert.Equal(2, program.Instructions.Count);
+        Assert.Equal("SEndpgm", program.Instructions[^1].Opcode);
+    }
+
     private static bool Decode(
         RecordingCpuMemory memory,
         ulong address,

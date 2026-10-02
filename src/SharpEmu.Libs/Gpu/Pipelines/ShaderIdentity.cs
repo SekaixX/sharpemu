@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Hashing;
 using SharpEmu.HLE;
@@ -47,12 +48,67 @@ public static class ShaderIdentity
         return true;
     }
 
-    // The declared hash when it is not zero, else the content hash of every code range.
+    // A single code object keeps its declared-or-content identity. Fused programs
+    // combine the ordered identity of every half, so the entry's declared hash
+    // cannot hide a changed continuation.
     public static ulong Compute(ICpuMemory memory, ulong codeAddress, ReadOnlySpan<(ulong Address, uint SizeBytes)> ranges, string label)
     {
-        if (!TryReadDeclaredHash(memory, codeAddress, out var declaredHash))
+        if (ranges.Length == 0)
         {
-            throw Scheduling.SubmissionScheduler.Fatal($"The shader code is unreadable: label={label} shader=0x{codeAddress:X16}.");
+            return ComputeCodeObject(memory, codeAddress, 0, label);
+        }
+
+        if (ranges.Length == 1)
+        {
+            return ComputeCodeObject(memory, ranges[0].Address, ranges[0].SizeBytes, label);
+        }
+
+        var combined = new XxHash3();
+        Span<byte> encodedHash = stackalloc byte[sizeof(ulong)];
+        foreach (var (address, sizeBytes) in ranges)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                encodedHash,
+                ComputeCodeObject(memory, address, sizeBytes, label));
+            combined.Append(encodedHash);
+        }
+
+        return combined.GetCurrentHashAsUInt64();
+    }
+
+    // Registered shaders already expose their one or two ranges as scalar fields. Avoid
+    // allocating CodeRanges on every draw while still reading (and, without a declared hash,
+    // hashing) every code object so self-modifying shaders remain detectable.
+    public static ulong Compute(ICpuMemory memory, RegisteredShader shader, string label)
+    {
+        if (!shader.IsFused)
+        {
+            return ComputeCodeObject(memory, shader.CodeAddress, shader.CodeSizeBytes, label);
+        }
+
+        var combined = new XxHash3();
+        Span<byte> encodedHash = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            encodedHash,
+            ComputeCodeObject(memory, shader.CodeAddress, shader.CodeSizeBytes, label));
+        combined.Append(encodedHash);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            encodedHash,
+            ComputeCodeObject(memory, shader.ContinuationAddress, shader.ContinuationSizeBytes, label));
+        combined.Append(encodedHash);
+        return combined.GetCurrentHashAsUInt64();
+    }
+
+    private static ulong ComputeCodeObject(
+        ICpuMemory memory,
+        ulong address,
+        uint sizeBytes,
+        string label)
+    {
+        if (!TryReadDeclaredHash(memory, address, out var declaredHash))
+        {
+            throw Scheduling.SubmissionScheduler.Fatal(
+                $"The shader code is unreadable: label={label} shader=0x{address:X16}.");
         }
 
         if (declaredHash != 0)
@@ -60,18 +116,22 @@ public static class ShaderIdentity
             return declaredHash;
         }
 
-        var hash = new XxHash3();
-        foreach (var (address, sizeBytes) in ranges)
+        var length = checked((int)sizeBytes);
+        var code = ArrayPool<byte>.Shared.Rent(length);
+        try
         {
-            var code = new byte[sizeBytes];
-            if (!memory.TryRead(address, code))
+            var contents = code.AsSpan(0, length);
+            if (!memory.TryRead(address, contents))
             {
-                throw Scheduling.SubmissionScheduler.Fatal($"The shader code is unreadable: label={label} shader=0x{address:X16} size=0x{sizeBytes:X8}.");
+                throw Scheduling.SubmissionScheduler.Fatal(
+                    $"The shader code is unreadable: label={label} shader=0x{address:X16} size=0x{sizeBytes:X8}.");
             }
 
-            hash.Append(code);
+            return XxHash3.HashToUInt64(contents);
         }
-
-        return hash.GetCurrentHashAsUInt64();
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(code);
+        }
     }
 }

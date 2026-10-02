@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers;
 using System.Runtime.InteropServices;
 using SharpEmu.HLE;
 using SharpEmu.HLE.GpuMemory;
@@ -28,6 +29,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private const ulong MiB = 1024 * 1024;
     private const ulong GdsBufferSize = 64 * 1024;
+    private const int CpuTransferChunkBytes = 64 * 1024;
     private readonly record struct PlannedDownload(GpuBuffer Buffer, ulong Address, BufferDownloadPlacement Placement);
 
     private enum ShutdownOutcome
@@ -41,6 +43,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private readonly SubmissionScheduler _scheduler;
     private readonly IGpuQueueRelay _relay;
     private readonly GuestBufferUploader _uploader;
+    private readonly ICpuMemory _guest;
     private readonly IGuestBackedSpace _backing;
     private readonly BdaFaultProcessor _faults;
     private readonly GpuBuffer _gds;
@@ -69,6 +72,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _device = device;
         _scheduler = scheduler;
         _relay = relay;
+        _guest = guest;
         _backing = backing;
         _faults = new BdaFaultProcessor(device, scheduler, this, CachingPageBits, CachingPageCount);
         _gds = new GpuBuffer(device, scheduler, GpuBufferUsage.Stream, 0, GpuBuffer.AllFlags, GdsBufferSize);
@@ -280,9 +284,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal(
                 $"Cannot reserve image staging space: address=0x{guestAddress:X16} size=0x{size:X16} capacity=0x{_staging.Size:X16} tick={_scheduler.CurrentTick}.");
         }
-        if (!_backing.TryReadBacking(guestAddress, _staging.Mapped.Slice((int)stageOffset, (int)size)) &&
-            !KernelMemoryCompatExports.TryReadPrtBacking(_backing, guestAddress,
-                _staging.Mapped.Slice((int)stageOffset, (int)size)))
+        var staging = _staging.Mapped.Slice((int)stageOffset, (int)size);
+        if (!_backing.TryReadBacking(guestAddress, staging) &&
+            !KernelMemoryCompatExports.TryReadPrtBacking(_backing, guestAddress, staging) &&
+            !_guest.TryRead(guestAddress, staging))
         {
             throw SubmissionScheduler.Fatal(
                 $"Could not read the mapped guest image backing: address=0x{guestAddress:X16} size=0x{size:X16} range_backed={_backing.IsBackedRange(guestAddress, size)} first_byte_backed={_backing.IsBackedRange(guestAddress, 1)} last_byte_backed={_backing.IsBackedRange(guestAddress + size - 1, 1)} tick={_scheduler.CurrentTick}.");
@@ -376,14 +381,21 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 images.InvalidateMemory(guestAddress, size);
             }
 
-            var values = new uint[4096];
-            Array.Fill(values, value);
-            var bytes = MemoryMarshal.AsBytes<uint>(values);
-            for (ulong offset = 0; offset < size;)
+            var scratch = ArrayPool<byte>.Shared.Rent(CpuTransferChunkBytes);
+            try
             {
-                var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
-                WriteHostMemory(guestAddress + offset, bytes[..chunk]);
-                offset += (ulong)chunk;
+                var bytes = scratch.AsSpan(0, CpuTransferChunkBytes);
+                MemoryMarshal.Cast<byte, uint>(bytes).Fill(value);
+                for (ulong offset = 0; offset < size;)
+                {
+                    var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
+                    WriteHostMemory(guestAddress + offset, bytes[..chunk]);
+                    offset += (ulong)chunk;
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(scratch);
             }
 
             return;
@@ -420,17 +432,25 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 images.InvalidateMemory(dstVaddr, size);
             }
 
-            var bytes = new byte[64 * 1024];
-            for (ulong offset = 0; offset < size;)
+            var scratch = ArrayPool<byte>.Shared.Rent(CpuTransferChunkBytes);
+            try
             {
-                var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
-                if (!_backing.TryReadBacking(srcVaddr + offset, bytes.AsSpan(0, chunk)))
+                var bytes = scratch.AsSpan(0, CpuTransferChunkBytes);
+                for (ulong offset = 0; offset < size;)
                 {
-                    throw SubmissionScheduler.Fatal("The host DMA source has no direct backing.");
-                }
+                    var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
+                    if (!_backing.TryReadBacking(srcVaddr + offset, bytes[..chunk]))
+                    {
+                        throw SubmissionScheduler.Fatal("The host DMA source has no direct backing.");
+                    }
 
-                WriteHostMemory(dstVaddr + offset, bytes.AsSpan(0, chunk));
-                offset += (ulong)chunk;
+                    WriteHostMemory(dstVaddr + offset, bytes[..chunk]);
+                    offset += (ulong)chunk;
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(scratch);
             }
 
             return;
@@ -1052,7 +1072,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             BufferUploadProfile.Record(guestAddress, size, copies.Count, totalSize, hotBytes, elapsedTicks);
         }
 
-        if (isTexelBuffer && !isWritten)
+        if (isTexelBuffer)
         {
             return RequireImageCache().TrySynchronizeBufferFromImage(buffer, guestAddress, size);
         }

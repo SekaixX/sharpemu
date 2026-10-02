@@ -99,7 +99,15 @@ internal sealed class PresenterUnderTest : IDisposable
     public CommandBuffer Command => new(Harness.Scheduler.Current.Handle);
 
     // Loads the dynamic rendering commands the render host records with; the device must carry the extensions.
-    public void LoadRenderingCommands() => InvokeMethod("LoadRenderingCommands", false, Harness.Vulkan.DeviceName);
+    public void LoadRenderingCommands(
+        bool supportsAttachmentFeedbackLoop = false,
+        bool supportsMeshShader = false) =>
+        InvokeMethod(
+            "LoadRenderingCommands",
+            false,
+            Harness.Vulkan.DeviceName,
+            supportsAttachmentFeedbackLoop,
+            supportsMeshShader);
 
     public void SetField(string name, object value) => PresenterType.GetField(name, InstanceMembers)!.SetValue(Instance, value);
 

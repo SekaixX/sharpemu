@@ -62,6 +62,25 @@ internal sealed unsafe partial class PosixHostViews : IHostViewMemory
         return true;
     }
 
+    public bool TryCommitBacking(HostBackingObject backing, ulong offset, ulong size)
+    {
+        lock (backing.Gate)
+        {
+            return !backing.IsDisposed && HostViewMemory.IsValidOffset(backing, offset, size, PageSize);
+        }
+    }
+
+    public bool TryReserveFreeRegions(
+        ulong startAddress,
+        ulong endAddress,
+        ulong minimumRegionSize,
+        out IReadOnlyList<HostAddressRange> reservations)
+    {
+        _ = minimumRegionSize;
+        reservations = Array.Empty<HostAddressRange>();
+        return startAddress != 0 && startAddress < endAddress;
+    }
+
     public ulong ReserveHole(ulong address, ulong size)
     {
         lock (PosixViewRegions.Gate)

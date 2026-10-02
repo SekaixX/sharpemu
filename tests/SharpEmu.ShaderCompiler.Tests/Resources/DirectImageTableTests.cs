@@ -11,7 +11,365 @@ namespace SharpEmu.ShaderCompiler.Tests.Resources;
 
 public sealed class DirectImageTableTests
 {
-    public static Gen5ShaderProgram CreateProgram(uint mask = 1, bool split = true, bool bitScan = true)
+    internal static Gen5ShaderProgram CreateWaveIndexedDescriptorProgram(
+        bool includeNonNegativeKeyGuard = true,
+        bool preserveLoadedMaskUntilClear = true,
+        bool preserveHeapAddress = true,
+        bool preserveGuardedExecutionMask = true,
+        bool branchAroundAddressDefinition = false)
+    {
+        var instructions = new List<Gen5ShaderInstruction>
+        {
+            ScalarLoad(0, 0, 16, immediateOffset: 0x80),
+            Sop1(8, "SFF1I32B32", 18, Gen5Operand.Scalar(16)),
+            MoveVectorFromScalar(16, 34, 18),
+            Vop2(20, "VLshlrevB32", 15, Operand(4), Gen5Operand.Vector(34)),
+            Vop3(24, "VLshlAddU32", 16, Gen5Operand.Vector(15), Operand(3), Gen5Operand.Vector(15)),
+            preserveLoadedMaskUntilClear ? Nop(32) : MoveScalar(32, 16, 0xFFFF),
+            Sop1(36, "SBitset0B32", 16, Gen5Operand.Scalar(18)),
+            preserveHeapAddress ? Nop(40) : MoveScalar(40, 0, 0x2000),
+            branchAroundAddressDefinition
+                ? Branch(44, "SCbranchScc1", 1)
+                : preserveHeapAddress ? Nop(44) : MoveScalar(44, 1, 0),
+            Vop2(48, "VAddI32", 15,
+                new Gen5Operand(Gen5OperandKind.LiteralConstant, 0x40), Gen5Operand.Vector(16)),
+            GlobalMemory(52, "GlobalLoadDword", 0, 15, 22, 0),
+            includeNonNegativeKeyGuard
+                ? Vopc(60, "VCmpxLeI32", Operand(0), 22)
+                : Nop(60),
+            preserveGuardedExecutionMask
+                ? Nop(64)
+                : Sop1(64, "SAndSaveexecB32", 20, Operand(uint.MaxValue)),
+            ReadFirstLane(68, 106, 22),
+            Sop2(72, "SLshlB32", 106, Gen5Operand.Scalar(106), Operand(5)),
+            ScalarLoad(76, 0, 4, 8, immediateOffset: 0x100, dynamicOffsetRegister: 106),
+            Image(84, "ImageLoad", 4, dmask: 1, vectorAddress: 1),
+            EndProgram(92),
+        };
+        return Program([.. instructions]);
+    }
+
+    internal static Gen5ShaderProgram CreateWaveIndexedReadLaneProgram(
+        bool selfAddressed,
+        bool restoreExec = true)
+    {
+        return Program(
+            ScalarLoad(0, 0, 16, immediateOffset: 0x80),
+            Sop1(8, "SFF1I32B32", 18, Gen5Operand.Scalar(16)),
+            MoveVectorFromScalar(16, 34, 18),
+            Vop2(20, "VLshlrevB32", 15, Operand(4), Gen5Operand.Vector(34)),
+            Vop3(24, "VLshlAddU32", selfAddressed ? 15u : 16u,
+                Gen5Operand.Vector(15), Operand(3), Gen5Operand.Vector(15)),
+            Sop2(32, "SLshlB32", 20, Operand(1), Gen5Operand.Scalar(18)),
+            Sop2(36, "SXorB32", 16, Gen5Operand.Scalar(20), Gen5Operand.Scalar(16)),
+            Vop2(40, "VAddI32", 15,
+                new Gen5Operand(Gen5OperandKind.LiteralConstant, 0x40),
+                Gen5Operand.Vector(selfAddressed ? 15u : 16u)),
+            GlobalMemory(44, "GlobalLoadDword", 0, 15, 22, 0),
+            Sop1(52, "SMovB64", 12, Gen5Operand.Scalar(126)),
+            Sop1(56, "SFF1I32B64", 24, Gen5Operand.Scalar(12)),
+            new Gen5ShaderInstruction(
+                60,
+                Gen5ShaderEncoding.Vop3,
+                "VReadlaneB32",
+                [0u, 0u],
+                [Gen5Operand.Vector(22), Gen5Operand.Scalar(24), Gen5Operand.Scalar(24)],
+                [Gen5Operand.Scalar(106)],
+                null),
+            new Gen5ShaderInstruction(
+                68,
+                Gen5ShaderEncoding.Vop3,
+                "VCmpEqU32",
+                [0u, 0u],
+                [Gen5Operand.Scalar(106), Gen5Operand.Vector(22)],
+                [Gen5Operand.Scalar(14)],
+                new Gen5Vop3Control(0, 0, 0, false, 0, 14)),
+            Sop1(76, "SAndSaveexecB64", 28, Gen5Operand.Scalar(14)),
+            Branch(80, "SCbranchExecz", 8),
+            Sop2(84, "SLshlB32", 106, Gen5Operand.Scalar(106), Operand(5)),
+            Sop2(88, "SAddI32", 107, Gen5Operand.Scalar(106), Operand(16)),
+            ScalarLoad(92, 0, 4, 4, immediateOffset: 0x100, dynamicOffsetRegister: 106),
+            ScalarLoad(100, 0, 8, 4, immediateOffset: 0x100, dynamicOffsetRegister: 107),
+            Image(108, "ImageLoad", 4, dmask: 1, vectorAddress: 1),
+            Sop2(116, "SAndn2B64", 12, Gen5Operand.Scalar(12), Gen5Operand.Scalar(14)),
+            restoreExec ? Sop1(120, "SMovB64", 126, Gen5Operand.Scalar(28)) : Nop(120),
+            Branch(124, "SCbranchScc1", -18),
+            EndProgram(128));
+    }
+
+    private static bool ReadWaveIndexedMemory(ulong address, out uint word)
+    {
+        word = 0;
+        if (address == 0x1000 + 0x80)
+        {
+            word = (1u << 1) | (1u << 4);
+            return true;
+        }
+
+        if (address == 0x1000 + 0x40 + 0x90 || address == 0x1000 + 0x40 + 4 * 0x90)
+        {
+            word = address == 0x1000 + 0x40 + 0x90 ? 2u : 5u;
+            return true;
+        }
+
+        if (address < 0x1000 + 0x100 || address >= 0x1000 + 0x100 + 6 * 32)
+        {
+            return false;
+        }
+
+        var relative = address - 0x1000 - 0x100;
+        var record = relative / 32;
+        if (record is not (2 or 5))
+        {
+            return false;
+        }
+
+        word = (relative % 32 / 4) switch
+        {
+            0 => (record & 1) == 0 ? 0x2000u : 0x1000u,
+            1 => 20u << 20,
+            3 => 0xFACu | (9u << 28),
+            _ => 0,
+        };
+        return true;
+    }
+
+    [Fact]
+    public void WaveIndexedDescriptorTableMaterializesOnlyActiveMaskKeys()
+    {
+        var plan = ShaderResourcePlan.Extract(
+            CreateWaveIndexedDescriptorProgram(), ShaderStage.Compute, Hash, 0, 2);
+        var selector = plan.DescriptorSources[(int)plan.Info.Images[0].Source].IndirectImage!;
+        Assert.True(selector.Dense);
+        Assert.Equal(0u, selector.KeyBound);
+        Assert.Equal(new WaveIndexedImageSelector(0x80, 0x40, 0x90)
+        {
+            RejectNegativeKeys = true,
+        }, selector.WaveIndexed);
+
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        Assert.True(ResourceMaterializer.Materialize(
+            plan,
+            Inputs([0x1000, 0], readCleanMemory: ReadWaveIndexedMemory),
+            ref snapshot,
+            ref specialization));
+        Assert.Equal(2, snapshot.Images.Length);
+    }
+
+    [Theory]
+    [InlineData("snapshot")]
+    [InlineData("mask")]
+    [InlineData("index")]
+    [InlineData("descriptor")]
+    public void WaveIndexedReadFailureReportsTheOriginalPhaseAndAddress(string failureSite)
+    {
+        var plan = ShaderResourcePlan.Extract(
+            CreateWaveIndexedDescriptorProgram(), ShaderStage.Compute, Hash, 0, 2);
+        var maskReads = 0;
+        var regularReads = 0;
+        bool ReadRegular(ulong address, out uint word)
+        {
+            regularReads++;
+            throw new InvalidOperationException($"diagnostics must not synchronize 0x{address:X16}");
+        }
+        bool ReadClean(ulong address, out uint word)
+        {
+            if (address == 0x1080)
+            {
+                maskReads++;
+                if (failureSite == "snapshot" || (failureSite == "mask" && maskReads == 2))
+                {
+                    word = 0;
+                    return false;
+                }
+            }
+            if ((failureSite == "index" && address == 0x10D0) ||
+                (failureSite == "descriptor" && address == 0x114C))
+            {
+                word = 0;
+                return false;
+            }
+            return ReadWaveIndexedMemory(address, out word);
+        }
+
+        var snapshot = new ResourceSnapshot { UserData = [0xFEEDBEEF] };
+        var specialization = new ResourceSpecialization();
+        var previousSnapshot = snapshot;
+        var previousSpecialization = specialization;
+
+        Assert.False(ResourceMaterializer.Materialize(
+            plan,
+            Inputs([0x1000, 0], readMemory: ReadRegular, readCleanMemory: ReadClean),
+            ref snapshot,
+            ref specialization,
+            out var failure,
+            out var detail));
+
+        Assert.Equal(ResourceMaterializationFailure.Other, failure);
+        Assert.NotNull(detail);
+        Assert.Same(previousSnapshot, snapshot);
+        Assert.Same(previousSpecialization, specialization);
+        Assert.Equal(0, regularReads);
+        switch (failureSite)
+        {
+            case "snapshot":
+                Assert.Contains("phase=snapshot_evaluation", detail);
+                Assert.Contains("address=0x0000000000001080", detail);
+                break;
+            case "mask":
+                Assert.Contains("phase=wave_mask_read", detail);
+                Assert.Contains("address=0x0000000000001080", detail);
+                break;
+            case "index":
+                Assert.Contains("phase=wave_index_read", detail);
+                Assert.Contains("bit=1", detail);
+                Assert.Contains("address=0x00000000000010D0", detail);
+                break;
+            default:
+                Assert.Contains("phase=wave_descriptor_read", detail);
+                Assert.Contains("key=0x00000002", detail);
+                Assert.Contains("dword=3", detail);
+                Assert.Contains("address=0x000000000000114C", detail);
+                break;
+        }
+    }
+
+    [Fact]
+    public void WaveIndexedHeapSourceFailureReportsItsSourceAndAddress()
+    {
+        var waveProgram = CreateWaveIndexedDescriptorProgram();
+        var program = Program([
+            ScalarLoad(0, 40, 0, count: 2),
+            .. waveProgram.Instructions.Select(instruction => instruction with { Pc = instruction.Pc + 8 }),
+        ]);
+        var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, Hash, 40, 2);
+        var pointerLowReads = 0;
+        var regularReads = 0;
+        bool ReadRegular(ulong address, out uint word)
+        {
+            regularReads++;
+            throw new InvalidOperationException($"diagnostics must not synchronize 0x{address:X16}");
+        }
+        bool ReadClean(ulong address, out uint word)
+        {
+            if (address == 0x3000)
+            {
+                pointerLowReads++;
+                word = 0x1000;
+                return pointerLowReads == 1;
+            }
+            if (address == 0x3004)
+            {
+                word = 0;
+                return true;
+            }
+            return ReadWaveIndexedMemory(address, out word);
+        }
+
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        var previousSnapshot = snapshot;
+        var previousSpecialization = specialization;
+        Assert.False(ResourceMaterializer.Materialize(
+            plan,
+            Inputs([0x3000, 0], readMemory: ReadRegular, readCleanMemory: ReadClean),
+            ref snapshot,
+            ref specialization,
+            out var failure,
+            out var detail));
+
+        Assert.Equal(ResourceMaterializationFailure.Other, failure);
+        Assert.NotNull(detail);
+        Assert.Contains("phase=wave_heap_source_evaluation", detail);
+        Assert.Contains("heap_source=", detail);
+        Assert.Contains("address=0x0000000000003000", detail);
+        Assert.Same(previousSnapshot, snapshot);
+        Assert.Same(previousSpecialization, specialization);
+        Assert.Equal(0, regularReads);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReadLaneWaterfallSelectsWaveIndexedDescriptors(bool selfAddressed)
+    {
+        var plan = ShaderResourcePlan.Extract(
+            CreateWaveIndexedReadLaneProgram(selfAddressed), ShaderStage.Compute, Hash, 0, 2);
+        var selector = plan.DescriptorSources[(int)plan.Info.Images[0].Source].IndirectImage!;
+        Assert.Equal(new WaveIndexedImageSelector(0x80, 0x40, 0x90), selector.WaveIndexed);
+
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        Assert.True(ResourceMaterializer.Materialize(
+            plan,
+            Inputs([0x1000, 0], readCleanMemory: ReadWaveIndexedMemory),
+            ref snapshot,
+            ref specialization));
+        Assert.Equal(2, snapshot.Images.Length);
+    }
+
+    [Theory]
+    [InlineData("missing-signed-guard")]
+    [InlineData("overwritten-exec")]
+    [InlineData("overwritten-mask")]
+    [InlineData("different-heap")]
+    [InlineData("branch-around-address")]
+    public void UnsafeWaveIndexedDescriptorShapesAreRejected(string variation)
+    {
+        var program = variation switch
+        {
+            "missing-signed-guard" => CreateWaveIndexedDescriptorProgram(includeNonNegativeKeyGuard: false),
+            "overwritten-exec" => CreateWaveIndexedDescriptorProgram(preserveGuardedExecutionMask: false),
+            "overwritten-mask" => CreateWaveIndexedDescriptorProgram(preserveLoadedMaskUntilClear: false),
+            "different-heap" => CreateWaveIndexedDescriptorProgram(preserveHeapAddress: false),
+            _ => CreateWaveIndexedDescriptorProgram(branchAroundAddressDefinition: true),
+        };
+
+        Assert.Throws<ResourcePlanException>(() =>
+            ShaderResourcePlan.Extract(program, ShaderStage.Compute, Hash, 0, 2));
+    }
+
+    [Fact]
+    public void ReadLaneWaterfallWithoutRestoredExecutionIsRejected()
+    {
+        Assert.Throws<ResourcePlanException>(() =>
+            ShaderResourcePlan.Extract(
+                CreateWaveIndexedReadLaneProgram(selfAddressed: true, restoreExec: false),
+                ShaderStage.Compute,
+                Hash,
+                0,
+                2));
+    }
+
+    [Fact]
+    public void WaveIndexedHeapReadsMarkEquivalentNonIdenticalHandlesClean()
+    {
+        var memory = new MemoryAccessTable();
+        var heapLow = ScalarValue.UserData(0);
+        var heapHigh = ScalarValue.UserData(1);
+        var readLow = ScalarValue.UserData(0);
+        var readHigh = ScalarValue.UserData(1);
+        var readHandle = ScalarValue.Handle(
+            ScalarValueKind.AddressHandle,
+            [readLow, readHigh]);
+        var read = ScalarValue.MemoryRead(
+            ScalarValueKind.ScalarAddressWord,
+            readHandle,
+            ScalarValue.ConstantOf(0u),
+            0);
+        var slots = new byte[1];
+
+        ShaderResourcePlan.MarkHeapReadSlots(
+            memory,
+            [new ResourceTableRead(read, 0)],
+            new DescriptorSource { Dwords = [heapLow, heapHigh] },
+            slots);
+
+        Assert.Equal((byte)1, slots[0]);
+    }
+
+    public static Gen5ShaderProgram CreateProgram(uint mask = 1, bool split = true, bool bitScan = true, bool r128 = false)
     {
         var instructions = new List<Gen5ShaderInstruction>
         {
@@ -27,7 +385,7 @@ public sealed class DirectImageTableTests
         instructions.AddRange([
             MoveScalar(40, 106, 999),
             MoveVector(44, 1, 0), MoveVector(48, 2, 0),
-            Image(52, "ImageLoad", 4, dmask: 1, vectorAddress: 1),
+            Image(52, "ImageLoad", 4, dmask: 1, vectorAddress: 1, r128: r128),
             MoveScalar(60, 20, 0), MoveScalar(64, 21, 0), MoveScalar(68, 22, 64), MoveScalar(72, 23, 0),
             BufferAccess(76, "BufferStoreDword", 20, vectorData: 4), EndProgram(84),
         ]);
@@ -51,9 +409,9 @@ public sealed class DirectImageTableTests
         return true;
     }
 
-    public static Gen5ShaderProgram CreateGuardedProgram(uint mask = 1, bool split = true)
+    public static Gen5ShaderProgram CreateGuardedProgram(uint mask = 1, bool split = true, bool r128 = false)
     {
-        var program = CreateProgram(mask, split);
+        var program = CreateProgram(mask, split, r128: r128);
         return program with
         {
             Instructions = program.Instructions.Where(instruction => instruction.Pc < 8)
@@ -188,6 +546,52 @@ public sealed class DirectImageTableTests
             Assert.Equal(ResourceMaterializationFailure.ImageCapacityExceeded, failure);
             Assert.Same(previousSnapshot, snapshot);
             Assert.Same(previousSpecialization, specialization);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, false, 2, 0x80000000u, true)]
+    [InlineData(false, false, 2, 0x40000000u, false)]
+    [InlineData(false, false, 4, 0x20000000u, false)]
+    [InlineData(false, true, 4, 0x20000000u, true)]
+    [InlineData(true, false, 2, 0x80000000u, true)]
+    [InlineData(true, false, 2, 0x40000000u, false)]
+    [InlineData(true, false, 4, 0x20000000u, false)]
+    [InlineData(true, true, 4, 0x20000000u, true)]
+    public void DirectAndDenseCandidatesMatchKyTyReservedFields(
+        bool dense,
+        bool r128,
+        int word,
+        uint bit,
+        bool expectedValid)
+    {
+        var program = dense ? CreateGuardedProgram(r128: r128) : CreateProgram(r128: r128);
+        var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, Hash, 0, 2);
+        bool Read(ulong address, out uint value)
+        {
+            var success = ReadDescriptor(address, out value);
+            if (success && ((address - 0x1000 - 312) % 32) / 4 == (ulong)word)
+            {
+                value |= bit;
+            }
+            return success;
+        }
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+
+        Assert.True(ResourceMaterializer.Materialize(
+            plan,
+            Inputs([0x1000, 0], readCleanMemory: Read),
+            ref snapshot,
+            ref specialization));
+        if (expectedValid)
+        {
+            Assert.Contains(snapshot.Images, descriptor => (descriptor[word] & bit) != 0);
+        }
+        else
+        {
+            var descriptor = Assert.Single(snapshot.Images);
+            Assert.All(descriptor, value => Assert.Equal(0u, value));
         }
     }
 

@@ -15,6 +15,9 @@ namespace SharpEmu.Libs.Stubs;
 /// </summary>
 public static class GameServiceStubs
 {
+    private const int NpTrophy2GameDetailsSize = 152;
+    private const int NpTrophy2GameDataSize = 24;
+
     private static int Ok(CpuContext ctx)
     {
         ctx[CpuRegister.Rax] = 0;
@@ -43,7 +46,41 @@ public static class GameServiceStubs
 
     [SysAbiExport(Nid = "4IzqhhUQ3nk", ExportName = "sceNpTrophy2GetGameInfo",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceNpTrophy2")]
-    public static int NpTrophy2GetGameInfo(CpuContext ctx) => Ok(ctx);
+    public static int NpTrophy2GetGameInfo(CpuContext ctx)
+    {
+        // SysV ABI: (context, handle, details, data).  A successful call must
+        // initialize both optional output structures.  Leaving details intact
+        // exposes stale guest stack/heap bytes as trophy counts; callers then
+        // trust those counts when sizing their result arrays.
+        var detailsAddress = ctx[CpuRegister.Rdx];
+        if (detailsAddress != 0)
+        {
+            Span<byte> details = stackalloc byte[NpTrophy2GameDetailsSize];
+            details.Clear();
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(details[4..], 1);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(details[20..], 1);
+            "SharpEmu"u8.CopyTo(details[24..]);
+            if (!ctx.Memory.TryWrite(detailsAddress, details))
+            {
+                ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+        }
+
+        var dataAddress = ctx[CpuRegister.Rcx];
+        if (dataAddress != 0)
+        {
+            Span<byte> data = stackalloc byte[NpTrophy2GameDataSize];
+            data.Clear();
+            if (!ctx.Memory.TryWrite(dataAddress, data))
+            {
+                ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+        }
+
+        return Ok(ctx);
+    }
 
     // ---- CES: Shift-JIS <-> Unicode conversion setup (Japanese text) ----
 
@@ -64,14 +101,6 @@ public static class GameServiceStubs
         Target = Generation.Gen5, LibraryName = "libSceNpGameIntent")]
     public static int NpGameIntentTerminate(CpuContext ctx) => Ok(ctx);
 
-    [SysAbiExport(Nid = "jqb7HntFQFc", ExportName = "sceWebBrowserDialogInitialize",
-        Target = Generation.Gen5, LibraryName = "libSceWebBrowserDialog")]
-    public static int WebBrowserDialogInitialize(CpuContext ctx) => Ok(ctx);
-
-    [SysAbiExport(Nid = "ocHtyBwHfys", ExportName = "sceWebBrowserDialogTerminate",
-        Target = Generation.Gen5, LibraryName = "libSceWebBrowserDialog")]
-    public static int WebBrowserDialogTerminate(CpuContext ctx) => Ok(ctx);
-
     [SysAbiExport(Nid = "mlYGfmqE3fQ", ExportName = "sceSigninDialogInitialize",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSigninDialog")]
     public static int SigninDialogInitialize(CpuContext ctx) => Ok(ctx);
@@ -89,11 +118,11 @@ public static class GameServiceStubs
     public static int SharePlayInitialize(CpuContext ctx) => Ok(ctx);
 
     [SysAbiExport(Nid = "0IL1keINExQ", ExportName = "sceShareTerminate",
-        Target = Generation.Gen5, LibraryName = "libSceShareUtility")]
+        Target = Generation.Gen5, LibraryName = "libSceShare")]
     public static int ShareTerminate(CpuContext ctx) => Ok(ctx);
 
     [SysAbiExport(Nid = "YBiIdcDPrxs", ExportName = "sceShareFeaturePermit",
-        Target = Generation.Gen5, LibraryName = "libSceShareUtility")]
+        Target = Generation.Gen5, LibraryName = "libSceShare")]
     public static int ShareFeaturePermit(CpuContext ctx) => Ok(ctx);
 
     [SysAbiExport(Nid = "9TrhuGzberQ", ExportName = "sceVoiceInit",
@@ -180,12 +209,4 @@ public static class GameServiceStubs
         Target = Generation.Gen5, LibraryName = "libSceVideoRecording")]
     public static int VideoRecordingSetInfo(CpuContext ctx) => Ok(ctx);
 
-    // Captured from GTA V Enhanced (PPSA04264); not in the public NID catalog.
-    // Side-effect-free success — same as unresolved stub behavior that kept boot
-    // moving; reverse the ABI before writing guest memory.
-    #pragma warning disable SHEM006
-    [SysAbiExport(Nid = "Ikfdt-rIqCE", ExportName = "sceUnknownIkfdt",
-        Target = Generation.Gen5, LibraryName = "libKernel")]
-    public static int UnknownIkfdt(CpuContext ctx) => Ok(ctx);
-    #pragma warning restore SHEM006
 }

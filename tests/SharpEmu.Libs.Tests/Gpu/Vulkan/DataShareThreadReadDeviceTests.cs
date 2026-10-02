@@ -27,7 +27,7 @@ public sealed class DataShareThreadReadDeviceTests(HeadlessVulkanFixture fixture
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
         var program = Gen5DataShareThreadReadTests.CreateReadbackProgram(scalarBase, byteOffset, maskOddLanes);
-        var (plan, resources, layout) = Prepare(program);
+        var (plan, resources, layout) = Prepare(program, waveSize: waveSize);
         var request = new ShaderCompileRequest(plan, resources, layout)
         {
             LocalSizeX = waveSize, ThreadCountX = waveSize, WaveSize = waveSize,

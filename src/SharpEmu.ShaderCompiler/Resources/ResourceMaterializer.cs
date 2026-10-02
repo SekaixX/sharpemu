@@ -31,14 +31,18 @@ public static class ResourceMaterializer
         public IndirectSelectorDiagnostic? SelectorDiagnostic;
     }
 
-    private sealed class MaterializedSnapshot
+    private struct MaterializedSnapshot
     {
         public uint[][] Buffers = [];
         public uint[][] Images = [];
         public uint[][] Samplers = [];
         public uint[] FlattenedTable = [];
         public uint[] UserData = [];
-        public List<IndirectImageTable> IndirectImages = [];
+        public List<IndirectImageTable>? IndirectImages;
+
+        public MaterializedSnapshot()
+        {
+        }
     }
 
     public static bool Materialize(
@@ -47,7 +51,7 @@ public static class ResourceMaterializer
         ref ResourceSnapshot snapshot,
         ref ResourceSpecialization specialization,
         Action<IndirectImageFailure>? captureIndirectImageFailure = null)
-        => Materialize(plan, inputs, ref snapshot, ref specialization, out _, captureIndirectImageFailure);
+        => Materialize(plan, inputs, ref snapshot, ref specialization, out _, out _, captureIndirectImageFailure);
 
     public static bool Materialize(
         ShaderResourcePlan plan,
@@ -56,9 +60,90 @@ public static class ResourceMaterializer
         ref ResourceSpecialization specialization,
         out ResourceMaterializationFailure failure,
         Action<IndirectImageFailure>? captureIndirectImageFailure = null)
+        => Materialize(
+            plan,
+            inputs,
+            ref snapshot,
+            ref specialization,
+            out failure,
+            out _,
+            captureIndirectImageFailure);
+
+    public static bool Materialize(
+        ShaderResourcePlan plan,
+        ResourceRuntimeInputs inputs,
+        ref ResourceSnapshot snapshot,
+        ref ResourceSpecialization specialization,
+        out ResourceMaterializationFailure failure,
+        out string? failureDetail,
+        Action<IndirectImageFailure>? captureIndirectImageFailure = null)
+        => MaterializeCore(
+            plan,
+            inputs,
+            specializationScratch: null,
+            ref snapshot,
+            ref specialization,
+            out failure,
+            out failureDetail,
+            captureIndirectImageFailure);
+
+    // The scratch specialization is transient and may be overwritten by the next call that
+    // uses it. A cache miss must clone the returned specialization before retaining it.
+    public static bool Materialize(
+        ShaderResourcePlan plan,
+        ResourceRuntimeInputs inputs,
+        ResourceSpecializationScratch specializationScratch,
+        ref ResourceSnapshot snapshot,
+        ref ResourceSpecialization specialization,
+        out ResourceMaterializationFailure failure,
+        Action<IndirectImageFailure>? captureIndirectImageFailure = null)
+        => Materialize(
+            plan,
+            inputs,
+            specializationScratch,
+            ref snapshot,
+            ref specialization,
+            out failure,
+            out _,
+            captureIndirectImageFailure);
+
+    public static bool Materialize(
+        ShaderResourcePlan plan,
+        ResourceRuntimeInputs inputs,
+        ResourceSpecializationScratch specializationScratch,
+        ref ResourceSnapshot snapshot,
+        ref ResourceSpecialization specialization,
+        out ResourceMaterializationFailure failure,
+        out string? failureDetail,
+        Action<IndirectImageFailure>? captureIndirectImageFailure = null)
+        => MaterializeCore(
+            plan,
+            inputs,
+            specializationScratch,
+            ref snapshot,
+            ref specialization,
+            out failure,
+            out failureDetail,
+            captureIndirectImageFailure);
+
+    private static bool MaterializeCore(
+        ShaderResourcePlan plan,
+        ResourceRuntimeInputs inputs,
+        ResourceSpecializationScratch? specializationScratch,
+        ref ResourceSnapshot snapshot,
+        ref ResourceSpecialization specialization,
+        out ResourceMaterializationFailure failure,
+        out string? failureDetail,
+        Action<IndirectImageFailure>? captureIndirectImageFailure)
     {
         using var totalProfile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.Total);
-        if (!MaterializeSnapshot(plan, inputs, captureIndirectImageFailure is not null, out var materialized, out failure))
+        if (!MaterializeSnapshot(
+                plan,
+                inputs,
+                captureIndirectImageFailure is not null,
+                out var materialized,
+                out failure,
+                out failureDetail))
         {
             return false;
         }
@@ -80,7 +165,14 @@ public static class ResourceMaterializer
             materialized.FlattenedTable[offset + 2] = (uint)Math.Min(range.Size, uint.MaxValue);
         }
 
-        if (!BuildSpecialization(plan, materialized, out var nextSnapshot, out var nextSpecialization, out failure, captureIndirectImageFailure))
+        if (!BuildSpecialization(
+            plan,
+            materialized,
+            specializationScratch,
+            out var nextSnapshot,
+            out var nextSpecialization,
+            out failure,
+            captureIndirectImageFailure))
         {
             return false;
         }
@@ -97,28 +189,39 @@ public static class ResourceMaterializer
         };
         specialization = nextSpecialization;
         failure = ResourceMaterializationFailure.None;
+        failureDetail = null;
         return true;
     }
 
     // ---- snapshot ----
 
-    private static bool MaterializeSnapshot(ShaderResourcePlan plan, ResourceRuntimeInputs inputs,
-        bool captureSelectorDiagnostic, out MaterializedSnapshot snapshot, out ResourceMaterializationFailure failure)
+    private static bool MaterializeSnapshot(
+        ShaderResourcePlan plan,
+        ResourceRuntimeInputs inputs,
+        bool captureSelectorDiagnostic,
+        out MaterializedSnapshot snapshot,
+        out ResourceMaterializationFailure failure,
+        out string? failureDetail)
     {
         using var snapshotProfile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.Snapshot);
         failure = ResourceMaterializationFailure.Other;
+        failureDetail = null;
         snapshot = new MaterializedSnapshot();
         if (plan.RequiresSpecializationMemory && inputs.ReadCleanMemory is null)
         {
-            return false;
+            return Fail(
+                "phase=snapshot_precondition reason=clean_reader_unavailable",
+                ref failureDetail);
         }
 
         if (!RuntimeValueEvaluator.EvaluateSources(plan, plan.MaterializationSources, inputs, plan.CleanFlatSlots,
             evaluateTable: true, out var values, out var table, out var activeSources,
+            out var snapshotEvaluationFailure,
             additionalTableWords: checked(plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount)))
         {
-            SpecializationFailed(DiagnoseSnapshotEvaluationFailure(plan, inputs, activeSources));
-            return false;
+            return Fail(
+                $"phase=snapshot_evaluation {snapshotEvaluationFailure ?? "reason=unknown"}",
+                ref failureDetail);
         }
 
         var cursor = 0;
@@ -142,13 +245,17 @@ public static class ResourceMaterializer
                 if (indirect.DirectCandidates is { } directCandidates)
                 {
                     if (!RuntimeValueEvaluator.EvaluateSources(plan, directCandidates.Select(candidate => candidate.Source).ToArray(),
-                        cleanInputs, [], evaluateTable: false, out var descriptors, out _)) return false;
+                        cleanInputs, [], evaluateTable: false, out var descriptors, out _))
+                    {
+                        return Fail(
+                            $"phase=direct_image_candidate_evaluation image={imageIndex} source={image.Source}",
+                            ref failureDetail);
+                    }
                     var directTable = new IndirectImageTable { Resource = (uint)imageIndex };
                     for (var candidateIndex = 0; candidateIndex < descriptors.Count; candidateIndex++)
                     {
                         var descriptor = descriptors[candidateIndex];
-                        if (NullImageDescriptor(descriptor.Dwords) || !ValidImageDescriptor(descriptor.Dwords, image.R128) ||
-                            !ReservedImageBitsClear(descriptor.Dwords))
+                        if (NullImageDescriptor(descriptor.Dwords) || !ValidImageDescriptor(descriptor.Dwords, image.R128))
                             descriptor = DescriptorWords.Empty(8);
                         var existing = directTable.Descriptors.FindIndex(candidate => candidate.SameAs(descriptor));
                         if (existing < 0)
@@ -160,7 +267,42 @@ public static class ResourceMaterializer
                         directTable.Candidates.Add((uint)existing);
                     }
                     snapshot.Images[imageIndex] = directTable.Descriptors[(int)directTable.Candidates[0]].Dwords;
-                    if (directTable.Descriptors.Count > 1) snapshot.IndirectImages.Add(directTable);
+                    if (directTable.Descriptors.Count > 1) (snapshot.IndirectImages ??= []).Add(directTable);
+                    continue;
+                }
+                if (indirect.WaveIndexed is { } waveIndexed)
+                {
+                    if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.HeapSource], cleanInputs, [],
+                        evaluateTable: false, out var waveSources, out _, out _, out var waveSourceFailure))
+                    {
+                        return Fail(
+                            $"phase=wave_heap_source_evaluation image={imageIndex} source={image.Source} " +
+                            $"heap_source={indirect.HeapSource} {waveSourceFailure ?? "reason=unknown"}",
+                            ref failureDetail);
+                    }
+
+                    if (!MaterializeWaveIndexedImage(
+                            indirect,
+                            waveIndexed,
+                            waveSources[0],
+                            image.R128,
+                            inputs,
+                            imageIndex,
+                            image.Source,
+                            out var waveTable,
+                            out failure,
+                            out failureDetail))
+                    {
+                        return false;
+                    }
+
+                    snapshot.Images[imageIndex] = waveTable.Descriptors[(int)waveTable.Candidates[0]].Dwords;
+                    if (waveTable.Descriptors.Count > 1)
+                    {
+                        waveTable.Resource = (uint)imageIndex;
+                        (snapshot.IndirectImages ??= []).Add(waveTable);
+                    }
+
                     continue;
                 }
                 if (indirect.Dense)
@@ -174,13 +316,16 @@ public static class ResourceMaterializer
                     if (denseTable.Descriptors.Count > 1)
                     {
                         denseTable.Resource = (uint)imageIndex;
-                        snapshot.IndirectImages.Add(denseTable);
+                        (snapshot.IndirectImages ??= []).Add(denseTable);
                     }
                     continue;
                 }
                 if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.MaterialSource, indirect.HeapSource], cleanInputs, [], evaluateTable: false, out var tables, out _))
                 {
-                    return false;
+                    return Fail(
+                        $"phase=indirect_image_root_evaluation image={imageIndex} source={image.Source} " +
+                        $"material_source={indirect.MaterialSource} heap_source={indirect.HeapSource}",
+                        ref failureDetail);
                 }
 
                 if (!MaterializeIndirectImage(plan, indirect, tables[0], tables[1], image, inputs,
@@ -193,7 +338,7 @@ public static class ResourceMaterializer
                 if (indirectTable.Descriptors.Count > 1)
                 {
                     indirectTable.Resource = (uint)imageIndex;
-                    snapshot.IndirectImages.Add(indirectTable);
+                    (snapshot.IndirectImages ??= []).Add(indirectTable);
                 }
             }
             else
@@ -215,146 +360,30 @@ public static class ResourceMaterializer
         return true;
     }
 
-    private static string DiagnoseSnapshotEvaluationFailure(
-        ShaderResourcePlan plan,
-        ResourceRuntimeInputs inputs,
-        IReadOnlyList<bool> activeSources)
-    {
-        var cleanEvaluator = new RuntimeValueEvaluator(
-            plan,
-            inputs.WithReader(inputs.ReadCleanMemory));
-        var evaluator = new RuntimeValueEvaluator(
-            plan,
-            inputs,
-            plan.CleanFlatSlots,
-            cleanEvaluator);
-
-        foreach (var sourceIndex in plan.MaterializationSources)
-        {
-            if (sourceIndex >= plan.DescriptorSources.Count)
-            {
-                return $"descriptor source {sourceIndex} is outside the source table";
-            }
-
-            if (activeSources.Count != 0 && !activeSources[(int)sourceIndex])
-            {
-                continue;
-            }
-
-            var source = plan.DescriptorSources[(int)sourceIndex];
-            for (var dword = 0; dword < source.Dwords.Length; dword++)
-            {
-                if (!evaluator.Evaluate(source.Dwords[dword], out _))
-                {
-                    return $"descriptor source {sourceIndex} dword {dword} cannot be evaluated: " +
-                        DescribeEvaluationValue(plan, inputs, evaluator, source.Dwords[dword]);
-                }
-            }
-        }
-
-        foreach (var read in plan.TableReads)
-        {
-            var clean = read.FlatOffset < plan.CleanFlatSlots.Count &&
-                plan.CleanFlatSlots[(int)read.FlatOffset] != 0;
-            var selected = clean ? cleanEvaluator : evaluator;
-            if (read.FlatOffset >= plan.TableReads.Count || !selected.Evaluate(read.Value, out _))
-            {
-                return $"resource table read {read.FlatOffset} cannot be evaluated: " +
-                    DescribeEvaluationValue(plan, inputs, selected, read.Value);
-            }
-        }
-
-        return "descriptor snapshot evaluation failed without an isolated source";
-    }
-
-    private static string DescribeEvaluationValue(
-        ShaderResourcePlan plan,
-        ResourceRuntimeInputs inputs,
-        RuntimeValueEvaluator evaluator,
-        ScalarValue value,
-        int depth = 0)
-    {
-        if (depth >= 6)
-        {
-            return value.ToString();
-        }
-
-        if (value.Kind == ScalarValueKind.ResourceTableWord)
-        {
-            var slot = (int)value.Payload;
-            if ((uint)slot < plan.TableReads.Count)
-            {
-                var read = plan.TableReads[slot];
-                return $"table-slot={slot} flat={read.FlatOffset} value=" +
-                    DescribeEvaluationValue(plan, inputs, evaluator, read.Value, depth + 1);
-            }
-
-            return $"table-slot={slot} (outside table)";
-        }
-
-        if (value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord &&
-            value.MemoryIndex >= 0 && value.MemoryIndex < plan.Memory.Count)
-        {
-            var memory = plan.Memory[value.MemoryIndex];
-            var detail = $"{value.Kind} memory={value.MemoryIndex} pc=0x{memory.Pc:X8} " +
-                $"opcode={memory.Opcode} offset={memory.Offset} operands=[{string.Join(", ", value.Operands.Select(operand =>
-                    DescribeEvaluationValue(plan, inputs, evaluator, operand, depth + 1)))}]";
-            if (value.Operands.Length >= 2 && value.Operands[0].Operands.Length >= 2 &&
-                evaluator.EvaluateWide(value.Operands[0].Operands[0], out var low) &&
-                evaluator.EvaluateWide(value.Operands[0].Operands[1], out var high) &&
-                evaluator.EvaluateWide(value.Operands[1], out var dynamicOffset))
-            {
-                var baseAddress = ((high << 32) | (uint)low) & AddressMask;
-                var relative = (long)(int)memory.Offset + (uint)dynamicOffset;
-                if (relative >= 0 && baseAddress <= AddressMask - (ulong)relative)
-                {
-                    var address = (baseAddress + (ulong)relative) & ~3ul;
-                    var regular = inputs.ReadMemory is not null && inputs.ReadMemory(address, out _);
-                    var clean = inputs.ReadCleanMemory is not null && inputs.ReadCleanMemory(address, out _);
-                    detail += $" base=0x{baseAddress:X16} dynamic=0x{dynamicOffset:X} " +
-                        $"address=0x{address:X16} readable={regular} clean={clean}";
-                }
-            }
-
-            return detail;
-        }
-
-        if (value.Kind is ScalarValueKind.AddressHandle or ScalarValueKind.BufferHandle or
-            ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle)
-        {
-            return $"{value.Kind}[{string.Join(", ", value.Operands.Select(operand =>
-                DescribeEvaluationValue(plan, inputs, evaluator, operand, depth + 1)))}]";
-        }
-
-        if (value.Kind is ScalarValueKind.Phi or ScalarValueKind.Select or ScalarValueKind.Operation)
-        {
-            return $"{value} operands=[{string.Join(", ", value.Operands.Select(operand =>
-                DescribeEvaluationValue(plan, inputs, evaluator, operand, depth + 1)))}]";
-        }
-
-        return value.ToString();
-    }
-
     private static bool NullImageDescriptor(ReadOnlySpan<uint> descriptor) =>
         descriptor[0] == 0 && (descriptor[1] & 0xFF) == 0;
 
-    private static bool ReservedImageBitsClear(ReadOnlySpan<uint> descriptor)
+    private static bool ReservedImageBitsClear(ReadOnlySpan<uint> descriptor, bool r128)
     {
-        ReadOnlySpan<uint> reserved =
-        [
-            0x00000000u, 0x20000000u, 0xf0003000u, 0x00000000u,
-            0xe000e000u, 0xf9000000u, 0x00007b00u, 0x00000000u,
-        ];
-        for (var dword = 0; dword < reserved.Length; dword++)
+        if ((descriptor[1] & 0x20000000u) != 0 ||
+            (descriptor[2] & 0x70003000u) != 0)
         {
-            if ((descriptor[dword] & reserved[dword]) != 0)
-                return false;
+            return false;
         }
-        return true;
+
+        return r128 ||
+            ((descriptor[4] & 0xe000e000u) == 0 &&
+             (descriptor[5] & 0xf9000000u) == 0 &&
+             (descriptor[6] & 0x00007b00u) == 0);
     }
 
     private static bool ValidImageDescriptor(ReadOnlySpan<uint> descriptor, bool r128)
     {
+        if (!ReservedImageBitsClear(descriptor, r128))
+        {
+            return false;
+        }
+
         var type = GuestImageFormat.ImageTypeOf(descriptor);
         var format = GuestImageFormat.FormatOf(descriptor);
         if (type < GuestImageFormat.ImageType1D || format == GuestImageFormat.Invalid || format > GuestImageFormat.MaxFormat)
@@ -435,13 +464,15 @@ public static class ResourceMaterializer
         result = new IndirectImageTable();
         if (material.DwordCount != 4 || heap.DwordCount != 4)
         {
-            return false;
+            return Fail(
+                $"indirect image descriptors have invalid sizes: material={material.DwordCount} heap={heap.DwordCount}");
         }
 
         var materialStride = (material.Dwords[1] >> 16) & 0x3FFF;
         if (materialStride != indirect.SelectorStride)
         {
-            return false;
+            return Fail(
+                $"indirect image selector stride changed: expected={indirect.SelectorStride} actual={materialStride}");
         }
 
         var period = 1ul << 32;
@@ -466,7 +497,8 @@ public static class ResourceMaterializer
         }
         if (provenOffsets is null && probeCount > MaxIndirectImageProbes)
         {
-            return false;
+            return Fail(
+                $"indirect image selector domain is too large: probes={probeCount} limit={MaxIndirectImageProbes}");
         }
 
         var keys = new List<uint> { 0 };
@@ -477,7 +509,8 @@ public static class ResourceMaterializer
         {
             if (!ReadScalarBufferWord(material.Dwords, (uint)offset, indirect.MaterialImmediate, inputs, out var key))
             {
-                return false;
+                return Fail(
+                    $"indirect image material key read failed: offset=0x{offset:X}");
             }
 
             if (seen.Add(key))
@@ -497,12 +530,12 @@ public static class ResourceMaterializer
             {
                 if (!ReadScalarBufferWord(heap.Dwords, heapOffset, dword * sizeof(uint), inputs, out candidate[dword]))
                 {
-                    return false;
+                    return Fail(
+                        $"indirect image heap descriptor read failed: key=0x{key:X8} dword={dword}");
                 }
             }
 
-            if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, image.R128) ||
-                !ReservedImageBitsClear(candidate))
+            if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, image.R128))
             {
                 Array.Clear(candidate);
             }
@@ -555,8 +588,7 @@ public static class ResourceMaterializer
                     return false;
             }
 
-            if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128) ||
-                !ReservedImageBitsClear(candidate))
+            if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128))
                 Array.Clear(candidate);
             probed.Add(candidate);
         }
@@ -568,6 +600,163 @@ public static class ResourceMaterializer
             out result,
             out failure);
     }
+
+    private static bool MaterializeWaveIndexedImage(
+        IndirectImageSelector indirect,
+        WaveIndexedImageSelector wave,
+        DescriptorWords heap,
+        bool r128,
+        ResourceRuntimeInputs inputs,
+        int imageIndex,
+        uint sourceIndex,
+        out IndirectImageTable result,
+        out ResourceMaterializationFailure failure,
+        out string? failureDetail)
+    {
+        failure = ResourceMaterializationFailure.Other;
+        failureDetail = null;
+        result = new IndirectImageTable();
+        if (heap.DwordCount != 2 || inputs.ReadCleanMemory is null || wave.IndexStride == 0)
+        {
+            return Fail(
+                $"phase=wave_precondition image={imageIndex} source={sourceIndex} heap_words={heap.DwordCount} " +
+                $"clean_reader={(inputs.ReadCleanMemory is null ? "unavailable" : "available")} " +
+                $"index_stride=0x{wave.IndexStride:X}",
+                ref failureDetail);
+        }
+
+        var baseAddress = (((ulong)heap.Dwords[1] << 32) | heap.Dwords[0]) & AddressMask;
+        if (!TryReadCleanWord(
+                baseAddress,
+                wave.MaskOffset,
+                inputs,
+                out var activeMask,
+                out var maskAddress,
+                out var maskReadFailure))
+        {
+            return Fail(
+                $"phase=wave_mask_read image={imageIndex} source={sourceIndex} heap_base=0x{baseAddress:X16} " +
+                $"mask_offset=0x{wave.MaskOffset:X} address={FormatAttemptedAddress(maskAddress)} " +
+                $"reason={maskReadFailure}",
+                ref failureDetail);
+        }
+
+        var keys = new SortedSet<uint>();
+        for (uint bit = 0; bit < 32; bit++)
+        {
+            if ((activeMask & (1u << (int)bit)) == 0)
+            {
+                continue;
+            }
+
+            var indexOffset = (ulong)wave.IndexTableOffset + (ulong)bit * wave.IndexStride;
+            if (!TryReadCleanWord(
+                    baseAddress,
+                    indexOffset,
+                    inputs,
+                    out var key,
+                    out var indexAddress,
+                    out var indexReadFailure))
+            {
+                return Fail(
+                    $"phase=wave_index_read image={imageIndex} source={sourceIndex} heap_base=0x{baseAddress:X16} " +
+                    $"active_mask=0x{activeMask:X8} bit={bit} index_table_offset=0x{wave.IndexTableOffset:X} " +
+                    $"index_stride=0x{wave.IndexStride:X} offset=0x{indexOffset:X} " +
+                    $"address={FormatAttemptedAddress(indexAddress)} reason={indexReadFailure}",
+                    ref failureDetail);
+            }
+
+            if (!wave.RejectNegativeKeys || (key & 0x8000_0000u) == 0)
+            {
+                keys.Add(key);
+            }
+        }
+
+        var probed = new List<uint[]>(Math.Max(1, keys.Count));
+        var offsets = new List<uint>(Math.Max(1, keys.Count));
+        foreach (var key in keys)
+        {
+            var candidate = new uint[8];
+            var descriptorOffset = (ulong)indirect.TableOffset + ((ulong)key << 5);
+            for (uint dword = 0; dword < candidate.Length; dword++)
+            {
+                var dwordOffset = descriptorOffset + dword * sizeof(uint);
+                if (!TryReadCleanWord(
+                        baseAddress,
+                        dwordOffset,
+                        inputs,
+                        out candidate[dword],
+                        out var descriptorAddress,
+                        out var descriptorReadFailure))
+                {
+                    return Fail(
+                        $"phase=wave_descriptor_read image={imageIndex} source={sourceIndex} heap_base=0x{baseAddress:X16} " +
+                        $"key=0x{key:X8} table_offset=0x{indirect.TableOffset:X} descriptor_offset=0x{descriptorOffset:X} " +
+                        $"dword={dword} offset=0x{dwordOffset:X} address={FormatAttemptedAddress(descriptorAddress)} " +
+                        $"reason={descriptorReadFailure}",
+                        ref failureDetail);
+                }
+            }
+
+            if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128))
+            {
+                Array.Clear(candidate);
+            }
+
+            probed.Add(candidate);
+            offsets.Add(unchecked(indirect.DynamicOffsetBase + (key << 5)));
+        }
+
+        if (probed.Count == 0)
+        {
+            probed.Add(new uint[8]);
+            offsets.Add(0);
+        }
+
+        return FinishIndirectImage(probed, offsets, out result, out failure);
+    }
+
+    private static bool TryReadCleanWord(
+        ulong baseAddress,
+        ulong offset,
+        ResourceRuntimeInputs inputs,
+        out uint word,
+        out ulong? address,
+        out string? failure)
+    {
+        word = 0;
+        address = null;
+        failure = null;
+        if (offset > AddressMask)
+        {
+            failure = "offset_out_of_range";
+            return false;
+        }
+
+        if (baseAddress > AddressMask - offset)
+        {
+            failure = "address_overflow";
+            return false;
+        }
+
+        address = baseAddress + offset;
+        if (inputs.ReadCleanMemory is null)
+        {
+            failure = "clean_reader_unavailable";
+            return false;
+        }
+
+        if (!inputs.ReadCleanMemory(address.Value, out word))
+        {
+            failure = "clean_reader_refused";
+            return false;
+        }
+
+        return true;
+    }
+
+    private static string FormatAttemptedAddress(ulong? address) =>
+        address is { } value ? $"0x{value:X16}" : "unavailable";
 
     private static bool FinishIndirectImage(
         IReadOnlyList<uint[]> probed,
@@ -655,9 +844,16 @@ public static class ResourceMaterializer
         return false;
     }
 
+    private static bool Fail(string message, ref string? failureDetail)
+    {
+        failureDetail = message;
+        return Fail(message);
+    }
+
     private static bool BuildSpecialization(
         ShaderResourcePlan plan,
         MaterializedSnapshot snapshot,
+        ResourceSpecializationScratch? specializationScratch,
         out MaterializedSnapshot specializedSnapshot,
         out ResourceSpecialization specialization,
         out ResourceMaterializationFailure failure,
@@ -666,25 +862,28 @@ public static class ResourceMaterializer
         using var specializationProfile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.Specialization);
         failure = ResourceMaterializationFailure.Other;
         specializedSnapshot = snapshot;
-        specialization = new ResourceSpecialization();
+        specialization = specializationScratch?.Specialization ?? null!;
         var info = plan.Info;
         var imageCount = info.Images.Count;
         var mappingWordCount = 0;
-        foreach (var table in snapshot.IndirectImages)
+        if (snapshot.IndirectImages is { } indirectTables)
         {
-            if (table.Resource >= info.Images.Count || table.Descriptors.Count < 2)
+            foreach (var table in indirectTables)
             {
-                return Fail("indirect image table has an invalid root or candidate count");
-            }
+                if (table.Resource >= info.Images.Count || table.Descriptors.Count < 2)
+                {
+                    return Fail("indirect image table has an invalid root or candidate count");
+                }
 
-            if (imageCount + table.Descriptors.Count - 1 > ShaderResourceInfo.MaxImages)
-            {
-                failure = ResourceMaterializationFailure.ImageCapacityExceeded;
-                return Fail("indirect image candidates exceed the dense image resource limit");
-            }
+                if (imageCount + table.Descriptors.Count - 1 > ShaderResourceInfo.MaxImages)
+                {
+                    failure = ResourceMaterializationFailure.ImageCapacityExceeded;
+                    return Fail("indirect image candidates exceed the dense image resource limit");
+                }
 
-            imageCount += table.Descriptors.Count - 1;
-            mappingWordCount = checked(mappingWordCount + 1 + table.Keys.Count * 2);
+                imageCount += table.Descriptors.Count - 1;
+                mappingWordCount = checked(mappingWordCount + 1 + table.Keys.Count * 2);
+            }
         }
 
         // Each draw owns these arrays. Only indirect candidates require a larger table.
@@ -692,7 +891,9 @@ public static class ResourceMaterializer
         var mappingCursor = snapshot.FlattenedTable.Length;
         Array.Resize(ref snapshot.FlattenedTable, checked(mappingCursor + mappingWordCount));
         var imageCursor = info.Images.Count;
-        var images = new List<ImageSpecialization>(imageCount);
+        var images = specializationScratch?.Images ?? new List<ImageSpecialization>(imageCount);
+        images.Clear();
+        images.EnsureCapacity(imageCount);
         foreach (var image in info.Images)
         {
             images.Add(new ImageSpecialization(
@@ -700,37 +901,42 @@ public static class ResourceMaterializer
                 image.IndirectRoot, image.IndirectMappingOffset, image.IndirectSearchIterations, image.Cube));
         }
 
-        foreach (var table in snapshot.IndirectImages)
+        if (snapshot.IndirectImages is { } materializedTables)
         {
-            var rootImage = images[(int)table.Resource];
-            for (var candidate = 1; candidate < table.Descriptors.Count; candidate++)
+            foreach (var table in materializedTables)
             {
-                images.Add(rootImage with { IndirectRoot = table.Resource });
-                snapshot.Images[imageCursor++] = table.Descriptors[candidate].Dwords;
-            }
+                var rootImage = images[(int)table.Resource];
+                for (var candidate = 1; candidate < table.Descriptors.Count; candidate++)
+                {
+                    images.Add(rootImage with { IndirectRoot = table.Resource });
+                    snapshot.Images[imageCursor++] = table.Descriptors[candidate].Dwords;
+                }
 
-            var mappingOffset = (uint)mappingCursor;
-            images[(int)table.Resource] = rootImage with
-            {
-                IndirectRoot = table.Resource,
-                IndirectMappingOffset = mappingOffset,
-                IndirectSearchIterations = (uint)BitOperations.Log2((uint)table.Keys.Count) + 1,
-            };
-            mappingCursor += 1 + table.Keys.Count * 2;
-            var order = Enumerable.Range(0, table.Keys.Count).OrderBy(index => table.Keys[index]).ToArray();
-            snapshot.FlattenedTable[(int)mappingOffset] = (uint)table.Keys.Count;
-            for (var entry = 0; entry < order.Length; entry++)
-            {
-                var source = order[entry];
-                var offset = (int)mappingOffset + 1 + entry * 2;
-                snapshot.FlattenedTable[offset] = table.Keys[source];
-                snapshot.FlattenedTable[offset + 1] = table.Candidates[source];
-            }
+                var mappingOffset = (uint)mappingCursor;
+                images[(int)table.Resource] = rootImage with
+                {
+                    IndirectRoot = table.Resource,
+                    IndirectMappingOffset = mappingOffset,
+                    IndirectSearchIterations = (uint)BitOperations.Log2((uint)table.Keys.Count) + 1,
+                };
+                mappingCursor += 1 + table.Keys.Count * 2;
+                var order = Enumerable.Range(0, table.Keys.Count).OrderBy(index => table.Keys[index]).ToArray();
+                snapshot.FlattenedTable[(int)mappingOffset] = (uint)table.Keys.Count;
+                for (var entry = 0; entry < order.Length; entry++)
+                {
+                    var source = order[entry];
+                    var offset = (int)mappingOffset + 1 + entry * 2;
+                    snapshot.FlattenedTable[offset] = table.Keys[source];
+                    snapshot.FlattenedTable[offset + 1] = table.Candidates[source];
+                }
 
-            snapshot.Images[(int)table.Resource] = table.Descriptors[0].Dwords;
+                snapshot.Images[(int)table.Resource] = table.Descriptors[0].Dwords;
+            }
         }
 
-        var buffers = new List<BufferSpecialization>(info.Buffers.Count);
+        var buffers = specializationScratch?.Buffers ?? new List<BufferSpecialization>(info.Buffers.Count);
+        buffers.Clear();
+        buffers.EnsureCapacity(info.Buffers.Count);
         for (var index = 0; index < info.Buffers.Count; index++)
         {
             var descriptor = snapshot.Buffers[index];
@@ -794,7 +1000,10 @@ public static class ResourceMaterializer
             {
                 images[index] = image with
                 {
-                    NumericClass = baseImage.Atomic ? ImageNumericClass.Uint : ImageNumericClass.Float,
+                    // A null-bound atomic keeps its declared numeric class
+                    // (Uint or, since float image atomics were added, Float)
+                    // instead of assuming every atomic image is Uint.
+                    NumericClass = baseImage.Atomic ? baseImage.NumericClass : ImageNumericClass.Float,
                     Dimension = ImageDimension.Dim2D,
                     Cube = false,
                 };
@@ -810,7 +1019,17 @@ public static class ResourceMaterializer
             }
 
             var format = GuestImageFormat.FormatOf(descriptor);
-            if (baseImage.Atomic && format != GuestImageFormat.Format32Uint)
+            // Image atomics operate on one 32-bit word. Integer atomics use an
+            // R32Uint view; Fmin/Fmax use the bit pattern of an R32Float view.
+            // Other float-class formats have different texel widths and cannot
+            // safely share that atomic view.
+            var expectedAtomicFormat = baseImage.NumericClass switch
+            {
+                ImageNumericClass.Uint => GuestImageFormat.Format32Uint,
+                ImageNumericClass.Float => GuestImageFormat.Format32Float,
+                _ => GuestImageFormat.Invalid,
+            };
+            if (baseImage.Atomic && format != expectedAtomicFormat)
             {
                 return Fail($"atomic image descriptor {index} uses unsupported format {format}");
             }
@@ -922,7 +1141,7 @@ public static class ResourceMaterializer
                     failure = ResourceMaterializationFailure.IncompatibleImageCandidates;
                     if (captureIndirectImageFailure is not null)
                     {
-                        var table = snapshot.IndirectImages.Single(table => table.Resource == rootIndex);
+                        var table = snapshot.IndirectImages!.Single(table => table.Resource == rootIndex);
                         captureIndirectImageFailure(new IndirectImageFailure(
                             info.Images[rootIndex].FirstUsePc, (uint)rootIndex, exemplar, (uint)candidate,
                             table.SelectorStride, table.SelectorOffset,
@@ -946,45 +1165,49 @@ public static class ResourceMaterializer
             }
         }
 
-        if (!BuildSamplerPlan(info, images, out var samplerPlan))
+        Span<uint> pointSampler = stackalloc uint[ShaderResourceInfo.MaxSamplers];
+        if (!BuildSamplerPlan(info, images, pointSampler, out var samplerCount))
         {
             return Fail("specialized sampler layout exceeds its resource limit");
         }
 
-        Array.Resize(ref snapshot.Samplers, checked((int)samplerPlan.SamplerCount));
+        Array.Resize(ref snapshot.Samplers, checked((int)samplerCount));
         for (var index = 0; index < info.Samplers.Count; index++)
         {
-            var target = samplerPlan.PointSampler[index];
+            var target = pointSampler[index];
             if (target != DescriptorConstants.NoIndex && target >= info.Samplers.Count)
             {
                 snapshot.Samplers[target] = snapshot.Samplers[index];
             }
         }
 
-        specialization = new ResourceSpecialization { Buffers = buffers, Images = images };
+        specialization = specializationScratch?.Specialization ?? new ResourceSpecialization
+        {
+            Buffers = buffers,
+            Images = images,
+        };
         specializedSnapshot = snapshot;
         return true;
     }
 
-    private sealed class SamplerPlan
-    {
-        public uint[] PointSampler = new uint[ShaderResourceInfo.MaxSamplers];
-        public uint SamplerCount;
-    }
-
     // A sampler that some pair uses with a point-only image needs a point-filtering
     // copy; when every pair does, the sampler itself switches.
-    private static bool BuildSamplerPlan(ShaderResourceInfo info, IReadOnlyList<ImageSpecialization> images, out SamplerPlan plan)
+    private static bool BuildSamplerPlan(
+        ShaderResourceInfo info,
+        IReadOnlyList<ImageSpecialization> images,
+        Span<uint> pointSampler,
+        out uint samplerCount)
     {
-        plan = new SamplerPlan();
-        if (info.Samplers.Count > plan.PointSampler.Length)
+        samplerCount = 0;
+        if (pointSampler.Length < ShaderResourceInfo.MaxSamplers || info.Samplers.Count > pointSampler.Length)
         {
             return false;
         }
 
-        Array.Fill(plan.PointSampler, DescriptorConstants.NoIndex);
-        plan.SamplerCount = (uint)info.Samplers.Count;
-        var usage = new byte[ShaderResourceInfo.MaxSamplers];
+        pointSampler.Fill(DescriptorConstants.NoIndex);
+        samplerCount = (uint)info.Samplers.Count;
+        Span<byte> usage = stackalloc byte[ShaderResourceInfo.MaxSamplers];
+        usage.Clear();
         foreach (var pair in info.SampledPairs)
         {
             if (pair.Image >= images.Count || pair.Sampler >= info.Samplers.Count)
@@ -993,7 +1216,7 @@ public static class ResourceMaterializer
             }
 
             var image = images[(int)pair.Image];
-            usage[pair.Sampler] |= RequiresPointSampler(image.NumericClass, image.ConversionFormat) ? (byte)2 : (byte)1;
+            usage[(int)pair.Sampler] |= RequiresPointSampler(image.NumericClass, image.ConversionFormat) ? (byte)2 : (byte)1;
         }
 
         for (var index = 0; index < info.Samplers.Count; index++)
@@ -1005,16 +1228,16 @@ public static class ResourceMaterializer
 
             if ((usage[index] & 1) == 0)
             {
-                plan.PointSampler[index] = (uint)index;
+                pointSampler[index] = (uint)index;
             }
             else
             {
-                if (plan.SamplerCount >= ShaderResourceInfo.MaxSamplers)
+                if (samplerCount >= ShaderResourceInfo.MaxSamplers)
                 {
                     return false;
                 }
 
-                plan.PointSampler[index] = plan.SamplerCount++;
+                pointSampler[index] = samplerCount++;
             }
         }
 
@@ -1083,14 +1306,15 @@ public static class ResourceMaterializer
             }
         }
 
-        if (!BuildSamplerPlan(source, specialization.Images, out var samplerPlan))
+        Span<uint> pointSampler = stackalloc uint[ShaderResourceInfo.MaxSamplers];
+        if (!BuildSamplerPlan(source, specialization.Images, pointSampler, out _))
         {
             throw new ResourcePlanException($"shader resource specialization exceeds the sampler limit: hash=0x{plan.Hash:X16}");
         }
 
         for (var index = 0; index < source.Samplers.Count; index++)
         {
-            var target = samplerPlan.PointSampler[index];
+            var target = pointSampler[index];
             if (target == DescriptorConstants.NoIndex)
             {
                 continue;
@@ -1113,7 +1337,7 @@ public static class ResourceMaterializer
             var image = info.Images[(int)pair.Image];
             if (RequiresPointSampler(image.NumericClass, image.ConversionFormat))
             {
-                pair.Sampler = samplerPlan.PointSampler[pair.Sampler];
+                pair.Sampler = pointSampler[(int)pair.Sampler];
             }
         }
 
@@ -1121,15 +1345,16 @@ public static class ResourceMaterializer
         // sampling. Vulkan bakes compareEnable into VkSampler, so those uses cannot
         // share one host sampler. Split only the mixed cases; compare-only samplers
         // can use their existing slot.
-        var compareUsage = new byte[ShaderResourceInfo.MaxSamplers];
+        Span<byte> compareUsage = stackalloc byte[ShaderResourceInfo.MaxSamplers];
+        compareUsage.Clear();
         foreach (var pair in info.SampledPairs)
         {
             var image = info.Images[(int)pair.Image];
-            compareUsage[pair.Sampler] |= image.DepthCompare ? (byte)2 : (byte)1;
+            compareUsage[(int)pair.Sampler] |= image.DepthCompare ? (byte)2 : (byte)1;
         }
 
-        var compareSampler = new uint[ShaderResourceInfo.MaxSamplers];
-        Array.Fill(compareSampler, DescriptorConstants.NoIndex);
+        Span<uint> compareSampler = stackalloc uint[ShaderResourceInfo.MaxSamplers];
+        compareSampler.Fill(DescriptorConstants.NoIndex);
         for (var index = 0; index < info.Samplers.Count; index++)
         {
             if ((compareUsage[index] & 2) == 0)
@@ -1159,7 +1384,7 @@ public static class ResourceMaterializer
         {
             if (info.Images[(int)pair.Image].DepthCompare)
             {
-                pair.Sampler = compareSampler[pair.Sampler];
+                pair.Sampler = compareSampler[(int)pair.Sampler];
             }
         }
 
@@ -1181,12 +1406,12 @@ public static class ResourceMaterializer
             var sampler = memory.Sampler;
             if (RequiresPointSampler(image.NumericClass, image.ConversionFormat))
             {
-                sampler = samplerPlan.PointSampler[sampler];
+                sampler = pointSampler[(int)sampler];
             }
 
             if (image.DepthCompare)
             {
-                sampler = compareSampler[sampler];
+                sampler = compareSampler[(int)sampler];
             }
 
             if (sampler != memory.Sampler)

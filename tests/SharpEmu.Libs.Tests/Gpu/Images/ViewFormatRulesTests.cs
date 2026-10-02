@@ -99,6 +99,7 @@ public sealed class ViewFormatRulesTests
         Assert.Equal(left.GetHashCode(), same.GetHashCode());
         Assert.NotEqual(left, swizzled);
         Assert.NotEqual(left, left with { LevelCount = 2 });
+        Assert.NotEqual(left, left with { MinLod = 0x80 });
         Assert.NotEqual(left, left with { Usage = ImageUsageFlags.StorageBit });
     }
 }

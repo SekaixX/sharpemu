@@ -115,8 +115,8 @@ public static class GuestGpuMemoryHook
 
     public static bool TryResolveFault(FaultKind kind, ulong address)
     {
-        if (_current == null && Traces(address, 8))
-            Trace(address, 8, $"fault={kind} result=no-manager");
+        if (_current == null && Traces(address, 1))
+            Trace(address, 1, $"fault={kind} result=no-manager");
         if (_current != null && _current.TryResolveFault(kind, address))
         {
             Interlocked.Increment(ref _faultsResolved);

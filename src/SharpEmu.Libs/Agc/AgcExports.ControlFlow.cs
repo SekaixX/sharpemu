@@ -10,6 +10,8 @@ public static partial class AgcExports
 {
     // This partial constructs AGC command-buffer control flow.
 
+    private const int Graphics5ErrorInvalidPacket = unchecked((int)0x8A6C000C);
+
     // Hardware REWIND is a fixed 2-dword header + body (valid bit 31).
     [SysAbiExport(
         Nid = "QIXCsbipds0",
@@ -305,6 +307,51 @@ public static partial class AgcExports
 
         return ReturnPointer(ctx, cmd);
     }
+
+    // Patches an existing INDIRECT_BUFFER packet. This NID was previously
+    // registered as a side-effect-free libKernel stub, which silently left the
+    // old target and length in the command stream.
+    #pragma warning disable SHEM006
+    [SysAbiExport(
+        Nid = "Ikfdt-rIqCE",
+        ExportName = "sceAgcUnknownIkfdtRIqCE",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int PatchIndirectBuffer(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var cachePolicy = (uint)ctx[CpuRegister.Rsi] & 0x3u;
+        var targetAddress = ctx[CpuRegister.Rdx];
+        var sizeInDwords = (uint)ctx[CpuRegister.Rcx];
+
+        if (commandAddress == 0 ||
+            !TryReadUInt32(ctx, commandAddress, out var header) ||
+            ((header >> 8) & 0xFFu) != ItIndirectBuffer)
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(long)Graphics5ErrorInvalidPacket);
+            return Graphics5ErrorInvalidPacket;
+        }
+
+        if (!TryReadUInt32(ctx, commandAddress + 4, out var addressLow) ||
+            !TryReadUInt32(ctx, commandAddress + 12, out var control) ||
+            !TryWriteUInt32(
+                ctx,
+                commandAddress + 4,
+                (addressLow & 0x3u) | ((uint)targetAddress & 0xFFFF_FFFCu)) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)(targetAddress >> 32)) ||
+            !TryWriteUInt32(
+                ctx,
+                commandAddress + 12,
+                (control & 0xCFF0_0000u) | (cachePolicy << 28) | (sizeInDwords & 0xFFFFFu)))
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(long)Graphics5ErrorInvalidPacket);
+            return Graphics5ErrorInvalidPacket;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+    #pragma warning restore SHEM006
 
     [SysAbiExport(
         Nid = "bbFueFP+J4k",

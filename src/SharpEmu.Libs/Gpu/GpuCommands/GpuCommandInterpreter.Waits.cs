@@ -9,6 +9,8 @@ public sealed partial class GpuCommandInterpreter
 {
     private const uint RewindValidBit = 1u << 31;
     private const uint RewindKnownBits = 0x8100_0000u;
+    private const uint OcclusionDepthBlockCount = 16;
+    private const ulong OcclusionCounterReadyBit = 1UL << 63;
 
     // Polls the label once; an unmet condition suspends the submission at this packet.
     internal void WaitOnMemory(uint compareFunction, ulong address, ulong reference, ulong mask, uint waitOperation, bool is64Bit)
@@ -36,22 +38,67 @@ public sealed partial class GpuCommandInterpreter
 
         if (!satisfied)
         {
-            Suspend();
+            if (LogGpuWaits)
+            {
+                Suspend(
+                    $"memory bits={(is64Bit ? 64 : 32)} operation={waitOperation} compare={compareFunction} " +
+                    $"target=0x{address:X16} observed=0x{value:X16} reference=0x{reference:X16} mask=0x{mask:X16}");
+            }
+            else
+            {
+                Suspend();
+            }
         }
     }
 
     internal void SetPredication(uint condition, uint operation, uint waitOperation, ulong address)
     {
-        if (waitOperation != 0)
+        // Operation 3 reads a single GPU-produced boolean label.  When the
+        // packet requests a wait, retire prior GPU work before reading it.
+        // Keep the newer operation-1 occlusion-counter behavior unchanged.
+        if (operation == 3 && waitOperation != 0)
         {
             _host.FlushAndWait();
         }
 
+        ulong value;
         switch (operation)
         {
             case 0:
                 PredicateSkip = false;
+                return;
+            case 1:
+            {
+                if (address == 0)
+                {
+                    throw _host.Fatal("The predication address is zero.");
+                }
+
+                value = 0;
+                for (var depthBlock = 0u; depthBlock < OcclusionDepthBlockCount; depthBlock++)
+                {
+                    var pairAddress = address + ((ulong)depthBlock * 2 * sizeof(ulong));
+                    var begin = ReadQword(pairAddress);
+                    var end = ReadQword(pairAddress + sizeof(ulong));
+                    if ((begin & end & OcclusionCounterReadyBit) == 0)
+                    {
+                        if (waitOperation == 0)
+                        {
+                            Suspend();
+                        }
+                        else
+                        {
+                            PredicateSkip = false;
+                        }
+
+                        return;
+                    }
+
+                    value = unchecked(value + (end - begin));
+                }
+
                 break;
+            }
             case 3:
             {
                 if (address == 0)
@@ -59,19 +106,20 @@ public sealed partial class GpuCommandInterpreter
                     throw _host.Fatal("The predication address is zero.");
                 }
 
-                var value = ReadQword(address);
-                PredicateSkip = condition switch
-                {
-                    0 => value != 0,
-                    1 => value == 0,
-                    _ => throw _host.Fatal($"The predication condition is unknown: condition=0x{condition:X8} address=0x{address:X16}."),
-                };
+                value = ReadQword(address);
                 break;
             }
 
             default:
                 throw _host.Fatal($"The predication operation is unknown: operation=0x{operation:X8} address=0x{address:X16}.");
         }
+
+        PredicateSkip = condition switch
+        {
+            0 => value != 0,
+            1 => value == 0,
+            _ => throw _host.Fatal($"The predication condition is unknown: condition=0x{condition:X8} address=0x{address:X16}."),
+        };
     }
 
     internal void WaitForConstantEngine()

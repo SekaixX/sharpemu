@@ -371,6 +371,11 @@ internal static unsafe partial class VulkanVideoPresenter
     /// </summary>
     private static void TryReplaceWithHostMovieFrame(ref Presentation presentation)
     {
+        if (IsAvPlayerFallbackTextureComposited())
+        {
+            return;
+        }
+
         if (!TryTakeHostMovieFrame(out var pixels, out var width, out var height))
         {
             return;
@@ -398,6 +403,12 @@ internal static unsafe partial class VulkanVideoPresenter
         long presentedSequence,
         out Presentation presentation)
     {
+        if (IsAvPlayerFallbackTextureComposited())
+        {
+            presentation = default;
+            return false;
+        }
+
         if (!TryTakeHostMovieFrame(out var pixels, out var width, out var height))
         {
             presentation = default;
@@ -412,6 +423,14 @@ internal static unsafe partial class VulkanVideoPresenter
             GuestDrawKind.None,
             IsSplash: false);
         return true;
+    }
+
+    private static bool IsAvPlayerFallbackTextureComposited()
+    {
+        lock (_gate)
+        {
+            return _activePresenter?.AvPlayerFallbackTextureComposited == true;
+        }
     }
 
     private static bool TryTakeHostMovieFrame(

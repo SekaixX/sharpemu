@@ -129,6 +129,14 @@ public sealed class ShaderResourcePlan
             else if (indirect.Dense)
             {
                 plan.MarkCleanFlatSlots(plan.DescriptorSources[(int)indirect.HeapSource], cleanSlots);
+                if (indirect.WaveIndexed is not null)
+                {
+                    MarkHeapReadSlots(
+                        plan.Memory,
+                        plan.TableReads,
+                        plan.DescriptorSources[(int)indirect.HeapSource],
+                        cleanSlots);
+                }
             }
             else
             {
@@ -167,6 +175,31 @@ public sealed class ShaderResourcePlan
 
     // The flattened table the host fills per draw: table reads, then the written ranges.
     public int FlattenedTableReservedCount => TableReads.Count + WrittenRangeCount * WrittenRangeDwordCount;
+
+    // A wave-indexed selector obtains its mask, index keys and descriptors from
+    // the same heap. Equivalent (not merely reference-identical) address handles
+    // must therefore use the clean reader as one coherent snapshot.
+    internal static void MarkHeapReadSlots(
+        MemoryAccessTable memory,
+        IReadOnlyList<ResourceTableRead> tableReads,
+        DescriptorSource heap,
+        byte[] slots)
+    {
+        for (var slot = 0; slot < tableReads.Count && slot < slots.Length; slot++)
+        {
+            var value = tableReads[slot].Value;
+            if (value.Kind == ScalarValueKind.ScalarAddressWord && value.Operands.Length != 0 &&
+                value.Operands[0].Kind == ScalarValueKind.AddressHandle &&
+                value.Operands[0].Operands.Length == heap.Dwords.Length &&
+                value.Operands[0].Operands
+                    .Zip(heap.Dwords, (actual, expected) =>
+                        ScalarValueEquivalence.Equivalent(memory, actual, expected))
+                    .All(static equivalent => equivalent))
+            {
+                slots[slot] = 1;
+            }
+        }
+    }
 
     // Every flattened slot an indirect table's descriptor depends on must be read
     // through the clean reader, including the slots those reads depend on.

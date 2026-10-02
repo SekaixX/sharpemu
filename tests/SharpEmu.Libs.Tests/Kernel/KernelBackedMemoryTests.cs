@@ -298,6 +298,21 @@ public sealed class KernelBackedMemoryTests
     }
 
     [Fact]
+    public void LargeHintlessReservationUsesTheUserAddressClass()
+    {
+        using var test = new BackedKernelMemory();
+        const ulong size = 0x8000000000;
+
+        var address = test.Reserve(size);
+
+        var userAddressStart = OperatingSystem.IsMacOS()
+            ? 0x0000007000000000UL
+            : GuestMemoryLayout.GuestUserAddressStart;
+        Assert.InRange(address, userAddressStart, GuestMemoryLayout.GuestAddressLimit - size);
+        Assert.Equal((address, address + size), test.Query(address));
+    }
+
+    [Fact]
     public void AddressSearchUsesTheFullReservationExtent()
     {
         using var test = new BackedKernelMemory();
@@ -663,7 +678,12 @@ public sealed class KernelBackedMemoryTests
         Assert.True(test.Context.TryReadUInt64(test.Output, out start));
         Assert.True(test.Context.TryReadUInt64(test.Output + 8, out end));
         Assert.Equal((0UL, 0x4000UL), (start, end));
-        Assert.Equal(unchecked((int)0x8002000D), Query(0xC000, 1));
+        Assert.Equal(0, Query(0xC000, 1));
+        Assert.True(test.Context.TryReadUInt64(test.Output, out start));
+        Assert.True(test.Context.TryReadUInt64(test.Output + 8, out end));
+        Assert.True(test.Context.TryReadUInt32(test.Output + 16, out var terminalMemoryType));
+        Assert.Equal((GuestMemoryLayout.DirectBytes, GuestMemoryLayout.DirectBytes), (start, end));
+        Assert.Equal(0u, terminalMemoryType);
     }
 
     [Fact]
@@ -768,7 +788,7 @@ internal sealed class BackedKernelMemory : IDisposable
 
     public BackedKernelMemory(ulong bytes = 128UL * 1024 * 1024)
     {
-        Memory = new PhysicalVirtualMemory(viewHost: Host, backingBytes: bytes);
+        Memory = new PhysicalVirtualMemory(null, Host, bytes, reserveGuestAddressSpace: false);
         Context = new CpuContext(Memory, Generation.Gen5);
         ResetOutput();
     }

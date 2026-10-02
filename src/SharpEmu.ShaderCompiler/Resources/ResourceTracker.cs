@@ -298,6 +298,81 @@ public sealed partial class ResourceTracker
         return false;
     }
 
+    // A runtime V# is a four-dword descriptor whose dynamic leaves all come
+    // from guest-memory reads. Loop-carried phi values are valid as long as
+    // their non-cyclic inputs remain derivable from those reads and ordinary
+    // plan-time values. This keeps malformed or lane-divergent descriptors on
+    // the normal validation path instead of treating arbitrary bits as a GPU
+    // address.
+    private bool IsRuntimeDescriptorHandle(ScalarValue? handle)
+    {
+        if (handle is null || handle.Kind != ScalarValueKind.BufferHandle ||
+            handle.Operands.Length != 4 ||
+            !handle.Operands.All(operand => IsRuntimeDerivable(operand, [])))
+        {
+            return false;
+        }
+
+        return handle.Operands.Any(HasRuntimeRead);
+    }
+
+    private bool IsRuntimeDerivable(
+        ScalarValue value,
+        HashSet<ScalarValue> visiting)
+    {
+        if (!visiting.Add(value))
+        {
+            return value.Kind == ScalarValueKind.Phi;
+        }
+
+        try
+        {
+            return value.Kind switch
+            {
+                ScalarValueKind.Constant or
+                ScalarValueKind.ResourceTableWord or
+                ScalarValueKind.UserData or
+                ScalarValueKind.ShaderBase => true,
+                ScalarValueKind.ScalarAddressWord or
+                ScalarValueKind.ScalarBufferWord =>
+                    value.MemoryIndex >= 0 && value.MemoryIndex < _graph.Memory.Count,
+                ScalarValueKind.Phi or
+                ScalarValueKind.Select or
+                ScalarValueKind.Operation or
+                ScalarValueKind.FirstLane =>
+                    value.Operands.All(operand => IsRuntimeDerivable(operand, visiting)),
+                _ => false,
+            };
+        }
+        finally
+        {
+            visiting.Remove(value);
+        }
+    }
+
+    private static bool HasRuntimeRead(ScalarValue value) =>
+        HasRuntimeRead(value, []);
+
+    private static bool HasRuntimeRead(
+        ScalarValue value,
+        HashSet<ScalarValue> visiting)
+    {
+        if (!visiting.Add(value))
+        {
+            return false;
+        }
+
+        try
+        {
+            return value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord ||
+                value.Operands.Any(operand => HasRuntimeRead(operand, visiting));
+        }
+        finally
+        {
+            visiting.Remove(value);
+        }
+    }
+
     private uint GetHandleSource(ScalarValue? handle, ScalarValueKind expected, uint width, uint pc, bool sampler = false, bool sampleAdjust = false)
     {
         if (handle is null || handle.Kind != expected)
@@ -379,7 +454,8 @@ public sealed partial class ResourceTracker
         {
             var image = _info.Images[index];
             if (image.Source == source && image.ResourceClass == resourceClass && image.Dimension == memory.ImageDimension &&
-                image.MipMode == mip && image.DepthCompare == depth && image.R128 == memory.ImageR128)
+                image.MipMode == mip && image.DepthCompare == depth && image.R128 == memory.ImageR128 &&
+                image.NumericClass == memory.ImageNumericClass)
             {
                 Merge(image, memory, pc);
                 return (uint)index;
@@ -396,6 +472,7 @@ public sealed partial class ResourceTracker
             Source = source,
             FirstUsePc = pc,
             ResourceClass = resourceClass,
+            NumericClass = memory.ImageNumericClass,
             Dimension = memory.ImageDimension,
             MipMode = mip,
             DepthCompare = depth,
@@ -487,8 +564,15 @@ public sealed partial class ResourceTracker
     {
         var memory = _plan.Memory[index];
         var access = _plan.Accesses[index];
+        // Scratch is per-invocation private storage and deliberately has no
+        // descriptor/resource handle.  Backends allocate it from ScratchDwords.
+        if (memory.Kind == MemoryResourceKind.Scratch)
+        {
+            return;
+        }
+
         var isBuffer = memory.Kind is MemoryResourceKind.Buffer or MemoryResourceKind.ScalarBuffer;
-        var isAddress = memory.Kind is MemoryResourceKind.ScalarAddress or MemoryResourceKind.Flat or MemoryResourceKind.Global or MemoryResourceKind.Scratch;
+        var isAddress = memory.Kind is MemoryResourceKind.ScalarAddress or MemoryResourceKind.Flat or MemoryResourceKind.Global;
         var isImage = memory.Kind == MemoryResourceKind.Image;
         if (!isBuffer && !isAddress && !isImage)
         {
@@ -508,9 +592,13 @@ public sealed partial class ResourceTracker
         if (isBuffer)
         {
             // Scalar loads can address buffers that have no host descriptor binding, while
-            // vector buffer descriptors loaded from scalar-buffer data must stay device-side.
+            // a proven runtime vector V# must stay in shader registers and use the
+            // device-address page table. Require explicit guest-memory provenance for
+            // vector descriptors so malformed handles still fail closed.
             if ((memory.Kind == MemoryResourceKind.ScalarBuffer && !IsHostBufferHandle(access.Handle)) ||
-                (memory.Kind == MemoryResourceKind.Buffer && IsDeviceLoadedBufferHandle(access.Handle)))
+                (memory.Kind == MemoryResourceKind.Buffer &&
+                 !IsHostBufferHandle(access.Handle) &&
+                 (IsDeviceLoadedBufferHandle(access.Handle) || IsRuntimeDescriptorHandle(access.Handle))))
             {
                 memory.DeviceDescriptor = true;
                 _info.UsesDeviceAddresses = true;

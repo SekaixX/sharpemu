@@ -14,6 +14,7 @@ using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.Gpu.Vulkan;
+using SharpEmu.ShaderCompiler.Resources;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -27,8 +28,18 @@ internal static unsafe partial class VulkanVideoPresenter
     private const string ColorWriteEnableExtensionName = "VK_EXT_color_write_enable";
     private const string DepthClipControlExtensionName = "VK_EXT_depth_clip_control";
     private const string DepthClipEnableExtensionName = "VK_EXT_depth_clip_enable";
+    private const string AttachmentFeedbackLoopLayoutExtensionName = "VK_EXT_attachment_feedback_loop_layout";
+    private const string AttachmentFeedbackLoopDynamicStateExtensionName = "VK_EXT_attachment_feedback_loop_dynamic_state";
     private const int DrawsPerBatch = 64;
-    private const uint SingleRectangleVertexCount = 4;
+
+    // Guest write aspects select the attachment layout and feedback-loop handling. The host
+    // rendering scope still stores every bound depth/stencil attachment, including a guest
+    // read-only one, so synchronization must always declare the attachment write access.
+    internal static AccessFlags DepthAttachmentStoreAccess(ImageAspectFlags guestWriteAspects)
+    {
+        _ = guestWriteAspects;
+        return AccessFlags.DepthStencilAttachmentReadBit | AccessFlags.DepthStencilAttachmentWriteBit;
+    }
 
     private static void RequireRenderingFeature(bool supported, string feature, string deviceName)
     {
@@ -38,7 +49,7 @@ internal static unsafe partial class VulkanVideoPresenter
         }
     }
 
-    private sealed partial class Presenter : IRenderHost
+    private sealed partial class Presenter : IRenderHost, IMeshRenderHost
     {
         // Keep each new stream allocation intact until the draw is recorded.
         private sealed class RenderPreparation(Presenter owner, IDisposable streamRetention) : IResourcePreparation
@@ -97,9 +108,12 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         private ExtColorWriteEnable? _colorWriteEnableApi;
+        private ExtAttachmentFeedbackLoopDynamicState? _attachmentFeedbackLoopApi;
+        private ExtMeshShader? _meshShaderApi;
         private bool _supportsDepthClipControl;
         private bool _supportsDepthClipEnable;
         private bool _supportsDepthBounds;
+        private bool _supportsAttachmentFeedbackLoop;
         private RenderHostLimits _renderHostLimits;
         private IGuestBackedSpace _guestBacking = null!;
 
@@ -116,10 +130,15 @@ internal static unsafe partial class VulkanVideoPresenter
         private DepthAttachmentState _boundDepth;
         private ImageLayout _boundDepthLayout;
         private DepthStencilState _boundDepthLoadState;
+        private ImageAspectFlags _pendingAttachmentFeedbackLoopAspects;
         // A sampled depth target was cleared with a transfer; the rendering scope loads it instead.
         private bool _depthClearRecordedSeparately;
 
-        private void LoadRenderingCommands(bool supportsColorWriteEnable, string deviceName)
+        private void LoadRenderingCommands(
+            bool supportsColorWriteEnable,
+            string deviceName,
+            bool supportsAttachmentFeedbackLoop = false,
+            bool supportsMeshShader = false)
         {
             if (!_vk.TryGetDeviceExtension(_instance, _device, out _pushDescriptorApi))
             {
@@ -136,13 +155,68 @@ internal static unsafe partial class VulkanVideoPresenter
                 _colorWriteEnableApi = colorWriteEnable;
             }
 
+            if (supportsAttachmentFeedbackLoop)
+            {
+                if (!_vk.TryGetDeviceExtension(
+                        _instance,
+                        _device,
+                        out ExtAttachmentFeedbackLoopDynamicState attachmentFeedbackLoop))
+                {
+                    throw SubmissionScheduler.Fatal(
+                        $"The device extension commands are unavailable: device={deviceName} extension={AttachmentFeedbackLoopDynamicStateExtensionName}.");
+                }
+
+                _attachmentFeedbackLoopApi = attachmentFeedbackLoop;
+            }
+
+            if (supportsMeshShader)
+            {
+                if (!_vk.TryGetDeviceExtension(
+                        _instance,
+                        _device,
+                        out ExtMeshShader meshShader))
+                {
+                    throw SubmissionScheduler.Fatal(
+                        $"The device extension commands are unavailable: device={deviceName} extension={MeshShaderExtensionName}.");
+                }
+
+                _meshShaderApi = meshShader;
+            }
+
+            _supportsAttachmentFeedbackLoop = supportsAttachmentFeedbackLoop;
+
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan rendering extensions color_write_enable={(supportsColorWriteEnable ? 1 : 0)} " +
                 $"depth_clip_control={(_supportsDepthClipControl ? 1 : 0)} depth_clip_enable={(_supportsDepthClipEnable ? 1 : 0)} " +
-                $"depth_bounds={(_supportsDepthBounds ? 1 : 0)}");
+                $"depth_clamp={(_supportsDepthClamp ? 1 : 0)} depth_bounds={(_supportsDepthBounds ? 1 : 0)} " +
+                $"multi_viewport={(_supportsMultiViewport ? 1 : 0)} viewports={_renderHostLimits.MaxViewports} " +
+                $"attachment_feedback_loop={(supportsAttachmentFeedbackLoop ? 1 : 0)} " +
+                $"mesh_shader={(supportsMeshShader ? 1 : 0)}");
+
+            if (supportsMeshShader)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] Vulkan mesh limits groups=" +
+                    $"{_meshShaderCapabilities.MaxWorkGroupCountX}x" +
+                    $"{_meshShaderCapabilities.MaxWorkGroupCountY}x" +
+                    $"{_meshShaderCapabilities.MaxWorkGroupCountZ} " +
+                    $"total={_meshShaderCapabilities.MaxWorkGroupTotalCount} " +
+                    $"local={_meshShaderCapabilities.MaxWorkGroupSizeX}x" +
+                    $"{_meshShaderCapabilities.MaxWorkGroupSizeY}x" +
+                    $"{_meshShaderCapabilities.MaxWorkGroupSizeZ} " +
+                    $"invocations={_meshShaderCapabilities.MaxWorkGroupInvocations} " +
+                    $"vertices={_meshShaderCapabilities.MaxOutputVertices} " +
+                    $"primitives={_meshShaderCapabilities.MaxOutputPrimitives} " +
+                    $"shared={_meshShaderCapabilities.MaxSharedMemorySize}");
+            }
         }
 
         RenderHostLimits IRenderHost.Limits => _renderHostLimits;
+
+        bool IRenderHost.ProvokingVertexLastSupported => _supportsProvokingVertexLast;
+
+        MeshShaderHostCapabilities IMeshRenderHost.MeshShaderCapabilities =>
+            _meshShaderCapabilities;
 
         IImageFormatSupport IRenderHost.FormatSupport => _deviceInfo;
 
@@ -161,6 +235,14 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         public void RunPendingOperations() => RunPendingCommands();
+
+        public void SynchronizeForDiagnostic()
+        {
+            EndRendering();
+            _ = CurrentRecordingBuffer();
+            _scheduler.FlushAndWait();
+            CollectCompletedGuestSubmissions(waitForOldest: false);
+        }
 
         public void SetDebugInformation(RecordedOperation operation, ulong submitId, uint argument0, uint argument1, uint argument2, uint argument3, ulong argument4) =>
             _scheduler.Current.SetDebugInfo((uint)operation, submitId, argument0, argument1, argument2, argument3, argument4);
@@ -227,6 +309,7 @@ internal static unsafe partial class VulkanVideoPresenter
             ResetImageBindings();
             _hasBoundDepth = false;
             _depthClearRecordedSeparately = false;
+            _pendingAttachmentFeedbackLoopAspects = 0;
             _boundGraphicsPipeline = null;
         }
 
@@ -280,7 +363,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var command = BeginBatchedGuestCommands();
             var image = _imageCache.GetImage(depth.Image);
             var view = depth.Target.Target.Request.View;
-            var access = AccessFlags.DepthStencilAttachmentReadBit | (writeAspects != 0 ? AccessFlags.DepthStencilAttachmentWriteBit : 0);
+            var access = DepthAttachmentStoreAccess(writeAspects);
             image.Transition(layout, access, new SubresourceRange(view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount), command);
             _hasBoundDepth = true;
             _boundDepth = depth;
@@ -288,12 +371,18 @@ internal static unsafe partial class VulkanVideoPresenter
             _boundDepthLoadState = depth.LoadState;
         }
 
-        public BufferBinding NullBuffer => new(_bufferCache.GetBuffer(GuestBufferCache.NullBufferId).Handle.Handle, 0);
+        public BufferBinding NullBuffer => new(_bufferCache.GetBuffer(GuestBufferCache.NullBufferId).Handle.Handle, 0, 0);
 
         public BufferBinding ObtainBuffer(ulong address, ulong size, bool isWritten)
         {
             var (buffer, offset) = _bufferCache.ObtainBuffer(address, size, isWritten);
-            return new BufferBinding(buffer.Handle.Handle, offset);
+            return new BufferBinding(buffer.Handle.Handle, offset, size);
+        }
+
+        public void RegisterDeviceAddressRange(ulong address, ulong size)
+        {
+            _ = RequirePreparation();
+            _ = _bufferCache.FindBuffer(address, size);
         }
 
         // The ring takes the bytes unless it would wrap over a prepared binding; then a host buffer of the draw takes them.
@@ -305,7 +394,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 data.CopyTo(stream.Mapped[(int)offset..]);
                 stream.Commit();
-                return new BufferBinding(stream.Handle.Handle, offset);
+                return new BufferBinding(stream.Handle.Handle, offset, (ulong)data.Length);
             }
 
             // Transient uploads also back storage-buffer descriptors, so match the ring's usage.
@@ -316,7 +405,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 RenderTrace.Write($"The stream ring could not take an upload inside a preparation; a host buffer holds it: bytes={data.Length} alignment={alignment}");
             }
 
-            return new BufferBinding(buffer.Handle, 0);
+            return new BufferBinding(buffer.Handle, 0, (ulong)data.Length);
         }
 
         public void BindVertexBuffers(ReadOnlySpan<BufferBinding> bindings, VertexInputInfo input)
@@ -325,13 +414,15 @@ internal static unsafe partial class VulkanVideoPresenter
             var command = BeginBatchedGuestCommands();
             var buffers = stackalloc VkBuffer[bindings.Length];
             var offsets = stackalloc ulong[bindings.Length];
+            var sizes = stackalloc ulong[bindings.Length];
             for (var index = 0; index < bindings.Length; index++)
             {
                 buffers[index] = new VkBuffer(bindings[index].Handle);
                 offsets[index] = bindings[index].Offset;
+                sizes[index] = bindings[index].Size;
             }
 
-            _vk.CmdBindVertexBuffers(command, 0, (uint)bindings.Length, buffers, offsets);
+            _vk.CmdBindVertexBuffers2(command, 0, (uint)bindings.Length, buffers, offsets, sizes, null);
         }
 
         public void BindIndexBuffer(BufferBinding binding, IndexType type) =>
@@ -396,7 +487,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         _boundDepthLayout = _boundDepthLoadState.AttachmentLayout(depthFormat);
                         depthImage.Transition(
                             _boundDepthLayout,
-                            AccessFlags.DepthStencilAttachmentReadBit | (remainingWrites != 0 ? AccessFlags.DepthStencilAttachmentWriteBit : 0),
+                            DepthAttachmentStoreAccess(remainingWrites),
                             new SubresourceRange(depthView.BaseLevel, depthView.LevelCount, depthView.BaseLayer, depthView.LayerCount),
                             BeginBatchedGuestCommands());
                         break;
@@ -426,20 +517,28 @@ internal static unsafe partial class VulkanVideoPresenter
                     var writes = _boundDepthLoadState.AttachmentWriteAspects(depthFormat);
                     var attachmentView = _boundDepth.Target.Target.Request.View;
                     var overlaps = ViewsOverlap(view, attachmentView);
-                    if (overlaps && (sampledAspects & writes) != 0)
+                    var feedbackAspects = overlaps ? sampledAspects & writes : 0;
+                    if (feedbackAspects != 0)
                     {
-                        throw SubmissionScheduler.Fatal(
-                            "A draw cannot sample and write the same depth or stencil aspect without feedback-loop support: " +
-                            $"image=0x{image.Description.Data.Address:X16} sampledAspects={sampledAspects} writeAspects={writes} viewFormat={view.Format} viewAspect={view.Aspect} " +
-                            $"sampleMip={view.BaseLevel}+{view.LevelCount} sampleLayer={view.BaseLayer}+{view.LayerCount} " +
-                            $"targetMip={attachmentView.BaseLevel}+{attachmentView.LevelCount} targetLayer={attachmentView.BaseLayer}+{attachmentView.LayerCount} " +
-                            $"clearDepth={_boundDepthLoadState.DepthClearEnabled} clearStencil={_boundDepthLoadState.StencilClearEnabled} depthState={_boundDepthLoadState}.");
+                        if (storage || !_supportsAttachmentFeedbackLoop)
+                        {
+                            throw SubmissionScheduler.Fatal(
+                                "A draw cannot sample and write the same depth or stencil aspect without feedback-loop support: " +
+                                $"image=0x{image.Description.Data.Address:X16} sampledAspects={sampledAspects} writeAspects={writes} viewFormat={view.Format} viewAspect={view.Aspect} " +
+                                $"storage={(storage ? 1 : 0)} " +
+                                $"sampleMip={view.BaseLevel}+{view.LevelCount} sampleLayer={view.BaseLayer}+{view.LayerCount} " +
+                                $"targetMip={attachmentView.BaseLevel}+{attachmentView.LevelCount} targetLayer={attachmentView.BaseLayer}+{attachmentView.LayerCount} " +
+                                $"clearDepth={_boundDepthLoadState.DepthClearEnabled} clearStencil={_boundDepthLoadState.StencilClearEnabled} depthState={_boundDepthLoadState}.");
+                        }
+
+                        _pendingAttachmentFeedbackLoopAspects |= feedbackAspects;
+                        _boundDepthLayout = ImageLayout.AttachmentFeedbackLoopOptimalExt;
                     }
 
                     // Keep the sampled view and the attachment in the same layout.
                     binding.Layout = overlaps ? _boundDepthLayout : ImageLayout.DepthStencilReadOnlyOptimal;
                     var attachmentAccess = overlaps
-                        ? AccessFlags.DepthStencilAttachmentReadBit | (writes != 0 ? AccessFlags.DepthStencilAttachmentWriteBit : 0)
+                        ? DepthAttachmentStoreAccess(writes)
                         : 0;
                     image.Transition(binding.Layout, AccessFlags.ShaderReadBit | attachmentAccess, range, command);
                 }
@@ -492,16 +591,38 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.CmdClearDepthStencilImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &value, 1, &vkRange);
         }
 
-        public void SetDynamicState(in DynamicDrawState state)
+        public void SetDynamicState(in DynamicDrawState state, ReadOnlySpan<DynamicViewportState> viewports)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawDynamicStateRecording);
+            if (viewports.IsEmpty || (uint)viewports.Length > _renderHostLimits.MaxViewports)
+            {
+                throw SubmissionScheduler.Fatal(
+                    $"The dynamic viewport count is outside the enabled host range: " +
+                    $"count={viewports.Length} max={_renderHostLimits.MaxViewports}.");
+            }
+
             var command = BeginBatchedGuestCommands();
-            var viewport = new Viewport(state.ViewportX, state.ViewportY, state.ViewportWidth, state.ViewportHeight, state.ViewportMinDepth, state.ViewportMaxDepth);
-            _vk.CmdSetViewport(command, 0, 1, &viewport);
-            var scissor = new Rect2D(
-                new Offset2D(state.Scissor.Left, state.Scissor.Top),
-                new Extent2D((uint)(state.Scissor.Right - state.Scissor.Left), (uint)(state.Scissor.Bottom - state.Scissor.Top)));
-            _vk.CmdSetScissor(command, 0, 1, &scissor);
+            var vkViewports = stackalloc Viewport[viewports.Length];
+            var vkScissors = stackalloc Rect2D[viewports.Length];
+            for (var index = 0; index < viewports.Length; index++)
+            {
+                ref readonly var viewport = ref viewports[index];
+                vkViewports[index] = new Viewport(
+                    viewport.X,
+                    viewport.Y,
+                    viewport.Width,
+                    viewport.Height,
+                    viewport.MinDepth,
+                    viewport.MaxDepth);
+                vkScissors[index] = new Rect2D(
+                    new Offset2D(viewport.Scissor.Left, viewport.Scissor.Top),
+                    new Extent2D(
+                        (uint)(viewport.Scissor.Right - viewport.Scissor.Left),
+                        (uint)(viewport.Scissor.Bottom - viewport.Scissor.Top)));
+            }
+
+            _vk.CmdSetViewportWithCount(command, (uint)viewports.Length, vkViewports);
+            _vk.CmdSetScissorWithCount(command, (uint)viewports.Length, vkScissors);
             _vk.CmdSetLineWidth(command, state.LineWidth);
             var blendConstants = stackalloc float[4] { state.BlendRed, state.BlendGreen, state.BlendBlue, state.BlendAlpha };
             _vk.CmdSetBlendConstants(command, blendConstants);
@@ -509,6 +630,9 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.CmdSetDepthWriteEnable(command, state.DepthWriteEnabled);
             _vk.CmdSetDepthCompareOp(command, state.DepthCompare);
             _vk.CmdSetDepthBiasEnable(command, state.DepthBiasEnabled);
+            _attachmentFeedbackLoopApi?.CmdSetAttachmentFeedbackLoopEnable(
+                command,
+                _pendingAttachmentFeedbackLoopAspects);
             if (state.DepthBiasEnabled)
             {
                 _vk.CmdSetDepthBias(command, state.DepthBiasConstantFactor, _supportsDepthBiasClamp ? state.DepthBiasClamp : 0f, state.DepthBiasSlopeFactor);
@@ -660,7 +784,9 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var depthStencil = state.DepthStencilAttachment;
-            var depthLayout = depthStencil.Layout;
+            var depthLayout = _pendingAttachmentFeedbackLoopAspects != 0
+                ? _boundDepthLayout
+                : depthStencil.Layout;
             var depthClear = depthStencil.DepthClear;
             var stencilClear = depthStencil.StencilClear;
             if (_depthClearRecordedSeparately)
@@ -723,11 +849,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (bindPoint == PipelineBindPoint.Graphics)
             {
                 _boundGraphicsPipeline = entry;
-                if (!entry.RectangleList)
-                {
-                    _vk.CmdBindPipeline(command, bindPoint, entry.Pipeline);
-                }
-
+                _vk.CmdBindPipeline(command, bindPoint, entry.Pipeline);
                 return;
             }
 
@@ -744,39 +866,14 @@ internal static unsafe partial class VulkanVideoPresenter
             _batchDrawCount++;
         }
 
-        // A single rectangle draws as a strip of four vertices; anything else draws as a triangle list.
-        private static bool IsSingleRectangle(uint vertexCount) => vertexCount is 1 or 3 or 4;
-
-        private void BindRectangleListVariant(RenderPipelineEntry entry, bool strip, CommandBuffer command)
-        {
-            ref var variant = ref strip ? ref entry.StripVariant : ref entry.ListVariant;
-            if (variant.Handle == 0)
-            {
-                variant = CreateRenderPipeline(entry.Description!, strip ? PrimitiveTopology.TriangleStrip : PrimitiveTopology.TriangleList, entry.Layout);
-            }
-
-            _vk.CmdBindPipeline(command, PipelineBindPoint.Graphics, variant);
-        }
-
         public void Draw(uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
-            var count = vertexCount;
-            if (_boundGraphicsPipeline is { RectangleList: true } entry)
-            {
-                var strip = IsSingleRectangle(vertexCount);
-                BindRectangleListVariant(entry, strip, command);
-                if (strip)
-                {
-                    count = SingleRectangleVertexCount;
-                }
-            }
-
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
-            _vk.CmdDraw(command, count, instanceCount, firstVertex, firstInstance);
+            _vk.CmdDraw(command, vertexCount, instanceCount, firstVertex, firstInstance);
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Draw,
-                _boundGraphicsPipeline?.Id ?? 0, count, instanceCount);
+                _boundGraphicsPipeline?.Id ?? 0, vertexCount, instanceCount);
             CountDraw();
         }
 
@@ -784,15 +881,66 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
-            if (_boundGraphicsPipeline is { RectangleList: true } entry)
-            {
-                BindRectangleListVariant(entry, strip: false, command);
-            }
-
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             _vk.CmdDrawIndexed(command, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
                 _boundGraphicsPipeline?.Id ?? 0, indexCount, instanceCount);
+            CountDraw();
+        }
+
+        void IMeshRenderHost.PushMeshDrawData(
+            in PipelineHandle pipeline,
+            ReadOnlySpan<uint> drawData)
+        {
+            if (!_meshShaderCapabilities.Supported ||
+                pipeline.Layout == 0 ||
+                drawData.Length != checked((int)PushData.MeshDrawDwordCount))
+            {
+                throw SubmissionScheduler.Fatal(
+                    $"Mesh draw push data is invalid: " +
+                    $"supported={_meshShaderCapabilities.Supported} " +
+                    $"layout=0x{pipeline.Layout:X16} " +
+                    $"dwords={drawData.Length} expected={PushData.MeshDrawDwordCount}.");
+            }
+
+            var command = BeginBatchedGuestCommands();
+            fixed (uint* drawDataPointer = drawData)
+            {
+                _vk.CmdPushConstants(
+                    command,
+                    new PipelineLayout(pipeline.Layout),
+                    ShaderStageFlags.MeshBitExt | ShaderStageFlags.FragmentBit,
+                    0,
+                    PushData.MeshDrawDwordCount * sizeof(uint),
+                    drawDataPointer);
+            }
+        }
+
+        void IMeshRenderHost.DrawMeshTasks(uint groupCountX, uint groupCountY, uint groupCountZ)
+        {
+            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
+            if (_meshShaderApi is null ||
+                !VulkanMeshShaderPolicy.SupportsDraw(
+                    _meshShaderCapabilities,
+                    groupCountX,
+                    groupCountY,
+                    groupCountZ))
+            {
+                throw SubmissionScheduler.Fatal(
+                    $"Mesh task draw exceeds the enabled Vulkan host capability: " +
+                    $"groups={groupCountX}x{groupCountY}x{groupCountZ} " +
+                    $"supported={_meshShaderCapabilities.Supported}.");
+            }
+
+            var command = BeginBatchedGuestCommands();
+            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
+            _meshShaderApi.CmdDrawMeshTask(command, groupCountX, groupCountY, groupCountZ);
+            _gpuCommandProfile?.WriteMarker(
+                command,
+                VulkanCommandProfile.IntervalKind.Draw,
+                _boundGraphicsPipeline?.Id ?? 0,
+                groupCountX,
+                groupCountY);
             CountDraw();
         }
 

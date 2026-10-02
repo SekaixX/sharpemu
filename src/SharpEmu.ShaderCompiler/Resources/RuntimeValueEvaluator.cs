@@ -18,6 +18,15 @@ public sealed class RuntimeValueEvaluator
     private readonly ScalarValue? _activeMask;
     private readonly Dictionary<ScalarValue, ulong> _cache;
     private readonly List<ScalarValue> _visiting;
+    private string? _failureDetail;
+
+    internal string? FailureDetail => _failureDetail;
+
+    private static bool Fail(string message)
+    {
+        Console.Error.WriteLine($"shader runtime value evaluation failed: {message}");
+        return false;
+    }
 
     public RuntimeValueEvaluator(
         ShaderResourcePlan plan,
@@ -91,6 +100,7 @@ public sealed class RuntimeValueEvaluator
 
         if (_visiting.Contains(value))
         {
+            _failureDetail ??= DescribeFailure(value, "cyclic_dependency");
             return false;
         }
 
@@ -99,12 +109,22 @@ public sealed class RuntimeValueEvaluator
         _visiting.RemoveAt(_visiting.Count - 1);
         if (!evaluated)
         {
+            _failureDetail ??= DescribeFailure(value, "cannot_evaluate");
             return false;
         }
 
         _cache[value] = computed;
         result = computed;
         return true;
+    }
+
+    private static string DescribeFailure(ScalarValue value, string reason) =>
+        $"node={value.Id} kind={value.Kind} operation={value.Operation} payload=0x{value.Payload:X} reason={reason}";
+
+    private bool Refuse(ScalarValue value, string reason)
+    {
+        _failureDetail ??= DescribeFailure(value, reason);
+        return false;
     }
 
     private bool Operand(ScalarValue value, int index, out ulong result) => EvaluateWide(value.Operands[index], out result);
@@ -138,20 +158,36 @@ public sealed class RuntimeValueEvaluator
             case ScalarValueKind.FirstLane:
             {
                 using var scratch = RuntimeEvaluationScratch.Rent();
-                return new RuntimeValueEvaluator(scratch, _plan, _inputs, _cleanFlatSlots, _cleanEvaluator, value.Operands[1])
-                    .EvaluateWide(value.Operands[0], out result);
+                var laneEvaluator = new RuntimeValueEvaluator(
+                    scratch,
+                    _plan,
+                    _inputs,
+                    _cleanFlatSlots,
+                    _cleanEvaluator,
+                    value.Operands[1]);
+                var evaluated = laneEvaluator.EvaluateWide(value.Operands[0], out result);
+                if (!evaluated)
+                {
+                    _failureDetail ??= laneEvaluator.FailureDetail;
+                }
+                return evaluated;
             }
             case ScalarValueKind.ResourceTableWord:
             {
                 var slot = (int)value.Payload;
                 if (slot >= _plan.TableReads.Count)
                 {
-                    return false;
+                    return Refuse(value, $"resource_table_slot_out_of_range slot={slot}");
                 }
 
                 if (slot < _cleanFlatSlots.Count && _cleanFlatSlots[slot] != 0 && _cleanEvaluator is not null)
                 {
-                    return _cleanEvaluator.EvaluateWide(_plan.TableReads[slot].Value, out result);
+                    var evaluated = _cleanEvaluator.EvaluateWide(_plan.TableReads[slot].Value, out result);
+                    if (!evaluated)
+                    {
+                        _failureDetail ??= _cleanEvaluator.FailureDetail;
+                    }
+                    return evaluated;
                 }
 
                 return EvaluateWide(_plan.TableReads[slot].Value, out result);
@@ -199,7 +235,7 @@ public sealed class RuntimeValueEvaluator
         result = 0;
         if (value.MemoryIndex >= _plan.Memory.Count)
         {
-            return false;
+            return Refuse(value, $"memory_index_out_of_range index={value.MemoryIndex}");
         }
 
         var memory = _plan.Memory[value.MemoryIndex];
@@ -209,7 +245,7 @@ public sealed class RuntimeValueEvaluator
             !EvaluateWide(handle.Operands[1], out var high) ||
             !Operand(value, 1, out var offset))
         {
-            return false;
+            return Refuse(value, "address_inputs_unavailable");
         }
 
         var baseAddress = ((high << 32) | (uint)low) & AddressMask;
@@ -221,12 +257,12 @@ public sealed class RuntimeValueEvaluator
                 !EvaluateWide(handle.Operands[2], out var records) ||
                 !EvaluateWide(handle.Operands[3], out _))
             {
-                return false;
+                return Refuse(value, "buffer_descriptor_unavailable");
             }
 
             if (immediate < 0)
             {
-                return false;
+                return Refuse(value, $"negative_buffer_immediate immediate={immediate}");
             }
 
             var byteOffset = (ulong)immediate + (uint)offset;
@@ -235,7 +271,9 @@ public sealed class RuntimeValueEvaluator
             var size = stride == 0 ? (ulong)(uint)records : (ulong)stride * (uint)records;
             if (aligned > size || size - aligned < sizeof(uint))
             {
-                return false;
+                return Refuse(
+                    value,
+                    $"buffer_read_out_of_range offset=0x{aligned:X} size=0x{size:X}");
             }
 
             address = ((baseAddress & ~3ul) + byteOffset) & ~3ul;
@@ -245,7 +283,9 @@ public sealed class RuntimeValueEvaluator
             var relative = (immediate & ~3L) + (long)((uint)offset & ~3u);
             if (!AddSignedAddress(baseAddress & ~3ul, relative, out address))
             {
-                return false;
+                return Refuse(
+                    value,
+                    $"address_out_of_range base=0x{baseAddress:X16} relative={relative}");
             }
         }
 
@@ -260,7 +300,12 @@ public sealed class RuntimeValueEvaluator
                 return true;
             }
 
-            return false;
+            var access = _plan.Memory[value.MemoryIndex];
+            var reason = _inputs.ReadMemory is null ? "reader_unavailable" : "reader_refused";
+            return Refuse(
+                value,
+                $"guest_read_failed memory={value.MemoryIndex} pc=0x{access.Pc:X8} " +
+                $"address=0x{address:X16} {reason}");
         }
 
         result = word;
@@ -319,10 +364,34 @@ public sealed class RuntimeValueEvaluator
         out uint[] table,
         out bool[] activeSources,
         int additionalTableWords = 0)
+        => EvaluateSources(
+            plan,
+            sources,
+            inputs,
+            cleanFlatSlots,
+            evaluateTable,
+            out results,
+            out table,
+            out activeSources,
+            out _,
+            additionalTableWords);
+
+    internal static bool EvaluateSources(
+        ShaderResourcePlan plan,
+        IReadOnlyList<uint> sources,
+        ResourceRuntimeInputs inputs,
+        IReadOnlyList<byte> cleanFlatSlots,
+        bool evaluateTable,
+        out List<DescriptorWords> results,
+        out uint[] table,
+        out bool[] activeSources,
+        out string? failureDetail,
+        int additionalTableWords = 0)
     {
         results = [];
         table = [];
         activeSources = [];
+        failureDetail = null;
         var anyClean = false;
         foreach (var clean in cleanFlatSlots)
         {
@@ -331,7 +400,8 @@ public sealed class RuntimeValueEvaluator
 
         if (anyClean && inputs.ReadCleanMemory is null)
         {
-            return false;
+            failureDetail = "reason=clean_reader_unavailable";
+            return Fail("clean flattened slots require a clean guest-memory reader");
         }
 
         using var cleanScratch = RuntimeEvaluationScratch.Rent();
@@ -345,7 +415,10 @@ public sealed class RuntimeValueEvaluator
         {
             if (sourceIndex >= plan.DescriptorSources.Count)
             {
-                return false;
+                failureDetail = $"descriptor_source={sourceIndex} reason=source_out_of_range " +
+                    $"source_count={plan.DescriptorSources.Count}";
+                return Fail(
+                    $"descriptor source index {sourceIndex} exceeds count {plan.DescriptorSources.Count}");
             }
 
             var source = plan.DescriptorSources[(int)sourceIndex];
@@ -354,7 +427,15 @@ public sealed class RuntimeValueEvaluator
             {
                 for (var index = 0; index < words.Length; index++)
                 {
-                    if (!evaluator.Evaluate(source.Dwords[index], out words[index])) return false;
+                    if (!evaluator.Evaluate(source.Dwords[index], out words[index]))
+                    {
+                        var node = source.Dwords[index];
+                        failureDetail = $"descriptor_source={sourceIndex} dword={index} " +
+                            (evaluator.FailureDetail ?? DescribeFailure(node, "cannot_evaluate"));
+                        return Fail(
+                            $"descriptor source={sourceIndex} dword={index} node={node.Id} " +
+                            $"kind={node.Kind} operation={node.Operation} payload=0x{node.Payload:X}");
+                    }
                 }
             }
 
@@ -371,7 +452,14 @@ public sealed class RuntimeValueEvaluator
                 var selected = clean ? cleanEvaluator : evaluator;
                 if (read.FlatOffset >= plan.TableReads.Count || !selected.Evaluate(read.Value, out var word))
                 {
-                    return false;
+                    var node = read.Value;
+                    failureDetail = read.FlatOffset >= plan.TableReads.Count
+                        ? $"table_slot={read.FlatOffset} reason=slot_out_of_range table_count={plan.TableReads.Count}"
+                        : $"table_slot={read.FlatOffset} clean={clean} " +
+                            (selected.FailureDetail ?? DescribeFailure(node, "cannot_evaluate"));
+                    return Fail(
+                        $"flattened slot={read.FlatOffset} clean={clean} node={node.Id} " +
+                        $"kind={node.Kind} operation={node.Operation} payload=0x{node.Payload:X}");
                 }
 
                 flattened[(int)read.FlatOffset] = word;

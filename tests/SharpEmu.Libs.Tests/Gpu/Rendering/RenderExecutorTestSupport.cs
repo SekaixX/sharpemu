@@ -35,7 +35,7 @@ internal sealed class AcceptingFormatSupport : IImageFormatSupport
 }
 
 // Records every host call in order and fakes the buffer and image caches.
-internal sealed class RecordingRenderHost : IRenderHost
+internal sealed class RecordingRenderHost : IRenderHost, IMeshRenderHost
 {
     private sealed class Preparation(RecordingRenderHost owner) : IResourcePreparation
     {
@@ -84,15 +84,37 @@ internal sealed class RecordingRenderHost : IRenderHost
 
     public List<DynamicDrawState> DynamicStates { get; } = new();
 
+    public List<DynamicViewportState[]> DynamicViewports { get; } = new();
+
     public int GuestReads { get; private set; }
 
     public bool Recording { get; set; } = true;
 
     public RenderHostLimits Limits { get; set; } = new(16384, 8192, 16384, 16384);
 
+    public bool ProvokingVertexLastSupported { get; set; }
+
     public IImageFormatSupport FormatSupport { get; } = new AcceptingFormatSupport();
 
     public bool IsRecording => Recording;
+
+    public MeshShaderHostCapabilities MeshShaderCapabilities { get; set; } = new(
+        true,
+        uint.MaxValue,
+        uint.MaxValue,
+        uint.MaxValue,
+        uint.MaxValue,
+        1024,
+        1024,
+        1024,
+        64,
+        uint.MaxValue,
+        uint.MaxValue,
+        uint.MaxValue);
+
+    public uint[]? LastMeshDrawData { get; private set; }
+
+    public BufferBinding[] LastVertexBindings { get; private set; } = [];
 
     public ImageLayout ColorLayout { get; set; } = ImageLayout.ColorAttachmentOptimal;
 
@@ -145,7 +167,7 @@ internal sealed class RecordingRenderHost : IRenderHost
         return new Preparation(this);
     }
 
-    public BufferBinding NullBuffer => new(NullHandle, 0);
+    public BufferBinding NullBuffer => new(NullHandle, 0, 0);
 
     public void RunPendingOperations() => Calls.Add("pending");
 
@@ -253,7 +275,13 @@ internal sealed class RecordingRenderHost : IRenderHost
         }
 
         Calls.Add($"obtain {address:X} {size:X} written={isWritten} -> {owner.Handle:X}:{address - owner.Start:X}");
-        return new BufferBinding(owner.Handle, address - owner.Start);
+        return new BufferBinding(owner.Handle, address - owner.Start, size);
+    }
+
+    public void RegisterDeviceAddressRange(ulong address, ulong size)
+    {
+        TryWrapRing("register_device_address_range");
+        Calls.Add($"register_device_address_range {address:X} {size:X}");
     }
 
     public BufferBinding UploadTransient(ReadOnlySpan<byte> data, uint alignment)
@@ -262,13 +290,16 @@ internal sealed class RecordingRenderHost : IRenderHost
         _transientOffset += ((ulong)data.Length + alignment - 1) & ~(alignment - 1ul);
         Calls.Add($"upload_transient {data.Length:X} align={alignment} -> {TransientHandle:X}:{offset:X}");
         LastTransient = data.ToArray();
-        return new BufferBinding(TransientHandle, offset);
+        return new BufferBinding(TransientHandle, offset, (ulong)data.Length);
     }
 
     public byte[]? LastTransient { get; private set; }
 
-    public void BindVertexBuffers(ReadOnlySpan<BufferBinding> bindings, VertexInputInfo input) =>
-        Calls.Add($"bind_vertex {string.Join(",", bindings.ToArray().Select(b => $"{b.Handle:X}:{b.Offset:X}"))}");
+    public void BindVertexBuffers(ReadOnlySpan<BufferBinding> bindings, VertexInputInfo input)
+    {
+        LastVertexBindings = bindings.ToArray();
+        Calls.Add($"bind_vertex {string.Join(",", LastVertexBindings.Select(b => $"{b.Handle:X}:{b.Offset:X}"))}");
+    }
 
     public void BindIndexBuffer(BufferBinding binding, IndexType type) => Calls.Add($"bind_index {binding.Handle:X}:{binding.Offset:X} {type}");
 
@@ -300,9 +331,10 @@ internal sealed class RecordingRenderHost : IRenderHost
     public void CommitBindings(PipelineBindPoint bindPoint, in PipelineHandle pipeline, ReadOnlySpan<IPreparedBindings> stages) =>
         Calls.Add($"commit {bindPoint} {pipeline.Pipeline:X} [{string.Join(",", stages.ToArray().Select(s => ((RecordedBindings)s).Id))}]");
 
-    public void SetDynamicState(in DynamicDrawState state)
+    public void SetDynamicState(in DynamicDrawState state, ReadOnlySpan<DynamicViewportState> viewports)
     {
         DynamicStates.Add(state);
+        DynamicViewports.Add(viewports.ToArray());
         Calls.Add("dynamic_state");
     }
 
@@ -322,9 +354,22 @@ internal sealed class RecordingRenderHost : IRenderHost
     public void DrawIndexed(uint indexCount, uint instanceCount, uint firstIndex, int vertexOffset, uint firstInstance) =>
         Calls.Add($"draw_indexed {indexCount} {instanceCount} {firstIndex} {vertexOffset} {firstInstance}");
 
+    public void PushMeshDrawData(in PipelineHandle pipeline, ReadOnlySpan<uint> drawData)
+    {
+        LastMeshDrawData = drawData.ToArray();
+        Calls.Add($"push_mesh_draw_data {pipeline.Pipeline:X} [{string.Join(",", LastMeshDrawData)}]");
+    }
+
+    public void DrawMeshTasks(uint groupCountX, uint groupCountY, uint groupCountZ) =>
+        Calls.Add($"draw_mesh_tasks {groupCountX} {groupCountY} {groupCountZ}");
+
     public void Dispatch(uint groupsX, uint groupsY, uint groupsZ) => Calls.Add($"dispatch {groupsX} {groupsY} {groupsZ}");
 
-    public bool TryDispatchIndirect(ulong argumentsAddress) => false;
+    public bool TryDispatchIndirect(ulong argumentsAddress)
+    {
+        Calls.Add($"dispatch_indirect {argumentsAddress:X}");
+        return true;
+    }
 
     public void ShaderWriteBarrier(PipelineStageFlags sourceStages) => Calls.Add($"write_barrier {sourceStages}");
 
@@ -395,6 +440,16 @@ internal sealed class FakePipelineProvider : IShaderPipelineProvider
 
     public ComputeProgram Compute { get; set; } = RenderExecutorFixtures.ComputeProgram();
 
+    public HashSet<ulong> FusedGraphicsPrograms { get; } = [];
+
+    public Dictionary<ulong, ulong> FusedGraphicsContinuations { get; } = [];
+
+    public bool FusedGeometrySupported { get; set; } = true;
+
+    public bool SupportsFusedGeometry => FusedGeometrySupported;
+
+    public List<ulong> FusedGraphicsProgramQueries { get; } = [];
+
     public List<string> Calls { get; } = new();
 
     public List<RenderingState> PipelineRenderings { get; } = new();
@@ -405,17 +460,59 @@ internal sealed class FakePipelineProvider : IShaderPipelineProvider
 
     public List<ColorComponentMap[]> ExportMappings { get; } = new();
 
+    public List<uint> BoundColorSlotMasks { get; } = new();
+
+    public bool IsFusedGraphicsProgram(ulong codeAddress)
+    {
+        FusedGraphicsProgramQueries.Add(codeAddress);
+        return FusedGraphicsPrograms.Contains(codeAddress);
+    }
+
+    public bool TryGetFusedGraphicsProgram(ulong codeAddress, out ulong continuationAddress)
+    {
+        FusedGraphicsProgramQueries.Add(codeAddress);
+        if (FusedGraphicsContinuations.TryGetValue(codeAddress, out continuationAddress))
+        {
+            return true;
+        }
+
+        continuationAddress = 0;
+        return FusedGraphicsPrograms.Contains(codeAddress);
+    }
+
     public GraphicsPrograms GetGraphicsPrograms(
         VertexStageRegisters vertex,
         PixelStageRegisters pixel,
         ShaderInterfaceRegisters shaderInterface,
         ContextRegisters context,
+        UserConfigRegisters userConfig,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
         bool pixelActive)
     {
         Calls.Add($"get_graphics_programs pixelActive={pixelActive}");
         ExportMappings.Add(targetExportMapping.ToArray());
         return Graphics;
+    }
+
+    public GraphicsPrograms GetGraphicsPrograms(
+        VertexStageRegisters vertex,
+        PixelStageRegisters pixel,
+        ShaderInterfaceRegisters shaderInterface,
+        ContextRegisters context,
+        UserConfigRegisters userConfig,
+        ReadOnlySpan<ColorComponentMap> targetExportMapping,
+        uint boundColorSlots,
+        bool pixelActive)
+    {
+        BoundColorSlotMasks.Add(boundColorSlots);
+        return GetGraphicsPrograms(
+            vertex,
+            pixel,
+            shaderInterface,
+            context,
+            userConfig,
+            targetExportMapping,
+            pixelActive);
     }
 
     public PipelineHandle CreateGraphicsPipeline(
@@ -505,13 +602,15 @@ internal static class RenderExecutorFixtures
         return banks;
     }
 
-    public static ShaderProgramInfo Program(ShaderStageKind stage, BufferResourceInfo[]? buffers = null, ImageResourceInfo[]? images = null, uint userDataBase = 0, bool usesDeviceAddresses = false, bool exclusiveOr = false, int vertexOffsetScalar = ShaderProgramInfo.NoScalarRegister, int instanceOffsetScalar = ShaderProgramInfo.NoScalarRegister, uint parameterExportMask = 1) =>
+    public static ShaderProgramInfo Program(ShaderStageKind stage, BufferResourceInfo[]? buffers = null, ImageResourceInfo[]? images = null, uint userDataBase = 0, bool usesDeviceAddresses = false, bool exclusiveOr = false, int vertexOffsetScalar = ShaderProgramInfo.NoScalarRegister, int instanceOffsetScalar = ShaderProgramInfo.NoScalarRegister, uint parameterExportMask = 1, uint pixelColorExportMasks = uint.MaxValue, bool writesViewportIndex = false) =>
         new()
         {
             Stage = stage,
             Hash = 0x1234_5678_9ABC_DEF0,
             UserDataBase = userDataBase,
             ParameterExportMask = parameterExportMask,
+            WritesViewportIndex = writesViewportIndex,
+            PixelColorExportMasks = pixelColorExportMasks,
             Buffers = buffers ?? [],
             Images = images ?? [],
             UsesDeviceAddresses = usesDeviceAddresses,

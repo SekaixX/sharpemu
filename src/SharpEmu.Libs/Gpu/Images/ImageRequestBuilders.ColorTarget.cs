@@ -41,20 +41,34 @@ public static partial class ImageRequestBuilders
 {
     public static uint SampleCount(uint encodedLog2) => encodedLog2 <= 3 ? 1u << (int)encodedLog2 : 0;
 
+    private static bool DccAlphaOnMsb(in ColorTargetWords words)
+    {
+        switch (words.Layout)
+        {
+            case ChannelLayout.Bits10_10_10_2:
+            case ChannelLayout.Bits10_10_10_2Float:
+            case ChannelLayout.Bits5_5_5_1:
+                return true;
+            case ChannelLayout.Bits2_10_10_10:
+            case ChannelLayout.Bits1_5_5_5:
+                return false;
+        }
+
+        var components = GuestPixelFormats.ResolveRenderTargetEncoding(words.Layout, words.NumberType).Components;
+        if (components == 1)
+        {
+            return words.Order != ChannelOrder.Standard;
+        }
+
+        return components == 3 || words.Order is ChannelOrder.Standard or ChannelOrder.Alternate;
+    }
+
     // DCC clears use the target's packed clear word; the fixed-clear set is a format allow-list.
     private static (bool Supported, bool FixedSupported, ClearColorValue Value) DccClearInfo(Format format, bool hasDcc, uint packedClear)
     {
         ClearColorValue value = default;
         var supported = hasDcc && PackedClearValue.TryDecodeColor(format, packedClear, out value);
-        var fixedSupported = hasDcc && format switch
-        {
-            Format.R8Unorm or Format.R8G8Unorm or Format.R8G8B8A8Unorm or Format.R8G8B8A8Srgb or Format.B8G8R8A8Unorm or Format.B8G8R8A8Srgb or
-            Format.A2B10G10R10UnormPack32 or Format.A2R10G10B10UnormPack32 or Format.R5G6B5UnormPack16 or Format.A1R5G5B5UnormPack16 or
-            Format.R4G4B4A4UnormPack16 or Format.R16Unorm or Format.R16G16Unorm or Format.R16G16B16A16Unorm or Format.R16Sfloat or
-            Format.R16G16Sfloat or Format.R16G16B16A16Sfloat or Format.R32Sfloat or Format.R32G32Sfloat or Format.R32G32B32A32Sfloat or
-            Format.B10G11R11UfloatPack32 => true,
-            _ => false,
-        };
+        var fixedSupported = hasDcc && PackedClearValue.SupportsDccFixedColor(format);
         return (supported, fixedSupported, supported ? value : default);
     }
 
@@ -80,11 +94,6 @@ public static partial class ImageRequestBuilders
         if (samples == 0 || words.SamplesLog2 != words.FragmentsLog2)
         {
             throw SubmissionScheduler.Fatal($"The render-target sample configuration is not supported: samples={words.SamplesLog2} fragments={words.FragmentsLog2}.");
-        }
-
-        if (!TargetViewRange.TryResolve(words.SliceStart, words.SliceMax, drawLayerOffset, out var view))
-        {
-            throw SubmissionScheduler.Fatal($"The render-target view is invalid: base={words.SliceStart} last={words.SliceMax} drawOffset={drawLayerOffset}.");
         }
 
         var levels = words.MaxMip + 1;
@@ -122,6 +131,18 @@ public static partial class ImageRequestBuilders
         }
 
         var depth = volume ? words.Depth + 1 : 1;
+        // A volume's VIEW range bounds the slices exported by this draw, while
+        // ATTRIB3 carries the allocation depth. Guests may leave SLICE_MAX at
+        // the full-volume bound when rendering a mip, so cap it to that mip's
+        // last physical Z slice before resolving the attachment view.
+        var lastLayer = volume
+            ? Math.Min(words.SliceMax, Math.Max(depth >> (int)words.MipLevel, 1) - 1)
+            : words.SliceMax;
+        if (!TargetViewRange.TryResolve(words.SliceStart, lastLayer, drawLayerOffset, out var view))
+        {
+            throw SubmissionScheduler.Fatal($"The render-target view is invalid: base={words.SliceStart} last={words.SliceMax} drawOffset={drawLayerOffset}.");
+        }
+
         var tileMode = words.TileMode;
         var standard4 = tileMode == GuestTileMode.Standard4KB;
         var standard64 = tileMode == GuestTileMode.Standard64KB;
@@ -184,20 +205,12 @@ public static partial class ImageRequestBuilders
                 $"The 64 KiB texture-tiled render-target view is not supported: dimension={words.Dimension} depth={words.Depth} baseLayer={view.BaseLayer} layers={view.ImageLayers}.");
         }
 
-        uint pitch;
-        if (tiled)
+        var pitch = !tiled || volume || textureTile
+            ? TileGeometry.TexturePitch(transferFormat, width, tileMode)
+            : TileGeometry.RenderTargetPitch(width, bytesPerElement, words.FragmentsLog2);
+        if (pitch == 0)
         {
-            pitch = volume || textureTile
-                ? TileGeometry.TexturePitch(transferFormat, width, tileMode)
-                : TileGeometry.RenderTargetPitch(width, bytesPerElement, words.FragmentsLog2);
-            if (pitch == 0)
-            {
-                throw SubmissionScheduler.Fatal($"The render-target pitch is not supported: width={width} bytes={bytesPerElement}.");
-            }
-        }
-        else
-        {
-            pitch = width;
+            throw SubmissionScheduler.Fatal($"The render-target pitch is not supported: width={width} bytes={bytesPerElement}.");
         }
 
         var mipSpans = new TileLevelSpan[TiledSurfaceLayout.MaxLevels];
@@ -298,8 +311,14 @@ public static partial class ImageRequestBuilders
         if (hasDcc)
         {
             // DCC lives in its own allocation; the address lets the cache match fills seen before the target.
+            _ = TileGeometry.TryGetDccSize(
+                width, height, volume ? depth : view.ImageLayers, bytesPerElement, levels, tileMode,
+                out var metadataSize, words.FragmentsLog2);
             description.Metadata.Kind = MetadataKind.Dcc;
-            description.Metadata.Range = new GuestSpan(words.DccAddress, 0);
+            description.Metadata.Range = new GuestSpan(words.DccAddress, metadataSize.Size);
+            description.Metadata.DccClearWord = words.ClearWord0;
+            description.Metadata.DccClearRegisterValid = true;
+            description.Metadata.DccAlphaMsb = DccAlphaOnMsb(words);
         }
 
         for (var level = 0; level < levels; level++)
@@ -321,7 +340,7 @@ public static partial class ImageRequestBuilders
             ? view.LayerCount == 1 ? ImageViewType.Type1D : ImageViewType.Type1DArray
             : view.LayerCount == 1 ? ImageViewType.Type2D : ImageViewType.Type2DArray;
         var viewDescription = new ImageViewDescription(
-            targetFormat.HostFormat, viewType, ImageAspectFlags.ColorBit, words.MipLevel, 1, view.BaseLayer, view.LayerCount, default, ImageUsageFlags.ColorAttachmentBit);
+            targetFormat.HostFormat, viewType, ImageAspectFlags.ColorBit, words.MipLevel, 1, 0, view.BaseLayer, view.LayerCount, default, ImageUsageFlags.ColorAttachmentBit);
         var request = new ImageRequest(description, viewDescription, ImageRole.ColorTarget);
         var (clearSupported, fixedClearSupported, clearValue) = DccClearInfo(targetFormat.HostFormat, hasDcc, words.ClearWord0);
         return new ColorTargetResolution(

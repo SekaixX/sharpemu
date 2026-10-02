@@ -173,6 +173,71 @@ public static partial class TileGeometry
         switch (bytesPerElement)
         {
             case 1:
+                offset ^= Bit(x, 0, 0) ^ Bit(x, 1, 1) ^ Bit(x, 2, 2) ^ Bit(x, 3, 3);
+                offset ^= Bit(y, 0, 4) ^ Bit(y, 1, 5) ^ Bit(y, 2, 6) ^ Bit(y, 3, 7);
+                offset ^= Bit(x, 7, 8) ^ Bit(y, 4, 8) ^ Bit(y, 7, 8);
+                offset ^= Bit(x, 4, 9) ^ Bit(y, 4, 9);
+                offset ^= Bit(x, 6, 10) ^ Bit(y, 5, 10);
+                offset ^= Bit(x, 5, 11) ^ Bit(y, 6, 11);
+                offset ^= Bit(x, 6, 12) ^ Bit(y, 6, 13);
+                offset ^= Bit(x, 7, 14) ^ Bit(y, 8, 14);
+                offset ^= Bit(x, 8, 15) ^ Bit(y, 7, 15);
+                return offset;
+            case 2:
+                offset ^= Bit(x, 0, 1) ^ Bit(x, 1, 2) ^ Bit(x, 2, 3);
+                offset ^= Bit(y, 0, 4) ^ Bit(y, 1, 5) ^ Bit(y, 2, 6) ^ Bit(x, 3, 7);
+                offset ^= Bit(x, 7, 8) ^ Bit(y, 4, 8) ^ Bit(y, 7, 8);
+                offset ^= Bit(x, 4, 9) ^ Bit(y, 4, 9);
+                offset ^= Bit(x, 6, 10) ^ Bit(y, 5, 10);
+                offset ^= Bit(x, 5, 11) ^ Bit(y, 6, 11);
+                offset ^= Bit(y, 3, 12) ^ Bit(x, 6, 13);
+                offset ^= Bit(x, 7, 14) ^ Bit(y, 7, 14);
+                offset ^= Bit(x, 8, 15) ^ Bit(y, 6, 15);
+                return offset;
+            case 4:
+                offset ^= Bit(x, 0, 2) ^ Bit(x, 1, 3);
+                offset ^= Bit(y, 0, 4) ^ Bit(y, 1, 5) ^ Bit(x, 2, 6) ^ Bit(y, 2, 7);
+                offset ^= Bit(x, 7, 8) ^ Bit(y, 4, 8) ^ Bit(y, 7, 8);
+                offset ^= Bit(x, 4, 9) ^ Bit(y, 4, 9);
+                offset ^= Bit(x, 6, 10) ^ Bit(y, 5, 10);
+                offset ^= Bit(x, 5, 11) ^ Bit(y, 6, 11);
+                offset ^= Bit(x, 3, 12) ^ Bit(y, 3, 13);
+                offset ^= Bit(x, 6, 14) ^ Bit(y, 7, 14);
+                offset ^= Bit(x, 7, 15) ^ Bit(y, 6, 15);
+                return offset;
+            case 8:
+                offset ^= Bit(x, 0, 3) ^ Bit(y, 0, 4) ^ Bit(x, 1, 5) ^ Bit(x, 2, 6) ^ Bit(y, 1, 7);
+                offset ^= Bit(x, 7, 8) ^ Bit(y, 4, 8) ^ Bit(y, 7, 8);
+                offset ^= Bit(x, 4, 9) ^ Bit(y, 4, 9);
+                offset ^= Bit(x, 6, 10) ^ Bit(y, 5, 10);
+                offset ^= Bit(x, 5, 11) ^ Bit(y, 6, 11);
+                offset ^= Bit(y, 2, 12) ^ Bit(x, 3, 13);
+                offset ^= Bit(x, 7, 14) ^ Bit(y, 3, 14);
+                offset ^= Bit(x, 6, 15) ^ Bit(y, 6, 15);
+                return offset;
+            case 16:
+                offset ^= Bit(x, 0, 4) ^ Bit(y, 0, 5) ^ Bit(x, 1, 6) ^ Bit(y, 1, 7);
+                offset ^= Bit(x, 7, 8) ^ Bit(y, 4, 8) ^ Bit(y, 7, 8);
+                offset ^= Bit(x, 4, 9) ^ Bit(y, 4, 9);
+                offset ^= Bit(x, 6, 10) ^ Bit(y, 5, 10);
+                offset ^= Bit(x, 5, 11) ^ Bit(y, 6, 11);
+                offset ^= Bit(x, 2, 12) ^ Bit(y, 2, 13);
+                offset ^= Bit(x, 6, 14) ^ Bit(y, 3, 14);
+                offset ^= Bit(x, 3, 15) ^ Bit(y, 6, 15);
+                return offset;
+            default:
+                throw SubmissionScheduler.Fatal($"The render-target tile block does not support this element size: bytes={bytesPerElement}.");
+        }
+    }
+
+    // Gen5 render-target address equation used by guest render-target surfaces.
+    // This intentionally remains distinct from the RB+ R_X equation above.
+    private static uint Gen5RenderTargetOffset(uint x, uint y, uint bytesPerElement)
+    {
+        uint offset = 0;
+        switch (bytesPerElement)
+        {
+            case 1:
                 offset ^= (y << 2) & 0x0008;
                 offset ^= (y << 4) & 0x0010;
                 offset ^= (y << 3) & 0x00a0;
@@ -232,7 +297,7 @@ public static partial class TileGeometry
                 offset ^= (y << 11) & 0x4000;
                 return offset;
             default:
-                throw SubmissionScheduler.Fatal($"The render-target tile block does not support this element size: bytes={bytesPerElement}.");
+                throw SubmissionScheduler.Fatal($"The Gen5 render-target tile block does not support this element size: bytes={bytesPerElement}.");
         }
     }
 
@@ -325,6 +390,14 @@ public static partial class TileGeometry
 
                 offset = RenderTargetOffset(x, y, bytes);
                 break;
+            case TileBlockKind.RenderTarget64KBGen5:
+                if (bytes > 16)
+                {
+                    return false;
+                }
+
+                offset = Gen5RenderTargetOffset(x, y, bytes);
+                break;
             case TileBlockKind.Depth64KB:
                 switch (bytes)
                 {
@@ -370,17 +443,19 @@ public static partial class TileGeometry
 
             byteOffset = Depth64KB64X(blockX * layout.BlockWidth) ^ Depth64KB64Y(blockY * layout.BlockHeight);
         }
-        else if (layout.Kind == TileBlockKind.RenderTarget64KB)
+        else if (layout.Kind is TileBlockKind.RenderTarget64KB or TileBlockKind.RenderTarget64KBGen5)
         {
             if (blockX > uint.MaxValue / layout.BlockWidth || blockY > uint.MaxValue / layout.BlockHeight || layout.BytesPerElement > 16)
             {
                 return false;
             }
 
-            byteOffset = RenderTargetOffset(blockX * layout.BlockWidth, blockY * layout.BlockHeight, layout.BytesPerElement);
+            byteOffset = layout.Kind == TileBlockKind.RenderTarget64KBGen5
+                ? Gen5RenderTargetOffset(blockX * layout.BlockWidth, blockY * layout.BlockHeight, layout.BytesPerElement)
+                : RenderTargetOffset(blockX * layout.BlockWidth, blockY * layout.BlockHeight, layout.BytesPerElement);
         }
 
-        if (layout.Kind is TileBlockKind.RenderTarget64KB or TileBlockKind.Depth64KB)
+        if (layout.Kind is TileBlockKind.RenderTarget64KB or TileBlockKind.RenderTarget64KBGen5 or TileBlockKind.Depth64KB)
         {
             byteOffset ^= ((blockZ & 8) << 5) ^ ((blockZ & 4) << 7) ^ ((blockZ & 2) << 9) ^ ((blockZ & 1) << 11);
         }

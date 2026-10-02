@@ -133,9 +133,9 @@ public static partial class AgcExports
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var indexCount = (uint)ctx[CpuRegister.Rsi];
         var indexAddress = ctx[CpuRegister.Rdx];
-        var modifier = (uint)ctx[CpuRegister.Rcx];
+        var modifier = ctx[CpuRegister.Rcx];
 
-        if (commandBufferAddress == 0 || modifier != 0x4000_0000)
+        if (commandBufferAddress == 0 || indexAddress == 0 || (indexAddress & 1u) != 0)
         {
             return ReturnPointer(ctx, 0);
         }
@@ -161,7 +161,7 @@ public static partial class AgcExports
             !TryWriteUInt32(ctx, drawCommand + 8, (uint)indexAddress) ||
             !TryWriteUInt32(ctx, drawCommand + 12, (uint)(indexAddress >> 32)) ||
             !TryWriteUInt32(ctx, drawCommand + 16, indexCount) ||
-            !TryWriteUInt32(ctx, drawCommand + 20, 0))
+            !TryWriteUInt32(ctx, drawCommand + 20, DecodeDrawIndexInitiator(modifier)))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -186,23 +186,6 @@ public static partial class AgcExports
         var drawModifier = ctx[CpuRegister.Rdx];
         var emit = Interlocked.Increment(ref _indirectDrawEmitCount);
 
-        if (emit <= 12 || emit % 250 == 0)
-        {
-            var rcx = ctx[CpuRegister.Rcx];
-            var dump = string.Empty;
-            for (var word = 0; word < 8; word++)
-            {
-                dump += TryReadUInt32(ctx, rcx + dataOffset + ((ulong)word * 4), out var raw)
-                    ? $" {raw}"
-                    : " ?";
-            }
-
-            Console.Error.WriteLine(
-                $"[LOADER][WARN] agc.emit_indirect#{emit} buf=0x{commandBufferAddress:X16} " +
-                $"off=0x{dataOffset:X} rdx=0x{ctx[CpuRegister.Rdx]:X} rcx=0x{rcx:X} " +
-                $"r8=0x{ctx[CpuRegister.R8]:X} rcx_words:{dump}");
-        }
-
         if (commandBufferAddress == 0)
         {
             Interlocked.Increment(ref _indirectDrawEmitRejectCount);
@@ -221,9 +204,10 @@ public static partial class AgcExports
         var drawInitiator = (drawModifier & (1UL << 32)) != 0
             ? 2u
             : ((modifierBits >> 3) & 0x20u) | 2u;
+        var packetHeader = Pm4(5, ItDrawIndirect, 0);
 
         if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var drawCommand) ||
-            !TryWriteUInt32(ctx, drawCommand, Pm4(5, ItDrawIndirect, 0)) ||
+            !TryWriteUInt32(ctx, drawCommand, packetHeader) ||
             !TryWriteUInt32(ctx, drawCommand + 4, dataOffset) ||
             !TryWriteUInt32(ctx, drawCommand + 8, firstVertexRegister) ||
             !TryWriteUInt32(ctx, drawCommand + 12, firstInstanceRegister) ||
@@ -238,6 +222,15 @@ public static partial class AgcExports
             }
 
             return ReturnPointer(ctx, 0);
+        }
+
+        if (emit <= 12 || emit % 250 == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] agc.emit_indirect#{emit} buf=0x{commandBufferAddress:X16} " +
+                $"draw=0x{drawCommand:X16} off=0x{dataOffset:X} modifier=0x{drawModifier:X16} " +
+                $"packet_words: 0x{packetHeader:X8} 0x{dataOffset:X8} 0x{firstVertexRegister:X8} " +
+                $"0x{firstInstanceRegister:X8} 0x{drawInitiator:X8}");
         }
 
         TraceAgc(
@@ -257,19 +250,15 @@ public static partial class AgcExports
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var indexCount = (uint)ctx[CpuRegister.Rsi];
         var modifier = ctx[CpuRegister.Rdx];
-        if (commandBufferAddress == 0 || modifier != 0x4000_0000)
+        if (commandBufferAddress == 0)
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 7, out var commandAddress) ||
-            !TryWriteUInt32(ctx, commandAddress, Pm4(7, ItNop, RDrawIndexAuto)) ||
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 3, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(3, ItDrawIndexAuto, 0)) ||
             !TryWriteUInt32(ctx, commandAddress + 4, indexCount) ||
-            !TryWriteUInt32(ctx, commandAddress + 8, 0) ||
-            !TryWriteUInt32(ctx, commandAddress + 12, 0) ||
-            !TryWriteUInt32(ctx, commandAddress + 16, 0) ||
-            !TryWriteUInt32(ctx, commandAddress + 20, 0) ||
-            !TryWriteUInt32(ctx, commandAddress + 24, 0))
+            !TryWriteUInt32(ctx, commandAddress + 8, DecodeDrawIndexInitiator(modifier) | 2u))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -438,10 +427,9 @@ public static partial class AgcExports
             return ReturnPointer(ctx, 0);
         }
 
-        // The API modifier is not a packet initiator. Bit 32 disables its bit-8 selection.
-        var drawInitiator = (drawModifier & (1UL << 32)) != 0
-            ? 0u
-            : ((uint)drawModifier >> 3) & 0x20u;
+        // The API modifier is not itself a packet initiator. Decode only the
+        // documented bit-8 selection, unless bit 32 requests the default path.
+        var drawInitiator = DecodeDrawIndexInitiator(drawModifier);
         if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var commandAddress) ||
             !TryWriteUInt32(ctx, commandAddress, Pm4(5, ItDrawIndexOffset2, 0)) ||
             !TryWriteUInt32(ctx, commandAddress + 4, Math.Max(indexCount, 1u)) ||
@@ -455,6 +443,11 @@ public static partial class AgcExports
         TraceAgc($"agc.dcb_draw_index_offset buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} offset={indexOffset} count={indexCount} flags=0x{drawModifier:X8}");
         return ReturnPointer(ctx, commandAddress);
     }
+
+    private static uint DecodeDrawIndexInitiator(ulong modifier) =>
+        (modifier & (1UL << 32)) != 0
+            ? 0u
+            : ((uint)modifier >> 3) & 0x20u;
 
     // Synthetic label for an uncatalogued NID (the Unknown* convention); the NID is authoritative.
     #pragma warning disable SHEM006

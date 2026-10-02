@@ -65,6 +65,71 @@ public sealed class RenderExecutorComputeTests : IDisposable
     }
 
     [Fact]
+    public void IndirectDispatch_DefaultsToCpuResolvedCounts()
+    {
+        var argumentsAddress = RecordingRenderHost.MemoryBase + 0x70_0000;
+
+        _executor.Dispatch(1, Banks(), 2, 3, 4, 0x41, argumentsAddress);
+
+        Assert.Contains("dispatch 2 3 4", _host.Calls);
+        Assert.DoesNotContain(_host.Calls, call => call.StartsWith("dispatch_indirect ", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void IndirectDispatch_NativePathRequiresExplicitOptIn()
+    {
+        var argumentsAddress = RecordingRenderHost.MemoryBase + 0x70_0000;
+        var nativeExecutor = new RenderExecutor(_host, _pipelines, strictDrawResources: true, nativeIndirectDispatch: true);
+
+        nativeExecutor.Dispatch(1, Banks(), 0, 0, 0, 0x41, argumentsAddress);
+
+        Assert.Contains($"dispatch_indirect {argumentsAddress:X}", _host.Calls);
+        Assert.DoesNotContain(_host.Calls, call => call.StartsWith("dispatch ", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void TallZWorkgroup_PermutesLogicalDispatchCounts()
+    {
+        _pipelines.Compute = ComputeProgram(
+            threadsX: 1,
+            threadsY: 1,
+            threadsZ: 256);
+
+        _executor.Dispatch(1, Banks(), 2, 3, 4, 0x41);
+
+        AssertDispatched(4, 2, 3);
+    }
+
+    [Fact]
+    public void TallZWorkgroup_UsesCpuResolvedIndirectCounts()
+    {
+        var argumentsAddress = RecordingRenderHost.MemoryBase + 0x70_0000;
+        var nativeExecutor = new RenderExecutor(
+            _host,
+            _pipelines,
+            strictDrawResources: true,
+            nativeIndirectDispatch: true);
+        _pipelines.Compute = ComputeProgram(
+            threadsX: 1,
+            threadsY: 1,
+            threadsZ: 256);
+
+        nativeExecutor.Dispatch(
+            1,
+            Banks(),
+            2,
+            3,
+            4,
+            0x41,
+            argumentsAddress);
+
+        AssertDispatched(4, 2, 3);
+        Assert.DoesNotContain(
+            _host.Calls,
+            call => call.StartsWith("dispatch_indirect ", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void NullComputeShader_IsIgnoredBeforeTheProgramLookup()
     {
         var banks = Banks();

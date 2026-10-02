@@ -148,6 +148,28 @@ public static class NpManagerExports
     }
 
     [SysAbiExport(
+        Nid = "Oad3rvY-NJQ",
+        ExportName = "sceNpHasSignedUp",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpHasSignedUp(CpuContext ctx)
+    {
+        var signedUpAddress = ctx[CpuRegister.Rsi];
+        if (signedUpAddress == 0)
+        {
+            return SetReturn(ctx, NpErrorInvalidArgument);
+        }
+
+        // The local profile has no online NP enrollment. The ABI result is a
+        // one-byte C++ bool, not the 32-bit state returned by sceNpGetState.
+        Span<byte> signedUp = stackalloc byte[1];
+        signedUp[0] = 0;
+        return ctx.Memory.TryWrite(signedUpAddress, signedUp)
+            ? SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
         Nid = "rbknaUjpqWo",
         ExportName = "sceNpGetAccountIdA",
         Target = Generation.Gen4 | Generation.Gen5,

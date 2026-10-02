@@ -36,7 +36,7 @@ public static class GuestImageFormat
         (11, ImageNumericClass.Uint), (12, ImageNumericClass.Sint), (13, ImageNumericClass.Float), (14, ImageNumericClass.Float),
         (15, ImageNumericClass.Float), (18, ImageNumericClass.Uint), (19, ImageNumericClass.Sint), (20, ImageNumericClass.Uint),
         (21, ImageNumericClass.Sint), (22, ImageNumericClass.Float), (23, ImageNumericClass.Float), (24, ImageNumericClass.Float),
-        (27, ImageNumericClass.Uint), (28, ImageNumericClass.Sint), (29, ImageNumericClass.Float), (34, ImageNumericClass.Uint),
+        (27, ImageNumericClass.Uint), (28, ImageNumericClass.Sint), (29, ImageNumericClass.Float), (30, ImageNumericClass.Float), (34, ImageNumericClass.Uint),
         (36, ImageNumericClass.Float), (50, ImageNumericClass.Float), (54, ImageNumericClass.Uint), (56, ImageNumericClass.Float),
         (57, ImageNumericClass.Float), (60, ImageNumericClass.Uint), (61, ImageNumericClass.Sint), (62, ImageNumericClass.Uint),
         (63, ImageNumericClass.Sint), (64, ImageNumericClass.Float), (65, ImageNumericClass.Float), (66, ImageNumericClass.Float),

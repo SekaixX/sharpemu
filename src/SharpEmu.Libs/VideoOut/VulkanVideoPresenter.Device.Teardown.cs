@@ -45,6 +45,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 DestroyGuestImage(deferredVersion.Image);
             }
+            DestroyGuestFlipSnapshotPool();
             DestroySwapchainResources();
             Console.Error.WriteLine(
                 $"[LOADER][INFO] vk.device_memory live_allocations={_deviceInfo.LiveAllocations} " +

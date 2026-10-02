@@ -92,6 +92,7 @@ public static partial class AgcExports
     private const uint SpiShaderPgmLoHs = 0x108;
     private const uint SpiShaderPgmHiHs = 0x109;
     private const uint SpiShaderPgmRsrc1Hs = 0x10A;
+    private const uint SpiShaderPgmRsrc2Hs = 0x10B;
     private const uint SpiShaderPgmLoLs = 0x148;
     private const uint SpiShaderPgmHiLs = 0x149;
     // Not 0x8A/0x8B - those are SPI_SHADER_PGM_RSRC1/RSRC2_GS, and reading them
@@ -99,6 +100,7 @@ public static partial class AgcExports
     private const uint SpiShaderPgmLoGs = 0x88;
     private const uint SpiShaderPgmHiGs = 0x89;
     private const uint SpiShaderPgmRsrc1Gs = 0x8A;
+    private const uint SpiShaderPgmRsrc2Gs = 0x8B;
     private const uint SpiShaderPgmChksumGs = 0x80;
     private const uint SpiShaderPgmChksumPs = 0x06;
     private const uint SpiPsInputEna = 0x1B3;

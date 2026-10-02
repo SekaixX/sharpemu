@@ -98,6 +98,23 @@ public sealed partial class ScalarValueGraph
                     Transfer(block, entry.Clone());
                 }
             }
+
+            if (_program.Instructions.Any(static instruction =>
+                    instruction.Opcode is
+                        "SSetpcB64" or
+                        "SSwappcB64" or
+                        "SCallB64" or
+                        "SRfeB64" or
+                        "SCbranchJoin" or
+                        "SCbranchIFork" or
+                        "SCbranchGFork"))
+            {
+                // The resource CFG deliberately does not invent edges for
+                // indirect PCs or the hardware branch stack. Never claim an
+                // all-path fixed-lane proof when those edges are absent.
+                _graph.MutableFixedLaneReads.Clear();
+                _graph.MutableFixedLaneWrites.Clear();
+            }
         }
 
         // Reverse postorder completes acyclic predecessors before their joins.
@@ -145,7 +162,8 @@ public sealed partial class ScalarValueGraph
             state.Scalars[VccLow] = _graph.Constant(0u);
             state.Scalars[VccHigh] = _graph.Constant(0u);
             state.Scalars[ExecLow] = _graph.Constant(FullWaveMask);
-            state.Scalars[ExecHigh] = _graph.Constant(0u);
+            state.Scalars[ExecHigh] = _graph.Constant(
+                _graph.WaveSize == 64 ? FullWaveMask : 0u);
             state.Exec = _graph.Constant(true);
             state.Vcc = _graph.Constant(false);
             state.Scc = _graph.Constant(false);
@@ -214,6 +232,20 @@ public sealed partial class ScalarValueGraph
                     merged.Lanes[key] = value;
                 }
             }
+
+            // Fixed-lane initialization is a separate fact from the symbolic
+            // value carried by that lane. A scalar source can be valid at run
+            // time even when this resource-oriented graph cannot represent the
+            // arithmetic which produced it. Keep only facts present on every
+            // currently known predecessor; pending loop backedges are handled
+            // optimistically and corrected by the normal fixpoint iteration.
+            var definedLaneKeys = new HashSet<(uint Register, uint Lane)>(
+                visited[0].State.DefinedLanes);
+            foreach (var (_, state) in visited.Skip(1))
+            {
+                definedLaneKeys.IntersectWith(state.DefinedLanes);
+            }
+            merged.DefinedLanes.UnionWith(definedLaneKeys);
 
             var maskKeys = new HashSet<uint>(visited[0].State.ThreadBits.Keys);
             foreach (var (_, state) in visited.Skip(1))
@@ -369,7 +401,7 @@ public sealed partial class ScalarValueGraph
                 case "SGetpcB64":
                 {
                     var address = _graph.Operation(ScalarOperation.IAdd64, ScalarValueType.U64, _graph.ShaderBase(),
-                        _graph.Constant((ulong)instruction.Pc + (ulong)(instruction.Words.Count * sizeof(uint))));
+                        _graph.Constant(instruction.NextGuestProgramCounterOffset));
                     state.WritePair(destinationRegister, Extract(address, 0), Extract(address, 1));
                     return;
                 }
@@ -379,6 +411,62 @@ public sealed partial class ScalarValueGraph
                 case "SMovB64":
                     ApplyMovePair(instruction, state, destinationRegister);
                     return;
+                case "SBitreplicateB64B32":
+                {
+                    ScalarValue Spread16(ScalarValue input)
+                    {
+                        var value = Binary(
+                            ScalarOperation.And32,
+                            input,
+                            _graph.Constant(0xFFFFu));
+                        value = Binary(
+                            ScalarOperation.And32,
+                            Binary(
+                                ScalarOperation.Or32,
+                                value,
+                                Binary(ScalarOperation.ShiftLeft32, value, _graph.Constant(8u))),
+                            _graph.Constant(0x00FF_00FFu));
+                        value = Binary(
+                            ScalarOperation.And32,
+                            Binary(
+                                ScalarOperation.Or32,
+                                value,
+                                Binary(ScalarOperation.ShiftLeft32, value, _graph.Constant(4u))),
+                            _graph.Constant(0x0F0F_0F0Fu));
+                        value = Binary(
+                            ScalarOperation.And32,
+                            Binary(
+                                ScalarOperation.Or32,
+                                value,
+                                Binary(ScalarOperation.ShiftLeft32, value, _graph.Constant(2u))),
+                            _graph.Constant(0x3333_3333u));
+                        value = Binary(
+                            ScalarOperation.And32,
+                            Binary(
+                                ScalarOperation.Or32,
+                                value,
+                                Binary(ScalarOperation.ShiftLeft32, value, _graph.Constant(1u))),
+                            _graph.Constant(0x5555_5555u));
+                        return Binary(
+                            ScalarOperation.Or32,
+                            value,
+                            Binary(ScalarOperation.ShiftLeft32, value, _graph.Constant(1u)));
+                    }
+
+                    var source = Read(instruction.Sources[0], state);
+                    var low = Spread16(source);
+                    var high = Spread16(Binary(
+                        ScalarOperation.ShiftRightLogical32,
+                        source,
+                        _graph.Constant(16u)));
+                    WriteMaskPair(
+                        state,
+                        destinationRegister,
+                        low,
+                        high,
+                        NotZero(Binary(ScalarOperation.Or32, low, high)));
+                    return;
+                }
                 case "SCselectB32":
                     state.WriteScalar(destinationRegister, _graph.Select(state.Scc, Read(instruction.Sources[0], state), Read(instruction.Sources[1], state)));
                     return;
@@ -814,7 +902,15 @@ public sealed partial class ScalarValueGraph
             }
 
             state.ThreadBits[destinationRegister] = oldExec;
-            state.WritePair(ExecLow, newLow, newHigh);
+            if (wide)
+            {
+                state.WritePair(ExecLow, newLow, newHigh);
+            }
+            else
+            {
+                state.WriteScalar(ExecLow, newLow);
+            }
+
             state.Exec = newExec;
             state.Scc = newExec;
         }
@@ -988,6 +1084,14 @@ public sealed partial class ScalarValueGraph
         private void ApplyVectorAlu(Gen5ShaderInstruction instruction, RegisterState state)
         {
             var opcode = instruction.Opcode;
+            if (opcode.StartsWith("VMovrel", StringComparison.Ordinal))
+            {
+                // Relative vector-register addressing can alias a register other
+                // than the encoded operand. Drop every fixed-lane fact rather
+                // than proving a later READLANE from a potentially stale value.
+                state.ClearAllLanes();
+            }
+
             if (opcode == "VWritelaneB32")
             {
                 ApplyWriteLane(instruction, state);
@@ -1014,12 +1118,9 @@ public sealed partial class ScalarValueGraph
             }
 
             // Any other write to a vector register replaces its lanes and its uniform value.
-            foreach (var destination in instruction.Destinations)
+            foreach (var register in Gen5VectorRegisterWrites.Enumerate(instruction))
             {
-                if (destination.Kind == Gen5OperandKind.VectorRegister)
-                {
-                    state.ClearLanes(destination.Value);
-                }
+                state.ClearLanes(register);
             }
 
             if (instruction.Encoding == Gen5ShaderEncoding.Vopc ||
@@ -1029,9 +1130,14 @@ public sealed partial class ScalarValueGraph
                 return;
             }
 
+            var hasUnsupportedOperandSelect = opcode != "VAlignbitB32" &&
+                instruction.Control is Gen5Vop3Control { OperandSelect: not 0 };
+            var hasUnsupportedSdwa = instruction.Control is Gen5SdwaControl sdwa &&
+                !IsIdentitySdwa(sdwa);
             var hasModifiers = instruction.Control is Gen5Vop3Control { AbsoluteMask: not 0 } or Gen5Vop3Control { NegateMask: not 0 } or
-                Gen5Vop3Control { Clamp: true } or Gen5Vop3Control { OutputModifier: not 0 } or Gen5Vop3Control { OperandSelect: not 0 } or
-                Gen5SdwaControl or Gen5DppControl or Gen5Dpp8Control or Gen5Vop3pControl;
+                Gen5Vop3Control { Clamp: true } or Gen5Vop3Control { OutputModifier: not 0 } or
+                Gen5DppControl or Gen5Dpp8Control or Gen5Vop3pControl;
+            hasModifiers |= hasUnsupportedOperandSelect || hasUnsupportedSdwa;
             var value = hasModifiers ? _graph.Undefined(ScalarValueType.U32) : VectorResult(instruction, state);
             if (instruction.Control is Gen5Vop3Control { ScalarDestination: { } carryDestination } && !hasModifiers &&
                 opcode is "VAddCoU32" or "VSubCoU32" or "VSubrevCoU32" or "VAddCoCiU32" or "VSubCoCiU32" or "VSubrevCoCiU32" or "VMadU64U32")
@@ -1058,7 +1164,21 @@ public sealed partial class ScalarValueGraph
                     state.WriteScalar(destination.Value, _graph.Undefined(ScalarValueType.U32));
                 }
             }
+
+            InvalidateImplicitVectorWrites(instruction, state);
         }
+
+        private static bool IsIdentitySdwa(Gen5SdwaControl control) =>
+            control.DestinationSelect == 6 &&
+            control.DestinationUnused != 3 &&
+            control.Source0Select == 6 &&
+            control.Source1Select == 6 &&
+            !control.Source0SignExtend &&
+            !control.Source1SignExtend &&
+            control.AbsoluteMask == 0 &&
+            control.NegateMask == 0 &&
+            control.OutputModifier == 0 &&
+            !control.Clamp;
 
         private ScalarValue VectorResult(Gen5ShaderInstruction instruction, RegisterState state)
         {
@@ -1180,6 +1300,41 @@ public sealed partial class ScalarValueGraph
                     var bits = Source(0);
                     return Binary(ScalarOperation.Or32, Binary(ScalarOperation.And32, bits, Source(1)), Binary(ScalarOperation.And32, Unary(ScalarOperation.Not32, bits), Source(2)));
                 }
+                case "VAlignbitB32":
+                {
+                    var shiftSource = Source(2);
+                    if (instruction.Control is Gen5Vop3Control control)
+                    {
+                        var byteShift = (control.OperandSelect & 0x3u) * 8u;
+                        if (byteShift != 0)
+                        {
+                            shiftSource = Shift(
+                                shiftSource,
+                                _graph.Constant(byteShift),
+                                ScalarOperation.ShiftRightLogical32);
+                        }
+                    }
+
+                    var shift = Binary(
+                        ScalarOperation.And32,
+                        shiftSource,
+                        _graph.Constant(31u));
+                    var low = Source(1);
+                    var mixed = Binary(
+                        ScalarOperation.Or32,
+                        Shift(low, shift, ScalarOperation.ShiftRightLogical32),
+                        Shift(
+                            Source(0),
+                            Binary(
+                                ScalarOperation.ISub32,
+                                _graph.Constant(32u),
+                                shift),
+                            ScalarOperation.ShiftLeft32));
+                    return _graph.Select(
+                        Bool(ScalarOperation.IEqual32, shift, _graph.Constant(0u)),
+                        low,
+                        mixed);
+                }
                 case "VBfmB32":
                 {
                     var count = Binary(ScalarOperation.And32, Source(0), _graph.Constant(31u));
@@ -1221,6 +1376,9 @@ public sealed partial class ScalarValueGraph
                     return Unary(ScalarOperation.ConvertS32F32, Source(0));
                 case "VMulF32":
                     return Binary(ScalarOperation.FMul, Source(0), Source(1));
+                case "VRcpF32":
+                case "VRcpIflagF32":
+                    return Binary(ScalarOperation.FDiv, _graph.Constant(0x3F80_0000u), Source(0));
                 case "VAddF32":
                     return Binary(ScalarOperation.FAdd, Source(0), Source(1));
                 case "VSubF32":
@@ -1241,16 +1399,38 @@ public sealed partial class ScalarValueGraph
         private void ApplyVectorCompare(Gen5ShaderInstruction instruction, RegisterState state)
         {
             var opcode = instruction.Opcode;
-            var left = instruction.Sources.Count > 0 ? ReadVectorOperand(instruction.Sources[0], state) : _graph.Undefined(ScalarValueType.U32);
-            var right = instruction.Sources.Count > 1 ? ReadVectorOperand(instruction.Sources[1], state) : _graph.Undefined(ScalarValueType.U32);
             var updatesExecutionMask = opcode.StartsWith("VCmpx", StringComparison.Ordinal);
             var suffix = opcode[(updatesExecutionMask ? "VCmpx".Length : "VCmp".Length)..];
-            var result = instruction.Control is Gen5SdwaControl or Gen5Vop3Control { AbsoluteMask: not 0 } or Gen5Vop3Control { NegateMask: not 0 }
+            var compare64 = suffix.EndsWith("U64", StringComparison.Ordinal) ||
+                suffix.EndsWith("I64", StringComparison.Ordinal);
+            ScalarValue ReadSource(int index)
+            {
+                if (instruction.Sources.Count <= index)
+                {
+                    return _graph.Undefined(compare64 ? ScalarValueType.U64 : ScalarValueType.U32);
+                }
+
+                if (!compare64)
+                {
+                    return ReadVectorOperand(instruction.Sources[index], state);
+                }
+
+                var (low, high) = ReadVectorPair(instruction.Sources[index], state);
+                return Construct(low, high);
+            }
+
+            var left = ReadSource(0);
+            var right = ReadSource(1);
+            var result =
+                instruction.Control is Gen5SdwaControl sdwa && !IsIdentitySdwa(sdwa) ||
+                instruction.Control is Gen5Vop3Control { AbsoluteMask: not 0 } or Gen5Vop3Control { NegateMask: not 0 }
                 ? _graph.Undefined(ScalarValueType.Bool)
                 : suffix switch
                 {
                     "EqU32" or "EqI32" => Bool(ScalarOperation.IEqual32, left, right),
                     "NeU32" or "NeI32" => Bool(ScalarOperation.INotEqual32, left, right),
+                    "EqU64" or "EqI64" => Bool(ScalarOperation.IEqual64, left, right),
+                    "NeU64" or "NeI64" => Bool(ScalarOperation.INotEqual64, left, right),
                     "LtU32" => Bool(ScalarOperation.ULessThan32, left, right),
                     "GtU32" => Bool(ScalarOperation.UGreaterThan32, left, right),
                     "LeU32" => Bool(ScalarOperation.ULessThanEqual32, left, right),
@@ -1289,6 +1469,11 @@ public sealed partial class ScalarValueGraph
 
         private void ApplyWriteLane(Gen5ShaderInstruction instruction, RegisterState state)
         {
+            if (_recording)
+            {
+                _graph.MutableFixedLaneWrites.Remove(instruction.Pc);
+            }
+
             if (instruction.Destinations.Count != 1 ||
                 instruction.Destinations[0] is not { Kind: Gen5OperandKind.VectorRegister } destination ||
                 instruction.Sources.Count < 2)
@@ -1305,7 +1490,20 @@ public sealed partial class ScalarValueGraph
             }
 
             var value = Read(instruction.Sources[0], state);
-            var key = (destination.Value, lane.ConstantU32 & 63);
+            var key = (destination.Value, lane.ConstantU32 & (_graph.WaveSize - 1));
+            if (instruction.Sources[0].Kind == Gen5OperandKind.VectorRegister)
+            {
+                state.DefinedLanes.Remove(key);
+            }
+            else
+            {
+                state.DefinedLanes.Add(key);
+                if (_recording)
+                {
+                    _graph.MutableFixedLaneWrites[instruction.Pc] =
+                        new FixedLaneWriteBinding(destination.Value, key.Item2);
+                }
+            }
             if (value.IsUndefined)
             {
                 state.Lanes.Remove(key);
@@ -1318,6 +1516,11 @@ public sealed partial class ScalarValueGraph
 
         private void ApplyReadLane(Gen5ShaderInstruction instruction, RegisterState state)
         {
+            if (_recording)
+            {
+                _graph.MutableFixedLaneReads.Remove(instruction.Pc);
+            }
+
             if (instruction.Destinations.Count != 1 ||
                 instruction.Destinations[0] is not { Kind: Gen5OperandKind.ScalarRegister } destination)
             {
@@ -1325,31 +1528,95 @@ public sealed partial class ScalarValueGraph
             }
 
             var lane = instruction.Sources.Count > 1 ? Read(instruction.Sources[1], state) : _graph.Undefined(ScalarValueType.U32);
+            var normalizedLane = lane.IsConstant
+                ? lane.ConstantU32 & (_graph.WaveSize - 1)
+                : 0;
             if (instruction.Sources.Count < 2 ||
-                instruction.Sources[0] is not { Kind: Gen5OperandKind.VectorRegister } source ||
-                !lane.IsConstant ||
-                !state.Lanes.TryGetValue((source.Value, lane.ConstantU32 & 63), out var value))
+                instruction.Sources[0] is not { Kind: Gen5OperandKind.VectorRegister } source)
             {
                 state.WriteScalar(destination.Value, _graph.Undefined(ScalarValueType.U32));
                 return;
             }
 
-            state.WriteScalar(destination.Value, value);
+            if (!lane.IsConstant)
+            {
+                var sourceValue = state.ReadVector(source.Value);
+                state.WriteScalar(
+                    destination.Value,
+                    sourceValue.IsUndefined
+                        ? _graph.FirstLane(sourceValue, state.Exec, instruction.Pc)
+                        : _graph.Undefined(ScalarValueType.U32));
+                return;
+            }
+
+            var key = (source.Value, normalizedLane);
+            if (_recording && state.DefinedLanes.Contains(key))
+            {
+                _graph.MutableFixedLaneReads[instruction.Pc] = new FixedLaneReadBinding(
+                    source.Value,
+                    normalizedLane);
+            }
+
+            state.WriteScalar(
+                destination.Value,
+                state.Lanes.TryGetValue(key, out var value)
+                    ? value
+                    : _graph.Undefined(ScalarValueType.U32));
         }
 
         // ---- memory instructions ----
 
         private void ApplyMemory(Gen5ShaderInstruction instruction, RegisterState state)
         {
-            if (_recording && _graph.Memory.TryGetIndex(instruction.Pc, 0, out var memoryIndex))
+            var hasMemory = _graph.Memory.TryGetIndex(instruction.Pc, 0, out var memoryIndex);
+            ScalarValue? uniformBufferRead = null;
+            ScalarValue? bufferHandle = null;
+            if (hasMemory && instruction.Control is Gen5BufferMemoryControl bufferControl)
+            {
+                bufferHandle = _graph.Handle(
+                    ScalarValueKind.BufferHandle,
+                    state.Read(bufferControl.ScalarResource),
+                    state.Read(bufferControl.ScalarResource + 1),
+                    state.Read(bufferControl.ScalarResource + 2),
+                    state.Read(bufferControl.ScalarResource + 3));
+                var memory = _graph.Memory[memoryIndex];
+                var scalarOffset = instruction.Sources.Count > 2
+                    ? Read(instruction.Sources[2], state)
+                    : _graph.Constant(0u);
+                if (instruction.Opcode == "BufferLoadDword" &&
+                    instruction.Destinations.Count == 1 &&
+                    instruction.Destinations[0].Kind == Gen5OperandKind.VectorRegister &&
+                    memory.Access == MemoryAccess.Read &&
+                    memory.DataBits == 32 &&
+                    memory.DataDwords == 1 &&
+                    !memory.Typed &&
+                    !memory.Formatted &&
+                    !bufferControl.IndexEnabled &&
+                    !bufferControl.OffsetEnabled &&
+                    !bufferControl.Glc &&
+                    !bufferControl.Slc &&
+                    scalarOffset.IsConstant &&
+                    (ulong)memory.Offset + scalarOffset.ConstantU32 <= uint.MaxValue)
+                {
+                    // With no vector index or offset every active lane reads the same raw
+                    // dword. Preserve that uniform value so descriptor construction can
+                    // flatten the read onto the host before the dispatch.
+                    uniformBufferRead = _graph.MemoryRead(
+                        ScalarValueKind.ScalarBufferWord,
+                        bufferHandle,
+                        scalarOffset,
+                        memoryIndex);
+                }
+            }
+
+            if (_recording && hasMemory)
             {
                 _graph.Accesses[memoryIndex] = instruction.Control switch
                 {
                     Gen5BufferMemoryControl buffer => new MemoryAccessBinding(
-                        _graph.Handle(ScalarValueKind.BufferHandle, state.Read(buffer.ScalarResource), state.Read(buffer.ScalarResource + 1),
-                            state.Read(buffer.ScalarResource + 2), state.Read(buffer.ScalarResource + 3)),
+                        bufferHandle,
                         null,
-                        null),
+                        uniformBufferRead),
                     Gen5ImageControl image => new MemoryAccessBinding(
                         _graph.Handle(ScalarValueKind.ImageHandle, Enumerable.Range(0, 8).Select(index => state.Read(image.ScalarResource + (uint)index)).ToArray()),
                         _graph.Memory[memoryIndex].NeedsSampler
@@ -1365,16 +1632,43 @@ public sealed partial class ScalarValueGraph
                 };
             }
 
+            foreach (var register in Gen5VectorRegisterWrites.Enumerate(instruction))
+            {
+                state.ClearLanes(register);
+            }
+
             foreach (var destination in instruction.Destinations)
             {
                 if (destination.Kind == Gen5OperandKind.VectorRegister)
                 {
-                    state.ClearLanes(destination.Value);
-                    state.WriteVector(destination.Value, _graph.Undefined(ScalarValueType.U32));
+                    state.WriteVector(
+                        destination.Value,
+                        uniformBufferRead ?? _graph.Undefined(ScalarValueType.U32));
                 }
                 else if (destination.Kind == Gen5OperandKind.ScalarRegister)
                 {
                     state.WriteScalar(destination.Value, _graph.Undefined(ScalarValueType.U32));
+                }
+            }
+
+            InvalidateImplicitVectorWrites(instruction, state);
+        }
+
+        private void InvalidateImplicitVectorWrites(
+            Gen5ShaderInstruction instruction,
+            RegisterState state)
+        {
+            foreach (var register in Gen5VectorRegisterWrites.Enumerate(instruction))
+            {
+                var isExplicitDestination = instruction.Destinations.Any(
+                    destination => destination.Kind == Gen5OperandKind.VectorRegister &&
+                        destination.Value == register);
+                if (!isExplicitDestination)
+                {
+                    // The decoder records a base destination for several multi-dword
+                    // instructions. Do not let an older symbolic value survive in an
+                    // architectural high/result register that this instruction replaces.
+                    state.WriteVector(register, _graph.Undefined(ScalarValueType.U32));
                 }
             }
         }
@@ -1421,6 +1715,13 @@ public sealed partial class ScalarValueGraph
 
         private ScalarValue ReadVectorOperand(Gen5Operand operand, RegisterState state) =>
             operand.Kind == Gen5OperandKind.VectorRegister ? state.ReadVector(operand.Value) : Read(operand, state);
+
+        private (ScalarValue Low, ScalarValue High) ReadVectorPair(
+            Gen5Operand operand,
+            RegisterState state) =>
+            operand.Kind == Gen5OperandKind.VectorRegister
+                ? (state.ReadVector(operand.Value), state.ReadVector(operand.Value + 1))
+                : ReadPair(operand, state);
 
         private (ScalarValue Low, ScalarValue High) ReadPair(Gen5Operand operand, RegisterState state)
         {
@@ -1521,6 +1822,7 @@ public sealed partial class ScalarValueGraph
         public ScalarValue[] Scalars { get; }
         public ScalarValue[] Vectors { get; }
         public Dictionary<(uint Register, uint Lane), ScalarValue> Lanes { get; } = [];
+        public HashSet<(uint Register, uint Lane)> DefinedLanes { get; } = [];
         public Dictionary<uint, ScalarValue> ThreadBits { get; } = [];
         public ScalarValue Exec { get; set; }
         public ScalarValue Vcc { get; set; }
@@ -1546,7 +1848,10 @@ public sealed partial class ScalarValueGraph
 
             Scalars[register] = value;
             ThreadBits.Remove(register);
-            ThreadBits.Remove(register - 1);
+            if (_graph.WaveSize == 64)
+            {
+                ThreadBits.Remove(register - 1);
+            }
             if (register == ExecLow)
             {
                 Exec = _graph.Undefined(ScalarValueType.Bool);
@@ -1576,15 +1881,24 @@ public sealed partial class ScalarValueGraph
 
         public void ClearLanes(uint register)
         {
-            if (Lanes.Count == 0)
+            if (Lanes.Count != 0)
             {
-                return;
+                foreach (var key in Lanes.Keys.Where(key => key.Register == register).ToArray())
+                {
+                    Lanes.Remove(key);
+                }
             }
 
-            foreach (var key in Lanes.Keys.Where(key => key.Register == register).ToArray())
+            if (DefinedLanes.Count != 0)
             {
-                Lanes.Remove(key);
+                DefinedLanes.RemoveWhere(key => key.Register == register);
             }
+        }
+
+        public void ClearAllLanes()
+        {
+            Lanes.Clear();
+            DefinedLanes.Clear();
         }
 
         public RegisterState Clone()
@@ -1596,6 +1910,7 @@ public sealed partial class ScalarValueGraph
             {
                 clone.Lanes[key] = value;
             }
+            clone.DefinedLanes.UnionWith(DefinedLanes);
 
             foreach (var (key, value) in ThreadBits)
             {
@@ -1624,7 +1939,9 @@ public sealed partial class ScalarValueGraph
                 return false;
             }
 
-            if (Lanes.Count != other.Lanes.Count || ThreadBits.Count != other.ThreadBits.Count)
+            if (Lanes.Count != other.Lanes.Count ||
+                !DefinedLanes.SetEquals(other.DefinedLanes) ||
+                ThreadBits.Count != other.ThreadBits.Count)
             {
                 return false;
             }

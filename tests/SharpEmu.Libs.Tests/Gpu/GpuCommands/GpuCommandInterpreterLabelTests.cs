@@ -51,9 +51,10 @@ public sealed class GpuCommandInterpreterLabelTests
             contextId);
 
     [Fact]
-    public void EndOfPipeWrite64_LandsBeforeTheCompletionIsRecorded()
+    public void EndOfPipeWrite64_RecordsOneOrderedHostCompletionWithoutSynchronizing()
     {
         var runner = new StreamRunner();
+        runner.Host.WriteQword(Label, 0);
 
         runner.Run(EventWriteEop(0x28, 0, 0x00, 2, 2, Label, 0x1122_3344_5566_7788, 0));
 
@@ -62,13 +63,17 @@ public sealed class GpuCommandInterpreterLabelTests
         Assert.Equal(Label, write.Destination);
         Assert.Equal(0x1122_3344_5566_7788UL, runner.Host.ReadQword(Label));
         Assert.Equal(0, write.EventId);
+        Assert.Equal(new[] { "eop Interrupt64" }, runner.Host.Calls);
     }
 
     [Theory]
     [InlineData(0x04u, 5u, 0x00u, 0u, EndOfPipeWriteKind.Write64)]
     [InlineData(0x14u, 0u, 0x38u, 0u, EndOfPipeWriteKind.WriteBack64)]
     [InlineData(0x2Fu, 0u, 0x00u, 0u, EndOfPipeWriteKind.Write64)]
+    [InlineData(0x2Fu, 0u, 0x00u, 2u, EndOfPipeWriteKind.Interrupt64)]
     [InlineData(0x04u, 5u, 0x3Bu, 2u, EndOfPipeWriteKind.InterruptWriteBack64)]
+    [InlineData(0x04u, 5u, 0x38u, 2u, EndOfPipeWriteKind.InterruptWriteBack64)]
+    [InlineData(0x28u, 5u, 0x38u, 2u, EndOfPipeWriteKind.InterruptWriteBack64)]
     [InlineData(0x28u, 0u, 0x38u, 2u, EndOfPipeWriteKind.InterruptWriteBack64)]
     public void EndOfPipeWrite64_AcceptedCombinations(uint eventType, uint eventIndex, uint cacheAction, uint interruptSelector, EndOfPipeWriteKind expected)
     {
@@ -78,10 +83,10 @@ public sealed class GpuCommandInterpreterLabelTests
 
         Assert.Equal(expected, Assert.Single(runner.Host.EndOfPipeWrites).Kind);
         Assert.Equal(0xABCDUL, runner.Host.ReadQword(Label));
+        Assert.Equal(new[] { $"eop {expected}" }, runner.Host.Calls);
     }
 
     [Theory]
-    [InlineData(0x2Fu, 0u, 0x00u, 2u)]
     [InlineData(0x04u, 0u, 0x00u, 0u)]
     [InlineData(0x2Fu, 6u, 0x38u, 2u)]
     public void EndOfPipeWrite64_RejectedCombinations(uint eventType, uint eventIndex, uint cacheAction, uint interruptSelector)
@@ -118,6 +123,7 @@ public sealed class GpuCommandInterpreterLabelTests
         var write = Assert.Single(runner.Host.EndOfPipeWrites);
         Assert.Equal(EndOfPipeWriteKind.Interrupt64, write.Kind);
         Assert.Equal(GpuCommandInterpreter.ComputeQueueBase + 2, write.EventId);
+        Assert.Equal(new[] { "eop Interrupt64" }, runner.Host.Calls);
     }
 
     [Fact]
@@ -129,6 +135,7 @@ public sealed class GpuCommandInterpreterLabelTests
 
         Assert.NotEqual(0UL, runner.Host.ReadQword(Label));
         Assert.Equal(EndOfPipeWriteKind.ClockWrite, Assert.Single(runner.Host.EndOfPipeWrites).Kind);
+        Assert.Equal(new[] { "eop ClockWrite" }, runner.Host.Calls);
     }
 
     [Fact]
@@ -150,10 +157,11 @@ public sealed class GpuCommandInterpreterLabelTests
 
         Assert.Equal(0xFFFF_FFFF_0000_1234UL, runner.Host.ReadQword(Label));
         Assert.Equal(EndOfPipeWriteKind.WriteBack32, Assert.Single(runner.Host.EndOfPipeWrites).Kind);
+        Assert.Equal(new[] { "eop WriteBack32" }, runner.Host.Calls);
     }
 
     [Fact]
-    public void GdsSource_SynchronizesReadsAndInterruptsAtOnce()
+    public void GdsSource_RecordsOneOrderedWriteAndInterruptCompletion()
     {
         var runner = new StreamRunner(queueId: 1);
         runner.Host.Gds[8] = 0x11;
@@ -161,13 +169,13 @@ public sealed class GpuCommandInterpreterLabelTests
 
         runner.Run(EventWriteEos(0x2F, 6, 0x00, 1, 2, Label, (2u << 16) | 2u));
 
-        Assert.Equal(new[] { "synchronize", "read_gds 2 2", "eop GdsWrite32", $"interrupt {GpuCommandInterpreter.ComputeQueueBase} 0" }, runner.Host.Calls);
+        Assert.Equal(new[] { "eop InterruptGdsWrite32" }, runner.Host.Calls);
         Assert.Equal(0x11u, runner.Host.ReadDword(Label));
         Assert.Equal(0x22u, runner.Host.ReadDword(Label + 4));
     }
 
     [Fact]
-    public void ReleaseMemoryNative_DataSelectionOne_WritesFlushesAndFollowsTheGcrBarrierRule()
+    public void ReleaseMemoryNative_DataSelectionOne_AlwaysFlushesTheLabel()
     {
         var runner = new StreamRunner();
 
@@ -209,11 +217,27 @@ public sealed class GpuCommandInterpreterLabelTests
         runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 2, 0, Label, 0x0102_0304_0506_0708, 0));
         Assert.Equal(0x0102_0304_0506_0708UL, runner.Host.ReadQword(Label));
         Assert.Equal(EndOfPipeWriteKind.Write64, runner.Host.EndOfPipeWrites[^1].Kind);
-        Assert.DoesNotContain("flush", runner.Host.Calls);
+        Assert.Equal(new[] { "eop Write64" }, runner.Host.Calls);
 
+        runner.Host.Calls.Clear();
         runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 3, 0, Label, 0, 0));
         Assert.NotEqual(0UL, runner.Host.ReadQword(Label));
         Assert.Equal(EndOfPipeWriteKind.ClockWrite, runner.Host.EndOfPipeWrites[^1].Kind);
+        Assert.Equal(new[] { "eop ClockWrite" }, runner.Host.Calls);
+    }
+
+    [Fact]
+    public void ReleaseMemoryNative_EndOfPsWithInterruptWritesAndQueuesTheInterrupt()
+    {
+        var runner = new StreamRunner();
+
+        runner.Run(ReleaseMemoryNative(0x2F, 6, 0, 0, 2, 2, Label, 0x0102_0304_0506_0708, 9));
+
+        Assert.Equal(0x0102_0304_0506_0708UL, runner.Host.ReadQword(Label));
+        var write = Assert.Single(runner.Host.EndOfPipeWrites);
+        Assert.Equal(EndOfPipeWriteKind.Interrupt64, write.Kind);
+        Assert.Equal(9u, write.ContextId);
+        Assert.Equal(new[] { "barrier", "eop Interrupt64" }, runner.Host.Calls);
     }
 
     [Fact]
@@ -223,7 +247,7 @@ public sealed class GpuCommandInterpreterLabelTests
         runner.Host.Gds[0] = 0x42;
 
         runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 5, 1, Label, 1u << 16, 0));
-        Assert.Equal(new[] { "synchronize", "read_gds 0 1", "eop GdsWrite32", $"interrupt {GpuCommandInterpreter.ComputeQueueBase + 1} 0", "flush" }, runner.Host.Calls);
+        Assert.Equal(new[] { "eop InterruptGdsWrite32", "flush" }, runner.Host.Calls);
 
         runner.Host.Calls.Clear();
         runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 5, 0, Label, 1u << 16, 0));
@@ -322,7 +346,10 @@ public sealed class GpuCommandInterpreterLabelTests
         runner.Run(StreamRunner.CustomPacket(Nop, 0, 0x6875_0781, StreamRunner.Low(Label), StreamRunner.High(Label), 0x9A, 0x04, 0x38));
         Assert.Equal(new[] { "prepare_flip 7 2 1 68", "eop FlipWithInterruptWriteBack32", "flush" }, runner.Host.Calls);
         Assert.Contains("flip event type is unknown", runner.RunExpectingFatal(StreamRunner.CustomPacket(Nop, 0, 0x6875_0781, 0, 0, 0, 0x28, 0x38)).Message);
-        Assert.Contains("marker is unknown", runner.RunExpectingFatal(StreamRunner.CustomPacket(Nop, 0, 0x6875_0001)).Message);
+        // Marker ids with no side effect (Demon's Souls emits 0x6EC and 0x80C) are consumed, not fatal.
+        runner.Host.Calls.Clear();
+        runner.Run(StreamRunner.CustomPacket(Nop, 0, 0x6875_06EC), StreamRunner.CustomPacket(Nop, 0, 0x6875_080C));
+        Assert.Empty(runner.Host.Calls);
     }
 
     [Fact]

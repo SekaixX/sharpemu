@@ -295,6 +295,13 @@ public static class KernelPthreadCompatExports
     public static int PosixPthreadYield(CpuContext ctx) => PthreadYield(ctx);
 
     [SysAbiExport(
+        Nid = "6XG4B33N09g",
+        ExportName = "sched_yield",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int SchedYield(CpuContext ctx) => PthreadYield(ctx);
+
+    [SysAbiExport(
         Nid = "GBUY7ywdULE",
         ExportName = "scePthreadRename",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -1205,6 +1212,11 @@ public static class KernelPthreadCompatExports
             }
         }
 
+        // The guest ABI stores mutex attributes behind an opaque pointer.  The
+        // destroy operation ends that pointer's lifetime and clears the caller
+        // slot, matching the platform implementation.  Leaving the freed handle
+        // in place lets a later stack-local reuse resolve stale attribute state.
+        _ = KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, attrAddress, 0);
         FreeOpaqueObject(ctx, allocationAddress);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }

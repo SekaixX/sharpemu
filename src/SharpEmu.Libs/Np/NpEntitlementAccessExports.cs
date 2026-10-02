@@ -193,6 +193,26 @@ public static class NpEntitlementAccessExports
         return ctx.SetReturn(NpEntitlementAccessErrorNoEntitlement);
     }
 
+    [SysAbiExport(
+        Nid = "5LiMEPuW0DQ",
+        ExportName = "sceNpEntitlementAccessGetEntitlementKey",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpEntitlementAccess")]
+    public static int NpEntitlementAccessGetEntitlementKey(CpuContext ctx)
+    {
+        var entitlementLabelAddress = ctx[CpuRegister.Rsi];
+        var entitlementKeyAddress = ctx[CpuRegister.Rdx];
+        if (entitlementLabelAddress == 0 || entitlementKeyAddress == 0)
+        {
+            return ctx.SetReturn(NpEntitlementAccessErrorParameter);
+        }
+
+        TraceNpEntitlementAccess(
+            $"get_entitlement_key service={ctx[CpuRegister.Rdi]} " +
+            $"label=0x{entitlementLabelAddress:X16} key=0x{entitlementKeyAddress:X16} -> no entitlement");
+        return ctx.SetReturn(NpEntitlementAccessErrorNoEntitlement);
+    }
+
     private static bool TryWriteAddcontEntitlementInfo(
         CpuContext ctx,
         ulong address,
