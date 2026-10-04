@@ -36,7 +36,7 @@ public sealed class Gen5PixelSystemInputTests
     }
 
     [Fact]
-    public void FrontFaceInputStoresSignedUnitIntoGuestRegister()
+    public void FrontFaceInputStoresOneOrZeroIntoGuestRegister()
     {
         var shader = Compile(FrontFaceInput, FrontFaceInput);
         var instructions = Instructions(shader.Spirv);
@@ -87,7 +87,7 @@ public sealed class Gen5PixelSystemInputTests
                 constants.TryGetValue(instruction.Operands[3], out var front) &&
                 front == 0x3f800000u &&
                 constants.TryGetValue(instruction.Operands[4], out var back) &&
-                back == 0xbf800000u);
+                back == 0u);
         Assert.Contains(
             instructions,
             instruction =>
@@ -130,7 +130,7 @@ public sealed class Gen5PixelSystemInputTests
             instruction =>
                 instruction.Opcode == SpirvOp.Capability &&
                 instruction.Operands[0] ==
-                    (uint)SpirvCapability.ShaderLayer);
+                    (uint)SpirvCapability.ShaderViewportIndexLayerExt);
         var layerDecoration = Assert.Single(
             instructions,
             instruction =>
@@ -170,18 +170,13 @@ public sealed class Gen5PixelSystemInputTests
                 instruction.Opcode == SpirvOp.TypeInt &&
                 instruction.Operands[0] == layerPointer.Operands[2] &&
                 instruction.Operands[1] == 32 &&
-                instruction.Operands[2] == 1);
+                instruction.Operands[2] == 0);
 
         var layerLoad = Assert.Single(
             instructions,
             instruction =>
                 instruction.Opcode == SpirvOp.Load &&
                 instruction.Operands[^1] == layerInput);
-        var layerBits = Assert.Single(
-            instructions,
-            instruction =>
-                instruction.Opcode == SpirvOp.Bitcast &&
-                instruction.Operands[^1] == layerLoad.Operands[1]);
         var constants = instructions
             .Where(instruction => instruction.Opcode == SpirvOp.Constant)
             .ToDictionary(
@@ -189,19 +184,11 @@ public sealed class Gen5PixelSystemInputTests
                 instruction => instruction.Operands[2]);
         bool IsConstant(uint id, uint value) =>
             constants.TryGetValue(id, out var actual) && actual == value;
-        var boundedLayer = Assert.Single(
-            instructions,
-            instruction =>
-                instruction.Opcode == SpirvOp.BitwiseAnd &&
-                ((instruction.Operands[2] == layerBits.Operands[1] &&
-                  IsConstant(instruction.Operands[3], 0x7ff)) ||
-                 (instruction.Operands[3] == layerBits.Operands[1] &&
-                  IsConstant(instruction.Operands[2], 0x7ff))));
         var packedLayer = Assert.Single(
             instructions,
             instruction =>
                 instruction.Opcode == SpirvOp.ShiftLeftLogical &&
-                instruction.Operands[2] == boundedLayer.Operands[1] &&
+                instruction.Operands[2] == layerLoad.Operands[1] &&
                 IsConstant(instruction.Operands[3], 16));
         var ancillaryStore = Assert.Single(
             instructions,

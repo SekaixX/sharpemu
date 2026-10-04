@@ -259,8 +259,8 @@ public static partial class Gen5MslTranslator
                 "VCvtU16F16" =>
                     $"(uint)clamp(trunc(isnan({F16(instruction, 0)}) ? 0.0f : {F16(instruction, 0)}), 0.0f, 65535.0f)",
                 "VCvtI32F32" => AsUInt($"(int)({F(instruction, 0)})"),
-                // RPI rounds toward positive infinity; FLR toward negative.
-                "VCvtRpiI32F32" => AsUInt($"(int)ceil({F(instruction, 0)})"),
+                // RPI rounds to nearest with positive infinity as the 0.5 tie-breaker.
+                "VCvtRpiI32F32" => AsUInt($"(int)floor({F(instruction, 0)} + 0.5f)"),
                 "VCvtFlrI32F32" => AsUInt($"(int)floor({F(instruction, 0)})"),
                 "VCvtF32Ubyte0" => FloatResult(instruction, $"(float)(({RawSource(instruction, 0)}) & 0xFFu)"),
                 "VCvtF32Ubyte1" => FloatResult(instruction, $"(float)((({RawSource(instruction, 0)}) >> 8) & 0xFFu)"),

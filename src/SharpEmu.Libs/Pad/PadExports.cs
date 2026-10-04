@@ -79,6 +79,7 @@ public static class PadExports
     private static byte _lastLoggedL2;
     private static byte _lastLoggedR2;
     private static long _padDeliverySequence;
+    private static IHostInput? _hostInputOverrideForTests;
     private static readonly Dictionary<PadDeliverySite, PadInputSignature> PadDeliverySites = new();
 
     private readonly record struct PadOpenKey(int UserId, int Type, int Index);
@@ -133,6 +134,16 @@ public static class PadExports
 
     internal static void ResetOpenedPadForTests() => ResetForTests();
 
+    internal static void SetHostInputForTests(IHostInput? input)
+    {
+        Volatile.Write(ref _hostInputOverrideForTests, input);
+        Interlocked.Increment(ref _hostInputEpoch);
+        _lastInputSampleTicks = 0;
+    }
+
+    private static IHostInput HostInput =>
+        Volatile.Read(ref _hostInputOverrideForTests) ?? HostPlatform.Current.Input;
+
     [SysAbiExport(
         Nid = "hv1luiJrqQM",
         ExportName = "scePadInit",
@@ -141,7 +152,7 @@ public static class PadExports
     public static int PadInit(CpuContext ctx)
     {
         _initialized = true;
-        HostPlatform.Current.Input.EnsureStarted();
+        HostInput.EnsureStarted();
         CaptureCurrentInputState();
         return ctx.SetReturn(0);
     }
@@ -233,7 +244,7 @@ public static class PadExports
         // extended entry point likewise owns its parameter contract.
         _ = parameterAddress;
 
-        var input = HostPlatform.Current.Input;
+        var input = HostInput;
         input.EnsureStarted();
         if (Interlocked.Exchange(ref _controlsAnnouncementLogged, 1) == 0)
         {
@@ -705,7 +716,7 @@ public static class PadExports
         }
 
         var triggerMask = parameter[0];
-        HostPlatform.Current.Input.SetAdaptiveTriggerEffect(
+        HostInput.SetAdaptiveTriggerEffect(
             (triggerMask & 0x01) != 0 ? DecodeTriggerEffect(parameter[8..64]) : null,
             (triggerMask & 0x02) != 0 ? DecodeTriggerEffect(parameter[64..120]) : null);
         return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_OK);
@@ -931,7 +942,7 @@ public static class PadExports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        HostPlatform.Current.Input.SetRumble(parameter[0], parameter[1]);
+        HostInput.SetRumble(parameter[0], parameter[1]);
         return ctx.SetReturn(0);
     }
 
@@ -961,7 +972,7 @@ public static class PadExports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        HostPlatform.Current.Input.SetLightbar(color[0], color[1], color[2]);
+        HostInput.SetLightbar(color[0], color[1], color[2]);
         return ctx.SetReturn(0);
     }
 
@@ -978,7 +989,7 @@ public static class PadExports
             return ctx.SetReturn(OrbisPadErrorInvalidHandle);
         }
 
-        HostPlatform.Current.Input.ResetLightbar();
+        HostInput.ResetLightbar();
         return ctx.SetReturn(0);
     }
 
@@ -1110,7 +1121,7 @@ public static class PadExports
             return _cachedInputState;
         }
 
-        var input = HostPlatform.Current.Input;
+        var input = HostInput;
         var acceptsKeyboardInput = input.IsHostWindowFocused();
         var buttons = acceptsKeyboardInput ? ReadKeyboardButtons(input) : 0;
         var leftX = acceptsKeyboardInput ? ReadAnalogStick(input.IsKeyDown(0x41), input.IsKeyDown(0x44)) : (byte)128;

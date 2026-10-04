@@ -132,7 +132,7 @@ public sealed class VideoOutFlipRequestTests : IDisposable
         _context[CpuRegister.R9] = attributeAddress;
         _context[CpuRegister.Rsp] = stackAddress;
 
-        Assert.Equal(0, VideoOutExports.VideoOutRegisterBuffers2(_context));
+        Assert.Equal(0, RunWithoutStartingPresenter(() => VideoOutExports.VideoOutRegisterBuffers2(_context)));
         Assert.Equal(0, VideoOutExports.TryReserveFlipRequest(
             _handle,
             firstBufferIndex,
@@ -156,6 +156,32 @@ public sealed class VideoOutFlipRequestTests : IDisposable
             out _));
         VideoOutExports.CancelFlip(firstRequestId);
         VideoOutExports.CancelFlip(secondRequestId);
+    }
+
+    private static T RunWithoutStartingPresenter<T>(Func<T> action)
+    {
+        var presenterType = typeof(VulkanVideoPresenter);
+        var flags = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic;
+        var gate = presenterType.GetField("_gate", flags)!.GetValue(null)!;
+        var closed = presenterType.GetField("_closed", flags)!;
+        bool previousClosed;
+        lock (gate)
+        {
+            previousClosed = (bool)closed.GetValue(null)!;
+            closed.SetValue(null, true);
+        }
+
+        try
+        {
+            return action();
+        }
+        finally
+        {
+            lock (gate)
+            {
+                closed.SetValue(null, previousClosed);
+            }
+        }
     }
 
     [Fact]

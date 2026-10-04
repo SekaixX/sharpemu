@@ -1140,7 +1140,8 @@ internal static class CompiledShaderDump
         var hashFilter = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV_HASH");
         if (!string.IsNullOrWhiteSpace(hashFilter))
         {
-            foreach (var filter in hashFilter.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            var matches = false;
+            foreach (var filter in hashFilter.Split(new[] { ',', ';' }, StringSplitOptions.TrimEntries))
             {
                 var span = filter.AsSpan();
                 if (span.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
@@ -1148,14 +1149,15 @@ internal static class CompiledShaderDump
                     span = span[2..];
                 }
 
-                if (ulong.TryParse(span, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var filteredHash) &&
-                    shaderHash == filteredHash)
+                if (!ulong.TryParse(span, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var filteredHash))
                 {
-                    return true;
+                    return false;
                 }
+
+                matches |= shaderHash == filteredHash;
             }
 
-            return false;
+            return matches;
         }
 
         return true;

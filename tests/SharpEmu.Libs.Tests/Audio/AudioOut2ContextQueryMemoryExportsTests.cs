@@ -10,6 +10,7 @@ namespace SharpEmu.Libs.Tests.Audio;
 
 public sealed class AudioOut2ContextQueryMemoryExportsTests
 {
+    private const int InvalidPointer = unchecked((int)0x8026_800C);
     private const ulong MemoryBase = 0x10_0000_0000;
     private const ulong ParamAddress = MemoryBase + 0x100;
     private const ulong StackPointer = MemoryBase + 0x400;
@@ -61,7 +62,7 @@ public sealed class AudioOut2ContextQueryMemoryExportsTests
         ctx[CpuRegister.Rdx] = StaleThirdArgument;
 
         Assert.Equal(
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
+            InvalidPointer,
             AudioOut2Exports.AudioOut2ContextQueryMemory(ctx));
     }
 }

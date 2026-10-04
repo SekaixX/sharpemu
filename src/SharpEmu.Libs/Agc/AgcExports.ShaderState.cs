@@ -224,7 +224,6 @@ public static partial class AgcExports
                 var continuationSize = BinaryPrimitives.ReadUInt32LittleEndian(
                     descriptor[(int)ShaderSizeOffset..]);
                 if (continuationCodeAddress <= entryCodeAddress ||
-                    continuationCodeAddress - entryCodeAddress > uint.MaxValue ||
                     !IsValidDeclaredShaderSize(continuationSize) ||
                     !CanReadShaderRange(ctx, continuationCodeAddress, continuationSize))
                 {
@@ -482,7 +481,7 @@ public static partial class AgcExports
             }
         }
 
-        if (!MergeFusedShaderResourceRegisters(
+        if (!legacy && !MergeFusedShaderResourceRegisters(
                 ctx,
                 fusedRegistersAddress,
                 registerCount,

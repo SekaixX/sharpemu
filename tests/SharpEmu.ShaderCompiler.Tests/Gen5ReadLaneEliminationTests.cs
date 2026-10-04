@@ -55,20 +55,11 @@ public sealed class Gen5ReadLaneEliminationTests
             .ToDictionary(
                 instruction => instruction.Operands[1],
                 instruction => instruction.Operands[2]);
-        var scalarFile = Assert.Single(
+        var scalarPointers = RegisterPointers(
             instructions,
-            instruction =>
-                instruction.Opcode == SpirvOp.Name &&
-                DecodeString(instruction.Operands, 1) == "sgpr").Operands[0];
-        var scalarPointers = instructions
-            .Where(instruction =>
-                instruction.Opcode == SpirvOp.AccessChain &&
-                instruction.Operands.Length >= 4 &&
-                instruction.Operands[2] == scalarFile &&
-                constants.ContainsKey(instruction.Operands[3]))
-            .ToDictionary(
-                instruction => instruction.Operands[1],
-                instruction => constants[instruction.Operands[3]]);
+            constants,
+            "s",
+            "sgpr");
 
         var sourceOverwrite = Assert.Single(
             instructions.Select((instruction, index) => (instruction, index)),
@@ -139,7 +130,7 @@ public sealed class Gen5ReadLaneEliminationTests
     }
 
     [Fact]
-    public void InterveningVectorWriteKeepsReadLaneBroadcast()
+    public void InterveningVectorWriteInvalidatesProofAndRejectsStaleLaneSpill()
     {
         var program = ResourceTestProgram.Program(
             ResourceTestProgram.MoveScalar(0, destination: 4, value: 11),
@@ -148,13 +139,16 @@ public sealed class Gen5ReadLaneEliminationTests
             ResourceTestProgram.ReadLane(16, scalarRegister: 6, vectorRegister: 5, lane: 1),
             ResourceTestProgram.EndProgram(24));
 
-        Assert.Contains(
-            CompilePixel(program),
-            instruction => instruction.Opcode == SpirvOp.GroupNonUniformBroadcast);
+        var request = PreparePixel(program);
+        Assert.DoesNotContain(16u, request.FixedLaneReads.Keys);
+        AssertReadLaneUsesCurrentVectorValue(
+            CompilePixel(request),
+            vectorRegister: 5,
+            scalarRegister: 6);
     }
 
     [Fact]
-    public void ImplicitHighDwordVectorWriteKeepsReadLaneBroadcast()
+    public void ImplicitHighDwordVectorWriteInvalidatesProofAndRejectsStaleLaneSpill()
     {
         var program = ResourceTestProgram.Program(
             ResourceTestProgram.MoveScalar(0, destination: 4, value: 11),
@@ -170,13 +164,14 @@ public sealed class Gen5ReadLaneEliminationTests
 
         var request = PreparePixel(program);
         Assert.DoesNotContain(16u, request.FixedLaneReads.Keys);
-        Assert.Contains(
+        AssertReadLaneUsesCurrentVectorValue(
             CompilePixel(request),
-            instruction => instruction.Opcode == SpirvOp.GroupNonUniformBroadcast);
+            vectorRegister: 6,
+            scalarRegister: 6);
     }
 
     [Fact]
-    public void SecondaryImageLoadDestinationKeepsReadLaneBroadcast()
+    public void SecondaryImageLoadDestinationInvalidatesProofAndRejectsStaleLaneSpill()
     {
         var instructions = new List<Gen5ShaderInstruction>();
         var descriptor = new uint[]
@@ -210,9 +205,10 @@ public sealed class Gen5ReadLaneEliminationTests
 
         var request = PreparePixel(ResourceTestProgram.Program([.. instructions]));
         Assert.DoesNotContain(52u, request.FixedLaneReads.Keys);
-        Assert.Contains(
+        AssertReadLaneUsesCurrentVectorValue(
             CompilePixel(request),
-            instruction => instruction.Opcode == SpirvOp.GroupNonUniformBroadcast);
+            vectorRegister: 5,
+            scalarRegister: 6);
     }
 
     [Fact]
@@ -288,7 +284,7 @@ public sealed class Gen5ReadLaneEliminationTests
     }
 
     [Fact]
-    public void FixedLaneMissingOnOneBranchKeepsReadLaneBroadcast()
+    public void FixedLaneMissingOnOneBranchRejectsUnprovenLaneSpill()
     {
         var program = ResourceTestProgram.Program(
             ResourceTestProgram.MoveScalar(0, destination: 4, value: 11),
@@ -301,9 +297,10 @@ public sealed class Gen5ReadLaneEliminationTests
 
         var request = PreparePixel(program);
         Assert.DoesNotContain(24u, request.FixedLaneReads.Keys);
-        Assert.Contains(
+        AssertReadLaneUsesCurrentVectorValue(
             CompilePixel(request),
-            instruction => instruction.Opcode == SpirvOp.GroupNonUniformBroadcast);
+            vectorRegister: 5,
+            scalarRegister: 6);
     }
 
     [Fact]
@@ -327,7 +324,7 @@ public sealed class Gen5ReadLaneEliminationTests
     }
 
     [Fact]
-    public void PlanAndRuntimeWaveSizeMismatchKeepsReadLaneBroadcast()
+    public void PlanAndRuntimeWaveSizeMismatchIsRejected()
     {
         var program = ResourceTestProgram.Program(
             ResourceTestProgram.MoveScalar(0, destination: 4, value: 11),
@@ -351,9 +348,13 @@ public sealed class Gen5ReadLaneEliminationTests
         Assert.Equal(
             new FixedLaneReadBinding(5, 18),
             request.FixedLaneReads[12]);
-        Assert.Contains(
-            CompilePixel(request),
-            instruction => instruction.Opcode == SpirvOp.GroupNonUniformBroadcast);
+        Assert.False(
+            Gen5SpirvTranslator.TryCompileProgram(
+                request,
+                out _,
+                out var error));
+        Assert.Contains("fixed-lane analysis used wave32", error, StringComparison.Ordinal);
+        Assert.Contains("compile request uses wave64", error, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -393,9 +394,10 @@ public sealed class Gen5ReadLaneEliminationTests
 
         var request = PreparePixel(program);
         Assert.DoesNotContain(32u, request.FixedLaneReads.Keys);
-        Assert.Contains(
+        AssertReadLaneUsesCurrentVectorValue(
             CompilePixel(request),
-            instruction => instruction.Opcode == SpirvOp.GroupNonUniformBroadcast);
+            vectorRegister: 5,
+            scalarRegister: 6);
     }
 
     private static ShaderCompileRequest PreparePixel(
@@ -454,6 +456,115 @@ public sealed class Gen5ReadLaneEliminationTests
             [Gen5Operand.Scalar(scalarRegister)],
             [],
             null);
+
+    private static void AssertReadLaneUsesCurrentVectorValue(
+        IReadOnlyList<Instruction> instructions,
+        uint vectorRegister,
+        uint scalarRegister)
+    {
+        Assert.DoesNotContain(
+            instructions,
+            instruction => instruction.Opcode == SpirvOp.GroupNonUniformBroadcast);
+        Assert.DoesNotContain(
+            instructions,
+            instruction =>
+                instruction.Opcode == SpirvOp.Name &&
+                DecodeString(instruction.Operands, 1).StartsWith(
+                    "fixedLane_",
+                    StringComparison.Ordinal));
+
+        var spillPointers = instructions
+            .Where(instruction =>
+                instruction.Opcode == SpirvOp.Name &&
+                DecodeString(instruction.Operands, 1).StartsWith(
+                    $"v{vectorRegister}_lane",
+                    StringComparison.Ordinal))
+            .Select(instruction => instruction.Operands[0])
+            .ToHashSet();
+        Assert.NotEmpty(spillPointers);
+        Assert.DoesNotContain(
+            instructions,
+            instruction =>
+                instruction.Opcode == SpirvOp.Load &&
+                instruction.Operands.Length >= 3 &&
+                spillPointers.Contains(instruction.Operands[2]));
+
+        var constants = instructions
+            .Where(instruction => instruction.Opcode == SpirvOp.Constant)
+            .ToDictionary(
+                instruction => instruction.Operands[1],
+                instruction => instruction.Operands[2]);
+        var vectorPointers = RegisterPointers(
+            instructions,
+            constants,
+            "v",
+            "vgpr");
+        var scalarPointers = RegisterPointers(
+            instructions,
+            constants,
+            "s",
+            "sgpr");
+        var vectorLoads = instructions
+            .Where(instruction =>
+                instruction.Opcode == SpirvOp.Load &&
+                instruction.Operands.Length >= 3 &&
+                vectorPointers.TryGetValue(
+                    instruction.Operands[2],
+                    out var register) &&
+                register == vectorRegister)
+            .Select(instruction => instruction.Operands[1])
+            .ToHashSet();
+
+        Assert.Contains(
+            instructions,
+            instruction =>
+                instruction.Opcode == SpirvOp.Store &&
+                scalarPointers.TryGetValue(
+                    instruction.Operands[0],
+                    out var register) &&
+                register == scalarRegister &&
+                vectorLoads.Contains(instruction.Operands[1]));
+    }
+
+    private static Dictionary<uint, uint> RegisterPointers(
+        IReadOnlyList<Instruction> instructions,
+        IReadOnlyDictionary<uint, uint> constants,
+        string registerPrefix,
+        string registerFileName)
+    {
+        var pointers = new Dictionary<uint, uint>();
+        uint registerFile = 0;
+        foreach (var instruction in instructions.Where(
+                     instruction => instruction.Opcode == SpirvOp.Name))
+        {
+            var name = DecodeString(instruction.Operands, 1);
+            if (name == registerFileName)
+            {
+                registerFile = instruction.Operands[0];
+            }
+            else if (name.StartsWith(registerPrefix, StringComparison.Ordinal) &&
+                     uint.TryParse(name.AsSpan(registerPrefix.Length), out var register))
+            {
+                pointers[instruction.Operands[0]] = register;
+            }
+        }
+
+        if (registerFile == 0)
+        {
+            return pointers;
+        }
+
+        foreach (var instruction in instructions.Where(instruction =>
+                     instruction.Opcode == SpirvOp.AccessChain &&
+                     instruction.Operands.Length >= 4 &&
+                     instruction.Operands[2] == registerFile &&
+                     constants.ContainsKey(instruction.Operands[3])))
+        {
+            pointers[instruction.Operands[1]] = constants[instruction.Operands[3]];
+        }
+
+        return pointers;
+    }
 
     private static IReadOnlyList<Instruction> CompilePixel(Gen5ShaderProgram program) =>
         CompilePixel(PreparePixel(program));

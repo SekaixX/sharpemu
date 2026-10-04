@@ -139,7 +139,7 @@ public sealed class Gen5DispatcherGuardTests
             instructions,
             guard,
             stores[^1].Operands[1],
-            SpirvOp.Load);
+            SpirvOp.INotEqual);
         Assert.Equal(1, CountOccurrences(metal, "++backedges"));
         Assert.Contains("if (scc)", metal);
     }
@@ -358,18 +358,42 @@ public sealed class Gen5DispatcherGuardTests
         uint storedValue,
         SpirvOp expectedConditionOpcode)
     {
-        var select = FindResult(instructions, storedValue);
-        Assert.Equal(SpirvOp.Select, select.Opcode);
+        var stored = FindResult(instructions, storedValue);
+        SpirvInstruction increment;
+        if (expectedConditionOpcode == SpirvOp.ConstantTrue)
+        {
+            // The module builder folds select(true, increment, current).
+            Assert.Equal(SpirvOp.IAdd, stored.Opcode);
+            increment = stored;
+        }
+        else
+        {
+            Assert.Equal(SpirvOp.Select, stored.Opcode);
+            var condition = FindResult(instructions, stored.Operands[2]);
+            Assert.Equal(expectedConditionOpcode, condition.Opcode);
+            if (condition.Opcode == SpirvOp.INotEqual)
+            {
+                Assert.Equal(
+                    SpirvOp.Load,
+                    FindResult(instructions, condition.Operands[2]).Opcode);
+            }
 
-        var condition = FindResult(instructions, select.Operands[2]);
-        Assert.Equal(expectedConditionOpcode, condition.Opcode);
+            increment = FindResult(instructions, stored.Operands[3]);
+        }
 
-        var increment = FindResult(instructions, select.Operands[3]);
         Assert.Equal(SpirvOp.IAdd, increment.Opcode);
+        var current = Assert.Single(
+            instructions,
+            instruction =>
+                instruction.Opcode == SpirvOp.Load &&
+                instruction.Operands.Length >= 3 &&
+                instruction.Operands[2] == guard &&
+                increment.Operands[2..].Contains(instruction.Operands[1]));
+        if (stored.Opcode == SpirvOp.Select)
+        {
+            Assert.Equal(current.Operands[1], stored.Operands[4]);
+        }
 
-        var current = FindResult(instructions, select.Operands[4]);
-        Assert.Equal(SpirvOp.Load, current.Opcode);
-        Assert.Equal(guard, current.Operands[2]);
         Assert.Contains(current.Operands[1], increment.Operands[2..]);
     }
 
@@ -407,6 +431,7 @@ public sealed class Gen5DispatcherGuardTests
                 instruction.Opcode is SpirvOp.Load or
                     SpirvOp.IAdd or
                     SpirvOp.Select or
+                    SpirvOp.INotEqual or
                     SpirvOp.ConstantTrue or
                     SpirvOp.ConstantFalse or
                     SpirvOp.Constant);

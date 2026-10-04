@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.ShaderCompiler.Metal;
 using SharpEmu.ShaderCompiler.Vulkan;
 using Xunit;
 using static SharpEmu.ShaderCompiler.Tests.Resources.ResourceTestProgram;
@@ -35,14 +36,24 @@ public sealed class Gen5SaturatingConversionTests
     }
 
     [Fact]
-    public void RoundPositiveInfinityKeepsCeilBeforeSaturation()
+    public void RoundPositiveInfinityTieBreakerUsesFloorAfterHalfOffset()
     {
-        var instructions = Compile("VCvtRpiI32F32");
+        var program = Program(
+            Vop1(0, "VCvtRpiI32F32", 1, Gen5Operand.Vector(0)),
+            EndProgram(4));
+        var instructions = Compile(program);
 
-        AssertExtOperation(instructions, 9);
-        Assert.DoesNotContain(
-            instructions,
-            item => item.Opcode == SpirvOp.FAdd);
+        AssertExtOperation(instructions, 8);
+        Assert.Contains(instructions, item => item.Opcode == SpirvOp.FAdd);
+        AssertConstant(instructions, 0x3F00_0000); // 0.5f
+
+        var request = Request(program);
+        Assert.True(
+            Gen5MslTranslator.TryCompileProgram(request, out var metal, out var error),
+            error);
+        Assert.Contains("floor(", metal.Source, StringComparison.Ordinal);
+        Assert.Contains(" + 0.5f", metal.Source, StringComparison.Ordinal);
+        Assert.DoesNotContain("ceil(", metal.Source, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -272,7 +272,10 @@ public sealed class Gen5ShaderTranslatorTests
         Assert.Equal(
             [0u, 4u, 8u, 12u],
             program.Instructions.Select(static instruction => instruction.Pc));
-        Assert.All(program.Instructions, static instruction => Assert.Null(instruction.AddressOffset));
+        Assert.Null(program.Instructions[0].AddressOffset);
+        Assert.Null(program.Instructions[1].AddressOffset);
+        Assert.Equal(0x100UL, program.Instructions[2].AddressOffset);
+        Assert.Equal(0x104UL, program.Instructions[3].AddressOffset);
     }
 
     private sealed class TwoRegionMemory(FakeCpuMemory first, FakeCpuMemory second) : ICpuMemory
@@ -304,7 +307,7 @@ public sealed class Gen5ShaderTranslatorTests
 
         Assert.True(Gen5ShaderTranslator.TryDecodeProgram(context, ProgramAddress, out var program, out var error), error);
         Assert.Equal(["SNop", "SNop", "SGetpcB64", "SEndpgm"], program.Instructions.Select(static instruction => instruction.Opcode));
-        Assert.Equal([0u, 4u, 0x100u, 0x104u], program.Instructions.Select(static instruction => instruction.Pc));
+        Assert.Equal([0u, 4u, 8u, 12u], program.Instructions.Select(static instruction => instruction.Pc));
         Assert.Equal((ulong)distance, program.Instructions[2].ProgramOffset);
         Assert.Equal(unchecked((ulong)distance + 4), program.Instructions[3].ProgramOffset);
         Assert.Equal(continuationAddress, unchecked(program.Address + program.Instructions[2].ProgramOffset));

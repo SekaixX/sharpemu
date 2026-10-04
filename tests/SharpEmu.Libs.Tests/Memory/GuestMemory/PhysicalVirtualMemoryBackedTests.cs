@@ -151,9 +151,22 @@ public sealed unsafe class PhysicalVirtualMemoryBackedTests
         var searchStart = 0x70_0000_0000UL;
         for (var attempt = 0; attempt < 8; attempt++)
         {
-            if (!memory.TryHoldRangeAtOrAbove(searchStart, size, host.Granularity, out var address))
+            // Windows private mappings can replace an owner-controlled placeholder.
+            // The POSIX IHostMemory and IHostViewMemory backends deliberately keep
+            // separate ownership tables, so probe and release the address before
+            // asking the private-memory backend to map it, as production does for
+            // an ordinary private range.
+            ulong address;
+            if (OperatingSystem.IsWindows())
             {
-                break;
+                if (!memory.TryHoldRangeAtOrAbove(searchStart, size, host.Granularity, out address))
+                {
+                    break;
+                }
+            }
+            else
+            {
+                address = ProbeGuestAddress(host, size);
             }
 
             try

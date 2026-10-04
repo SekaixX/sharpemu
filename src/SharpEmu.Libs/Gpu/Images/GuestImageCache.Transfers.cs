@@ -858,6 +858,14 @@ public sealed unsafe partial class GuestImageCache
             return false;
         }
 
+        if (aspect is ImageAspectFlags.DepthBit or ImageAspectFlags.StencilBit)
+        {
+            // A depth/stencil transfer clear is itself a native depth-target producer. Record
+            // that before refreshing untouched guest bytes so both the upload and a later
+            // readback use the attachment layout even when no target view was acquired first.
+            image.Uses.DepthTarget = true;
+        }
+
         if (aspect == ImageAspectFlags.ColorBit)
         {
             // The full color clear replaces all texels. Keep the watch without copying old data.

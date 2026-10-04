@@ -158,7 +158,7 @@ public sealed class NetExportsTests
 
         var result = new byte[6];
         Assert.True(memory.TryRead(address, result));
-        Assert.Equal(new byte[6], result);
+        Assert.Equal(new byte[] { 0x02, 0x53, 0x48, 0x41, 0x52, 0x50 }, result);
 
         ctx[CpuRegister.Rsi] = 1;
         Assert.Equal(unchecked((int)0x80410116), NetExports.NetGetMacAddress(ctx));

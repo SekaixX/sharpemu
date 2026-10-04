@@ -1214,48 +1214,28 @@ public static partial class Gen5SpirvTranslator
 
         private uint ReadLaneSpillSlot(
             Gen5ShaderInstruction instruction,
-            uint selectedLane,
             uint value)
         {
-            if (instruction.Sources[0].Kind != Gen5OperandKind.VectorRegister)
+            // A private spill is valid only at a read which the control-flow
+            // analysis proved is reached by the matching fixed-lane write on
+            // every path. A slot merely existing for some other read of this
+            // VGPR is not provenance: an ordinary/multi-dword/image write, a
+            // branch without the write, or a loop backedge can invalidate it.
+            if (_request.FixedLaneWaveSize != _request.WaveSize ||
+                !_request.FixedLaneReads.TryGetValue(instruction.Pc, out var provenLane) ||
+                instruction.Sources[0].Kind != Gen5OperandKind.VectorRegister ||
+                instruction.Sources[0].Value != provenLane.Register)
             {
                 return value;
             }
 
             var register = instruction.Sources[0].Value;
-            if (TryGetConstantLane(instruction, out var lane))
+            if (TryGetConstantLane(instruction, out var lane) &&
+                lane == provenLane.Lane)
             {
                 return _laneSpillSlots.TryGetValue((register, lane), out var slot)
                     ? Load(_uintType, slot)
                     : value;
-            }
-
-            return SelectLaneSpillSlot(register, selectedLane, value);
-        }
-
-        private uint SelectLaneSpillSlot(
-            uint register,
-            uint selectedLane,
-            uint value)
-        {
-            foreach (var ((slotRegister, slotLane), variable) in _laneSpillSlots)
-            {
-                if (slotRegister != register)
-                {
-                    continue;
-                }
-
-                var isSlotLane = _module.AddInstruction(
-                    SpirvOp.IEqual,
-                    _boolType,
-                    selectedLane,
-                    UInt(slotLane));
-                value = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    isSlotLane,
-                    Load(_uintType, variable),
-                    value);
             }
 
             return value;
@@ -2772,6 +2752,16 @@ public static partial class Gen5SpirvTranslator
                     continue;
                 }
 
+                // Subvector-loop branches update EXEC state as part of deciding
+                // whether the branch is taken. The generic structurer cannot
+                // represent that state transition, so retain the dispatcher path
+                // which lowers both the branch and its architectural side effects.
+                if (terminator.Opcode is "SSubvectorLoopBegin" or "SSubvectorLoopEnd")
+                {
+                    error = $"unsupported structured {terminator.Opcode} at 0x{terminator.Pc:X}";
+                    return false;
+                }
+
                 if (!terminator.Opcode.StartsWith("SCbranch", StringComparison.Ordinal))
                 {
                     index = next;
@@ -2970,6 +2960,15 @@ public static partial class Gen5SpirvTranslator
                 Store(_iterationGuard, steps);
                 var withinLimit = _module.AddInstruction(SpirvOp.ULessThan, _boolType, steps, UInt((uint)_maxDispatcherSteps));
                 again = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, again, withinLimit);
+            }
+
+            EmitDispatcherBackedgeGuard(latch, header, again);
+            if (_maxDispatcherBackedges > 0)
+            {
+                // EmitDispatcherBackedgeGuard marks the invocation inactive at
+                // the limit. Feed that state into the structured continue edge
+                // so the optimized loop preserves the dispatcher's safety valve.
+                again = LogicalAnd(again, Load(_boolType, _programActive));
             }
 
             _module.AddStatement(SpirvOp.BranchConditional, again, headerLabel, mergeLabel);
@@ -4660,44 +4659,6 @@ public static partial class Gen5SpirvTranslator
                 _module.AddInstruction(SpirvOp.IMul, _uintType, vectorIndex, stride));
             byteAddress = ApplyGuestBufferByteBias(bindingIndex, byteAddress);
             var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
-
-            if (instruction.Opcode is "BufferAtomicSwapX2" or "BufferAtomicOrX2")
-            {
-                EmitExecConditional(() =>
-                {
-                    var firstInRange = IsBufferWordInRange(bindingIndex, dwordAddress);
-                    var secondAddress = IAdd(dwordAddress, UInt(1));
-                    var secondInRange = IsBufferWordInRange(bindingIndex, secondAddress);
-                    EmitConditional(LogicalAnd(firstInRange, secondInRange), () =>
-                    {
-                        var atomicOp = instruction.Opcode == "BufferAtomicSwapX2"
-                            ? SpirvOp.AtomicExchange
-                            : SpirvOp.AtomicOr;
-                        var first = EmitAtomic(
-                            atomicOp,
-                            _uintType,
-                            BufferWordPointer(bindingIndex, dwordAddress),
-                            scope: 1,
-                            semantics: 0x48,
-                            value: () => LoadV(control.VectorData),
-                            comparator: () => UInt(0));
-                        var second = EmitAtomic(
-                            atomicOp,
-                            _uintType,
-                            BufferWordPointer(bindingIndex, secondAddress),
-                            scope: 1,
-                            semantics: 0x48,
-                            value: () => LoadV(control.VectorData + 1),
-                            comparator: () => UInt(0));
-                        if (control.Glc)
-                        {
-                            StoreV(control.VectorData, first);
-                            StoreV(control.VectorData + 1, second);
-                        }
-                    });
-                });
-                return true;
-            }
 
             if (instruction.Opcode.StartsWith("BufferAtomic", StringComparison.Ordinal))
             {

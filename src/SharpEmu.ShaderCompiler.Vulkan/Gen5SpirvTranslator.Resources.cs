@@ -24,6 +24,14 @@ public static partial class Gen5SpirvTranslator
     public static bool TryCompileProgram(ShaderCompileRequest request, out Gen5SpirvShader shader, out string error)
     {
         shader = default!;
+        if (request.FixedLaneWaveSize != request.WaveSize &&
+            (request.FixedLaneReads.Count != 0 || request.FixedLaneWrites.Count != 0))
+        {
+            error =
+                $"fixed-lane analysis used wave{request.FixedLaneWaveSize}, but the compile request uses wave{request.WaveSize}";
+            return false;
+        }
+
         if (!request.BufferInt64AtomicsSupported &&
             request.Program.Instructions.Any(static instruction =>
                 IsBufferInt64Atomic(instruction.Opcode)))

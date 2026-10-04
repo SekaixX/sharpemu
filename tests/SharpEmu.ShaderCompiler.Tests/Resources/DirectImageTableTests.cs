@@ -23,11 +23,12 @@ public sealed class DirectImageTableTests
             Sop1(32, "SBitset0B32", 16, Gen5Operand.Scalar(18)),
             Vop2(36, "VAddI32", 15, new Gen5Operand(Gen5OperandKind.LiteralConstant, 0x40), Gen5Operand.Vector(16)),
             GlobalMemory(40, "GlobalLoadDword", 0, 15, 22, 0),
-            ReadFirstLane(48, 106, 22),
-            Sop2(52, "SLshlB32", 106, Gen5Operand.Scalar(106), Operand(5)),
-            ScalarLoad(56, 0, 4, 8, immediateOffset: 0x100, dynamicOffsetRegister: 106),
-            Image(64, "ImageLoad", 4, dmask: 1, vectorAddress: 1),
-            EndProgram(72));
+            Vopc(48, "VCmpxLeI32", Operand(0), 22),
+            ReadFirstLane(52, 106, 22),
+            Sop2(56, "SLshlB32", 106, Gen5Operand.Scalar(106), Operand(5)),
+            ScalarLoad(60, 0, 4, 8, immediateOffset: 0x100, dynamicOffsetRegister: 106),
+            Image(68, "ImageLoad", 4, dmask: 1, vectorAddress: 1),
+            EndProgram(76));
     }
 
     internal static Gen5ShaderProgram CreateWaveIndexedReadLaneProgram(bool selfAddressed, bool restoreExec = true)
@@ -140,7 +141,12 @@ public sealed class DirectImageTableTests
         var selector = plan.DescriptorSources[(int)plan.Info.Images[0].Source].IndirectImage!;
         Assert.True(selector.Dense);
         Assert.Equal(0u, selector.KeyBound);
-        Assert.Equal(new WaveIndexedImageSelector(0x80, 0x40, 0x90), selector.WaveIndexed);
+        Assert.Equal(
+            new WaveIndexedImageSelector(0x80, 0x40, 0x90)
+            {
+                RejectNegativeKeys = true,
+            },
+            selector.WaveIndexed);
 
         var snapshot = new ResourceSnapshot();
         var specialization = new ResourceSpecialization();

@@ -442,28 +442,6 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         image.MarkGpuModified();
         image.Uses.RenderTarget = true;
         RefreshFromGuest(imageIdentifier, request);
-        // DCC lives in its own allocation; it is registered at bind time, keeping a pending fill.
-        if (request.Description.Metadata.Kind == MetadataKind.Dcc)
-        {
-            image.Description.Metadata = request.Description.Metadata;
-            var address = request.Description.Metadata.Range.Address;
-            if (!_surfaceMetadata.TryGetValue(address, out var metadata))
-            {
-                metadata = new SurfaceMetadata { Kind = SurfaceMetadataKind.Dcc };
-                _surfaceMetadata.Add(address, metadata);
-            }
-            else if (metadata.Kind == SurfaceMetadataKind.PendingDcc)
-            {
-                metadata.Kind = SurfaceMetadataKind.Dcc;
-            }
-            else if (metadata.Kind != SurfaceMetadataKind.Dcc)
-            {
-                throw SubmissionScheduler.Fatal($"A color target reuses metadata that is not DCC: address=0x{address:X16} kind={metadata.Kind}.");
-            }
-
-            metadata.Size = Math.Max(metadata.Size, request.Description.DccSliceSize * request.Description.TransferLayers);
-        }
-
         TakeGpuOwnership(image);
         ScheduleReadback(imageIdentifier, image);
         var view = image.GetOrCreateView(request.View);

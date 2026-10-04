@@ -9,9 +9,17 @@ using Xunit;
 namespace SharpEmu.Libs.Tests.Pad;
 
 [CollectionDefinition(PadInputStateCollection.Name, DisableParallelization = true)]
-public sealed class PadInputStateCollection
+public sealed class PadInputStateCollection : ICollectionFixture<PadHostInputFixture>
 {
     public const string Name = "PadInputState";
+}
+
+public sealed class PadHostInputFixture : IDisposable
+{
+    public PadHostInputFixture() =>
+        PadExports.SetHostInputForTests(new WindowHostInput());
+
+    public void Dispose() => PadExports.SetHostInputForTests(null);
 }
 
 [Collection(PadInputStateCollection.Name)]
@@ -606,7 +614,7 @@ public sealed class PadExportsTests : IDisposable
     // parameter, so the only failure mode is a bad handle.
     [Theory]
     [InlineData(0, 0)]
-    [InlineData(1, 0)]
+    [InlineData(1, InvalidHandle)]
     [InlineData(2, InvalidHandle)]
     [InlineData(-1, InvalidHandle)]
     public void ResetOrientation_ValidatesHandle(int handle, int expected)

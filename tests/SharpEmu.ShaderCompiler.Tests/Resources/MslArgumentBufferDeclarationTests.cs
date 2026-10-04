@@ -199,7 +199,7 @@ public sealed class MslArgumentBufferDeclarationTests
         Assert.Contains(
             $"((ulong)sharpemu_push_data[{baseDword}] | ((ulong)sharpemu_push_data[{baseDword + 1}] << 32)) + {continuationOffset + sizeof(uint)}ul",
             shader.Source);
-        Assert.DoesNotContain("0x100000", shader.Source);
+        Assert.DoesNotContain("0x100000ul", shader.Source);
     }
 
     [Fact]

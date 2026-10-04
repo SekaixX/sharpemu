@@ -430,7 +430,7 @@ public sealed class ScalarValueGraphTests
             Branch(4, "SCbranchExecz", 0),
             EndProgram(8));
 
-        var graph = ScalarValueGraph.Build(program, 0, 0);
+        var graph = ScalarValueGraph.Build(program, 0, 0, waveSize: 32);
 
         Assert.True(graph.BranchConditions.TryGetValue(4, out var condition));
         Assert.False(condition.IsUndefined);

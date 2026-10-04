@@ -76,9 +76,22 @@ internal sealed unsafe partial class PosixHostViews : IHostViewMemory
         ulong minimumRegionSize,
         out IReadOnlyList<HostAddressRange> reservations)
     {
-        _ = minimumRegionSize;
         reservations = Array.Empty<HostAddressRange>();
-        return startAddress != 0 && startAddress < endAddress;
+        if (startAddress == 0 || startAddress >= endAddress)
+        {
+            return false;
+        }
+
+        // POSIX cannot query every foreign mapping the way VirtualQuery can on
+        // Windows. ReserveFreeAddressRanges probes the requested aperture with
+        // no-replace mappings and recursively keeps every sufficiently large
+        // free piece. Returning an empty successful result here silently
+        // disabled the process-lifetime guest-address reservation on POSIX.
+        reservations = ReserveFreeAddressRanges(
+            startAddress,
+            endAddress,
+            Math.Max(minimumRegionSize, Granularity));
+        return true;
     }
 
     public ulong ReserveHole(ulong address, ulong size)

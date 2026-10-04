@@ -266,6 +266,7 @@ public static partial class Gen5SpirvTranslator
                     var source = GetFloatSource(instruction, 0);
                     if (instruction.Opcode == "VCvtRpiI32F32")
                     {
+                        // RPI is nearest-integer rounding with +infinity only as the 0.5 tie-breaker.
                         source = Ext(8, _floatType, _module.AddInstruction(SpirvOp.FAdd, _floatType, source, Float(0.5f)));
                     }
                     else if (instruction.Opcode == "VCvtFlrI32F32")
@@ -5634,13 +5635,14 @@ public static partial class Gen5SpirvTranslator
                     UInt(3),
                     sourceValue,
                     selectedLane);
-                StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, broadcast));
+                StoreS(destination, ReadLaneSpillSlot(instruction, broadcast));
             }
             else
             {
-                // Fallback: no subgroup ops, read current lane's value, or the
-                // spill slot that V_WRITELANE filled for the selected lane.
-                StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, sourceValue));
+                // Graphics intentionally avoid a subgroup broadcast which may
+                // not cover the guest wave. Use a spill only when fixed-lane
+                // analysis proved its provenance at this exact read.
+                StoreS(destination, ReadLaneSpillSlot(instruction, sourceValue));
             }
 
             return true;

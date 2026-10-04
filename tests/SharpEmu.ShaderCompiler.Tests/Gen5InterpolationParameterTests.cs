@@ -293,7 +293,11 @@ public sealed class Gen5InterpolationParameterTests
             ResourceTestProgram.ReadLane(16, scalarRegister: 86, vectorRegister: 18, lane: 5),
             ResourceTestProgram.ReadLane(24, scalarRegister: 87, vectorRegister: 18, lane: 37),
             ResourceTestProgram.EndProgram(32));
-        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, stage, userDataCount: 0);
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(
+            program,
+            stage,
+            userDataCount: 0,
+            waveSize: waveSize);
         var request = new ShaderCompileRequest(plan, resources, layout) { WaveSize = waveSize, EnableGraphicsSubgroupOperations = true };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
         Assert.DoesNotContain(Instructions(shader.Spirv), instruction => instruction.Opcode == SpirvOp.GroupNonUniformBroadcast);

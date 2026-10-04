@@ -100,6 +100,7 @@ public sealed class Gen5SharedMemoryBarrierTests
         var request = new ShaderCompileRequest(plan, resources, layout)
         {
             WaveSize = 64,
+            HostSubgroupSize = 32,
             LocalSizeX = 64,
         };
 
@@ -143,12 +144,23 @@ public sealed class Gen5SharedMemoryBarrierTests
     public void PairedWave64_ReadlaneSelectsGuestBankWithinOneSubgroup(uint lane)
     {
         var program = ResourceTestProgram.Program(
-            ResourceTestProgram.ReadLane(
+            ResourceTestProgram.MoveScalar(
                 0,
-                scalarRegister: 2,
-                vectorRegister: 3,
-                lane),
-            ResourceTestProgram.EndProgram(8));
+                destination: 4,
+                value: lane),
+            new Gen5ShaderInstruction(
+                4,
+                Gen5ShaderEncoding.Vop3,
+                "VReadlaneB32",
+                [0u, 0u],
+                [
+                    Gen5Operand.Vector(3),
+                    Gen5Operand.Scalar(4),
+                    Gen5Operand.Scalar(0),
+                ],
+                [Gen5Operand.Scalar(2)],
+                null),
+            ResourceTestProgram.EndProgram(12));
         var (plan, resources, layout) = ResourceTestProgram.Prepare(
             program,
             userDataCount: 0,
@@ -558,7 +570,7 @@ public sealed class Gen5SharedMemoryBarrierTests
     [InlineData(uint.MaxValue, 1)]
     [InlineData(48u, 2)]
     public void Wave64Masks_AvoidRedundantInitializationAndBranchBallots(
-        uint threadCount, int expectedBallots)
+        uint threadCount, int expectedDynamicBallots)
     {
         var program = ResourceTestProgram.Program(
             ResourceTestProgram.Vopc(
@@ -599,8 +611,11 @@ public sealed class Gen5SharedMemoryBarrierTests
             offset += checked((int)(instruction >> 16) * 4);
         }
 
-        Assert.Equal(expectedBallots, ballots);
-        Assert.Equal(ballots, barriers);
+        // VCC and EXEC each need one ballot to initialize both emulated
+        // Wave64 halves. Only the later mask-producing operations need the
+        // workgroup exchange barrier counted by expectedDynamicBallots.
+        Assert.Equal(expectedDynamicBallots + 2, ballots);
+        Assert.Equal(expectedDynamicBallots, barriers);
     }
 
     [Theory]
@@ -687,9 +702,13 @@ public sealed class Gen5SharedMemoryBarrierTests
     }
 
     [Theory]
-    [InlineData(32u)]
-    [InlineData(64u)]
-    public void EmulatedWave64_DoesNotAliasAFullGuestLdsAllocation(uint hostSubgroupSize)
+    [InlineData(32u, 0u)]
+    [InlineData(64u, 0u)]
+    [InlineData(32u, 8192u)]
+    [InlineData(64u, 8192u)]
+    public void EmulatedWave64_DoesNotAliasAnUnknownOrFullGuestLdsAllocation(
+        uint hostSubgroupSize,
+        uint localDataShareDwords)
     {
         var program = ResourceTestProgram.Program(
             ResourceTestProgram.DataShare(
@@ -709,7 +728,7 @@ public sealed class Gen5SharedMemoryBarrierTests
             WaveSize = 64,
             HostSubgroupSize = hostSubgroupSize,
             LocalSizeX = 64,
-            LocalDataShareDwords = 8192,
+            LocalDataShareDwords = localDataShareDwords,
         };
 
         Assert.False(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error));

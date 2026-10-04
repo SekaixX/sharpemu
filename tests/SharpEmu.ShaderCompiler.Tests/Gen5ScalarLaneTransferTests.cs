@@ -426,7 +426,8 @@ public sealed class Gen5ScalarLaneTransferTests
 
         var opcodes = ReadSpirvOpcodes(compiled.Spirv);
         Assert.Contains((ushort)SpirvOp.IAdd, opcodes);
-        Assert.Contains((ushort)SpirvOp.ULessThan, opcodes);
+        Assert.Contains((ushort)SpirvOp.IEqual, opcodes);
+        Assert.Contains((ushort)SpirvOp.Select, opcodes);
     }
 
     [Theory]
@@ -464,7 +465,11 @@ public sealed class Gen5ScalarLaneTransferTests
                 out var decodeError),
             decodeError);
 
-        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Pixel, 0, 64, 0);
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(
+            program,
+            ShaderStage.Pixel,
+            userDataCount: 64,
+            waveSize: 64);
         var request = new ShaderCompileRequest(plan, resources, layout)
         {
             PixelOutputs = [new Gen5PixelOutputBinding(0, 0, Gen5PixelOutputKind.Float)],

@@ -54,7 +54,16 @@ public sealed class KernelFileRenameTests
                 (int)OrbisGen2Result.ORBIS_GEN2_OK,
                 KernelMemoryCompatExports.KernelRename(context));
             Assert.False(File.Exists(sourceHostPath));
-            Assert.Equal(payload, File.ReadAllBytes(destinationHostPath));
+            var renamedPayload = new byte[payload.Length];
+            using (var destinationStream = new FileStream(
+                destinationHostPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete))
+            {
+                destinationStream.ReadExactly(renamedPayload);
+            }
+            Assert.Equal(payload, renamedPayload);
 
             context[CpuRegister.Rdi] = unchecked((uint)fileDescriptor);
             context[CpuRegister.Rsi] = ReadBufferAddress;
@@ -73,6 +82,7 @@ public sealed class KernelFileRenameTests
                 (int)OrbisGen2Result.ORBIS_GEN2_OK,
                 KernelMemoryCompatExports.KernelClose(context));
             fileDescriptor = -1;
+            Assert.Equal(payload, File.ReadAllBytes(destinationHostPath));
         }
         finally
         {
