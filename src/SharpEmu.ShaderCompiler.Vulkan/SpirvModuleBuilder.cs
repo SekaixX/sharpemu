@@ -181,6 +181,7 @@ public enum SpirvOp : ushort
     GroupNonUniformShuffleXor = 346,
     GroupNonUniformShuffleUp = 347,
     GroupNonUniformShuffleDown = 348,
+    ReadClockKhr = 5056,
     SetMeshOutputsEXT = 5295,
 }
 
@@ -215,6 +216,7 @@ public enum SpirvCapability : uint
     ShaderViewportIndex = 70,
     SignedZeroInfNanPreserve = 4466,
     ShaderViewportIndexLayerExt = 5254,
+    ShaderClockKhr = 5055,
     RuntimeDescriptorArray = 5302,
     PhysicalStorageBufferAddresses = 5347,
     MeshShadingEXT = 5283,

@@ -703,6 +703,8 @@ internal sealed class ShaderProgramCache
         var shaderFloat64Supported = _host.ShaderFloat64Supported;
         var shaderSignedZeroInfNanPreserveFloat32Supported =
             _host.ShaderSignedZeroInfNanPreserveFloat32Supported;
+        var shaderDeviceClockSupported = _host.ShaderDeviceClockSupported;
+        var shaderDeviceClockShift = _host.ShaderDeviceClockShift;
         var sharedInt64Atomics = _host.SharedInt64AtomicsEnabled;
         switch (source.Stage)
         {
@@ -719,6 +721,8 @@ internal sealed class ShaderProgramCache
                     ShaderFloat64Supported = shaderFloat64Supported,
                     ShaderSignedZeroInfNanPreserveFloat32Supported =
                         shaderSignedZeroInfNanPreserveFloat32Supported,
+                    ShaderDeviceClockSupported = shaderDeviceClockSupported,
+                    ShaderDeviceClockShift = shaderDeviceClockShift,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
                     VertexInputs = entry.VertexInputs,
@@ -756,6 +760,8 @@ internal sealed class ShaderProgramCache
                     ShaderFloat64Supported = shaderFloat64Supported,
                     ShaderSignedZeroInfNanPreserveFloat32Supported =
                         shaderSignedZeroInfNanPreserveFloat32Supported,
+                    ShaderDeviceClockSupported = shaderDeviceClockSupported,
+                    ShaderDeviceClockShift = shaderDeviceClockShift,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
                     PositionExportControl = info.PositionExportControl,
                     ClipSpace = new ShaderClipSpaceTransform(
@@ -795,6 +801,8 @@ internal sealed class ShaderProgramCache
                     ShaderFloat64Supported = shaderFloat64Supported,
                     ShaderSignedZeroInfNanPreserveFloat32Supported =
                         shaderSignedZeroInfNanPreserveFloat32Supported,
+                    ShaderDeviceClockSupported = shaderDeviceClockSupported,
+                    ShaderDeviceClockShift = shaderDeviceClockShift,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     PixelOutputs = options.PixelOutputs,
                     PixelInputEnable = options.PixelInputEnable,
@@ -820,6 +828,8 @@ internal sealed class ShaderProgramCache
                     ShaderFloat64Supported = shaderFloat64Supported,
                     ShaderSignedZeroInfNanPreserveFloat32Supported =
                         shaderSignedZeroInfNanPreserveFloat32Supported,
+                    ShaderDeviceClockSupported = shaderDeviceClockSupported,
+                    ShaderDeviceClockShift = shaderDeviceClockShift,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     ComputeSystemRegisters = options.ComputeSystemRegisters,
                     LocalSizeX = Math.Max(info.ThreadsX, 1),

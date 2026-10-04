@@ -24,6 +24,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private const string DeviceFaultExtensionName = "VK_EXT_device_fault";
         private const string ImageViewMinLodExtensionName = "VK_EXT_image_view_min_lod";
         private const string ProvokingVertexExtensionName = "VK_EXT_provoking_vertex";
+        private const string ShaderClockExtensionName = "VK_KHR_shader_clock";
 
         private readonly SdlHostWindow _window;
 
@@ -57,6 +58,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool _supportsProvokingVertexLast;
         private bool _supportsShaderFloat64;
         private bool _supportsShaderSignedZeroInfNanPreserveFloat32;
+        private bool _supportsShaderDeviceClock;
+        private uint _shaderDeviceClockShift;
         private uint _maxColorAttachments;
         private Device _device;
         private PipelineCache _pipelineCache;
@@ -935,6 +938,22 @@ internal static unsafe partial class VulkanVideoPresenter
                 supportsMaintenance5 = maintenance5Features.Maintenance5;
             }
 
+            var hasShaderClockExtension = IsDeviceExtensionAvailable(ShaderClockExtensionName);
+            var shaderClockFeatures = new PhysicalDeviceShaderClockFeaturesKHR
+            {
+                SType = StructureType.PhysicalDeviceShaderClockFeaturesKhr,
+            };
+            if (hasShaderClockExtension)
+            {
+                var shaderClockQuery = new PhysicalDeviceFeatures2
+                {
+                    SType = StructureType.PhysicalDeviceFeatures2,
+                    PNext = &shaderClockFeatures,
+                };
+                _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &shaderClockQuery);
+            }
+            var supportsShaderDeviceClockFeature = shaderClockFeatures.ShaderDeviceClock;
+
             // MoltenVK exposes the barycentric builtins, but SPIRV-Cross rejects PerVertexKHR inputs.
             _supportsPerVertexPixelInputs = _supportsFragmentShaderBarycentric &&
                 !IsDeviceExtensionAvailable(PortabilitySubsetExtensionName);
@@ -1064,6 +1083,13 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             _vk.GetPhysicalDeviceProperties(_physicalDevice, out var deviceProperties);
             var deviceName = SilkMarshal.PtrToString((nint)deviceProperties.DeviceName) ?? "unknown";
+            _supportsShaderDeviceClock =
+                VulkanShaderClockPolicy.ShouldEnable(
+                    hasShaderClockExtension,
+                    supportsShaderDeviceClockFeature) &&
+                VulkanShaderClockPolicy.TryComputeShift(
+                    deviceProperties.Limits.TimestampPeriod,
+                    out _shaderDeviceClockShift);
             RequireRenderingFeature(vulkan13Features.DynamicRendering, "Vulkan 1.3 dynamicRendering", deviceName);
             RequireRenderingFeature(vulkan13Features.Synchronization2, "Vulkan 1.3 synchronization2", deviceName);
             var supportsColorWriteEnable = colorWriteEnableFeatures.ColorWriteEnable;
@@ -1092,6 +1118,10 @@ internal static unsafe partial class VulkanVideoPresenter
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan shaderSignedZeroInfNanPreserveFloat32 " +
                 $"enabled={_supportsShaderSignedZeroInfNanPreserveFloat32}");
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Vulkan shaderDeviceClock enabled={_supportsShaderDeviceClock} " +
+                $"timestamp_period_ns={deviceProperties.Limits.TimestampPeriod:F3} " +
+                $"realtime_shift={_shaderDeviceClockShift}");
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan layered shader outputs " +
                 $"layer={supportsShaderOutputLayer} viewport={supportsShaderOutputViewportIndex}");
@@ -1124,11 +1154,12 @@ internal static unsafe partial class VulkanVideoPresenter
             var maintenance5Extension = (byte*)SilkMarshal.StringToPtr(Maintenance5ExtensionName);
             var imageViewMinLodExtension = (byte*)SilkMarshal.StringToPtr(ImageViewMinLodExtensionName);
             var provokingVertexExtension = (byte*)SilkMarshal.StringToPtr(ProvokingVertexExtensionName);
+            var shaderClockExtension = (byte*)SilkMarshal.StringToPtr(ShaderClockExtensionName);
             try
             {
-                // Seventeen extensions can currently be enabled together. Keep
+                // Eighteen extensions can currently be enabled together. Keep
                 // one spare entry so another optional feature cannot overrun this list.
-                var extensions = stackalloc byte*[18];
+                var extensions = stackalloc byte*[19];
                 var extensionCount = 0u;
                 extensions[extensionCount++] = swapchainExtension;
                 extensions[extensionCount++] = pushDescriptorExtension;
@@ -1194,6 +1225,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (_supportsProvokingVertexLast)
                 {
                     extensions[extensionCount++] = provokingVertexExtension;
+                }
+
+                if (_supportsShaderDeviceClock)
+                {
+                    extensions[extensionCount++] = shaderClockExtension;
                 }
 
                 if (IsDeviceExtensionAvailable(PortabilitySubsetExtensionName))
@@ -1336,6 +1372,18 @@ internal static unsafe partial class VulkanVideoPresenter
                     renderingChain = &colorWriteEnableFeatures;
                 }
 
+                if (_supportsShaderDeviceClock)
+                {
+                    shaderClockFeatures = new PhysicalDeviceShaderClockFeaturesKHR
+                    {
+                        SType = StructureType.PhysicalDeviceShaderClockFeaturesKhr,
+                        ShaderSubgroupClock = false,
+                        ShaderDeviceClock = true,
+                        PNext = renderingChain,
+                    };
+                    renderingChain = &shaderClockFeatures;
+                }
+
                 vulkan13Features = new PhysicalDeviceVulkan13Features
                 {
                     SType = StructureType.PhysicalDeviceVulkan13Features,
@@ -1389,6 +1437,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 SilkMarshal.Free((nint)barycentricExtension);
                 SilkMarshal.Free((nint)viewportIndexLayerExtension);
                 SilkMarshal.Free((nint)provokingVertexExtension);
+                SilkMarshal.Free((nint)shaderClockExtension);
             }
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);

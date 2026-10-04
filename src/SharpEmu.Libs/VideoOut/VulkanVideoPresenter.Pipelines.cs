@@ -147,6 +147,10 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.ShaderSignedZeroInfNanPreserveFloat32Supported =>
             _supportsShaderSignedZeroInfNanPreserveFloat32;
 
+        bool IShaderPipelineHost.ShaderDeviceClockSupported => _supportsShaderDeviceClock;
+
+        uint IShaderPipelineHost.ShaderDeviceClockShift => _shaderDeviceClockShift;
+
         // Only a 64-invocation wave64 workgroup is translated for either host subgroup width. Every
         // other compute translation maps a guest wave to 32-lane host subgroups, and a 64-lane host
         // subgroup (AMD's default) left lanes 32..63 inactive: a wave64 8x8x8 group lost rows 4..7.

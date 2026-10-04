@@ -258,6 +258,8 @@ public sealed class ShaderCompileRequest
     public bool BufferInt64AtomicsSupported { get; init; }
     public bool ShaderFloat64Supported { get; init; }
     public bool ShaderSignedZeroInfNanPreserveFloat32Supported { get; init; }
+    public bool ShaderDeviceClockSupported { get; init; }
+    public uint ShaderDeviceClockShift { get; init; }
 
     // The device supports 64-bit integer atomics on workgroup memory
     // (VkPhysicalDeviceFeatures.shaderSharedInt64Atomics). When set, the LDS

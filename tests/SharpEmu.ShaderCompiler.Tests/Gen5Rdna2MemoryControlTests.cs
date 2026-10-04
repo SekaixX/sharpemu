@@ -102,6 +102,38 @@ public sealed class Gen5Rdna2MemoryControlTests
         Assert.Contains(uint.MaxValue, ReadUintConstants(shader.Spirv));
     }
 
+    [Theory]
+    [InlineData(0u)]
+    [InlineData(3u)]
+    public void MemRealtimeUsesOneDeviceClockReadWhenSupported(uint clockShift)
+    {
+        var program = DecodeRaw(0xF4940300u, 0xFA000000u, 0xBF810000u);
+        var (plan, resources, layout) = Prepare(program);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            ShaderDeviceClockSupported = true,
+            ShaderDeviceClockShift = clockShift,
+        };
+
+        Assert.True(
+            Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error),
+            error);
+        ValidateWhenAvailable(shader.Spirv);
+
+        var inspector = new Resources.SpirvModuleInspector(shader.Spirv);
+        Assert.Contains((uint)SpirvCapability.ShaderClockKhr, inspector.Capabilities);
+        Assert.Equal(1, CountOpcode(shader.Spirv, SpirvOp.ReadClockKhr));
+        Assert.Contains(1u, ReadUintConstants(shader.Spirv)); // SpvScopeDevice
+        if (clockShift != 0)
+        {
+            Assert.Contains(clockShift, ReadUintConstants(shader.Spirv));
+            Assert.Contains(32u - clockShift, ReadUintConstants(shader.Spirv));
+            Assert.Contains((ushort)SpirvOp.ShiftRightLogical, inspector.Opcodes);
+            Assert.Contains((ushort)SpirvOp.ShiftLeftLogical, inspector.Opcodes);
+            Assert.Contains((ushort)SpirvOp.BitwiseOr, inspector.Opcodes);
+        }
+    }
+
     [Fact]
     public void SubvectorLoopIsConditionalCfgAndCompilesStateTransitions()
     {

@@ -776,6 +776,13 @@ public static partial class Gen5SpirvTranslator
         private void DeclareModule()
         {
             _module.AddCapability(SpirvCapability.Shader);
+            if (_request.ShaderDeviceClockSupported &&
+                _request.Program.Instructions.Any(static instruction =>
+                    instruction.Opcode.Equals("SMemRealtime", StringComparison.OrdinalIgnoreCase)))
+            {
+                _module.AddExtension("SPV_KHR_shader_clock");
+                _module.AddCapability(SpirvCapability.ShaderClockKhr);
+            }
             if (_request.ShaderSignedZeroInfNanPreserveFloat32Supported)
             {
                 _module.AddExtension("SPV_KHR_float_controls");
@@ -4128,21 +4135,60 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            // Vulkan core has no shader clock matching AMD's 64-bit real-time
-            // counter, and enabling SPV_KHR_shader_clock without matching device
-            // feature plumbing would make otherwise valid shaders undeployable.
-            // Use an explicit all-ones sentinel until that feature is wired;
-            // warn once so this conservative fallback is never silent.
-            if (System.Threading.Interlocked.Exchange(
-                    ref _warnedMemRealtimeFallback,
-                    1) == 0)
+            if (!_request.ShaderDeviceClockSupported)
             {
-                Console.Error.WriteLine(
-                    "Warning: S_MEMREALTIME uses UINT64_MAX because a Vulkan shader-clock feature is unavailable.");
+                // Retain the existing explicit fallback on devices that do not expose
+                // VK_KHR_shader_clock. Supported devices take the real clock path below.
+                if (System.Threading.Interlocked.Exchange(
+                        ref _warnedMemRealtimeFallback,
+                        1) == 0)
+                {
+                    Console.Error.WriteLine(
+                        "Warning: S_MEMREALTIME uses UINT64_MAX because the Vulkan shader device clock is unavailable.");
+                }
+
+                StoreS(instruction.Destinations[0].Value, UInt(uint.MaxValue));
+                StoreS(instruction.Destinations[1].Value, UInt(uint.MaxValue));
+                return true;
             }
 
-            StoreS(instruction.Destinations[0].Value, UInt(uint.MaxValue));
-            StoreS(instruction.Destinations[1].Value, UInt(uint.MaxValue));
+            var shift = _request.ShaderDeviceClockShift;
+            if (shift > 31)
+            {
+                error = $"S_MEMREALTIME device-clock shift {shift} exceeds 31";
+                return false;
+            }
+
+            // The extension permits a uvec2 result. Read both halves in one operation so
+            // they cannot tear, then scale the host clock toward the guest's 100 MHz rate.
+            var clock = _module.AddInstruction(
+                SpirvOp.ReadClockKhr,
+                _uvec2Type,
+                UInt(1)); // SpvScopeDevice
+            var low = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _uintType,
+                clock,
+                0);
+            var high = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _uintType,
+                clock,
+                1);
+            if (shift != 0)
+            {
+                var shiftedLow = ShiftRightLogical(low, UInt(shift));
+                var carriedHigh = _module.AddInstruction(
+                    SpirvOp.ShiftLeftLogical,
+                    _uintType,
+                    high,
+                    UInt(32 - shift));
+                low = BitwiseOr(shiftedLow, carriedHigh);
+                high = ShiftRightLogical(high, UInt(shift));
+            }
+
+            StoreS(instruction.Destinations[0].Value, low);
+            StoreS(instruction.Destinations[1].Value, high);
             return true;
         }
 

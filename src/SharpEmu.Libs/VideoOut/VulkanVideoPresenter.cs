@@ -51,6 +51,35 @@ internal static class VulkanGraphicsSubgroupPolicy
         };
 }
 
+internal static class VulkanShaderClockPolicy
+{
+    private const double GuestRealtimeFrequencyHz = 100_000_000.0;
+
+    internal static bool ShouldEnable(bool extensionAvailable, bool deviceClockFeature) =>
+        extensionAvailable && deviceClockFeature;
+
+    // Vulkan exposes the timestamp tick period but not a separate shader-device-clock
+    // frequency. Current NVIDIA and AMD implementations use the same rate for both.
+    // Choose a power-of-two divisor that stays close to the guest's 100 MHz counter.
+    internal static bool TryComputeShift(float timestampPeriodNanoseconds, out uint shift)
+    {
+        shift = 0;
+        if (!float.IsFinite(timestampPeriodNanoseconds) || timestampPeriodNanoseconds <= 0)
+        {
+            return false;
+        }
+
+        var rateHz = 1_000_000_000.0 / timestampPeriodNanoseconds;
+        while (shift < 8 &&
+               rateHz / (1u << (int)(shift + 1)) >= GuestRealtimeFrequencyHz / 1.5)
+        {
+            shift++;
+        }
+
+        return true;
+    }
+}
+
 internal static class VulkanMeshShaderPolicy
 {
     internal static bool ShouldEnable(bool extensionAvailable, bool meshShaderFeature) =>
