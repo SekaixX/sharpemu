@@ -117,7 +117,9 @@ public sealed partial class ResourceTracker
         var bound = DenseKeyBound(key);
         var waveIndexed = TryCreateWaveIndexedImageSelector(key, reads);
         if (bound == 0 && waveIndexed is null)
+        {
             return false;
+        }
 
         foreach (var read in reads)
             if (!UsesOnly(read, [handle]))

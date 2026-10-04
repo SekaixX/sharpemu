@@ -96,16 +96,16 @@ public sealed class RegionLockTests
     public void UncontendedAcquisitionDoesNotAllocate(RegionLock.Category category)
     {
         var regionLock = new RegionLock(category);
-        using var fault = GpuMemoryAccessProfile.MeasureFault(FaultKind.Write);
-        for (var iteration = 0; iteration < 100; iteration++)
+        void Acquire(int count)
         {
-            using var held = regionLock.Hold();
+            using var fault = GpuMemoryAccessProfile.MeasureFault(FaultKind.Write);
+            for (var iteration = 0; iteration < count; iteration++)
+            {
+                using var held = regionLock.Hold();
+            }
         }
-        var before = GC.GetAllocatedBytesForCurrentThread();
-        for (var iteration = 0; iteration < 1000; iteration++)
-        {
-            using var held = regionLock.Hold();
-        }
-        Assert.Equal(before, GC.GetAllocatedBytesForCurrentThread());
+
+        var allocated = AllocationMeasurement.SteadyState(() => Acquire(100), () => Acquire(1000));
+        Assert.Equal(0, allocated);
     }
 }

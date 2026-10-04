@@ -255,8 +255,39 @@ public static partial class ImageRequestBuilders
 
     private static bool IsMultisampledTexture(GuestImageType type) => type is GuestImageType.Color2DMsaa or GuestImageType.Color2DMsaaArray;
 
+    private readonly record struct TextureKey(uint W0, uint W1, uint W2, uint W3, uint W4, uint W5, uint W6, uint W7, ShaderImageShape Shape);
+
+    private const int TextureCacheLimit = 8192;
+
+    // Every texture binding of every draw resolves its T# here, and the tiled layout math
+    // allocates several arrays each time; the result depends only on the words and shape
+    // and is a pure value, so it is memoised per thread.
+    [ThreadStatic]
+    private static Dictionary<TextureKey, TextureRequestResolution>? _textureCache;
+
     // Builds the request for a sampled or storage texture; the words are the eight T# dwords.
     public static TextureRequestResolution Texture(ReadOnlySpan<uint> words, in ShaderImageShape shape)
+    {
+        Span<uint> key = stackalloc uint[8];
+        words[..Math.Min(words.Length, 8)].CopyTo(key);
+        var cacheKey = new TextureKey(key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7], shape);
+        var cache = _textureCache ??= new Dictionary<TextureKey, TextureRequestResolution>();
+        if (cache.TryGetValue(cacheKey, out var cached))
+        {
+            return cached;
+        }
+
+        var resolution = BuildTexture(key, shape);
+        if (cache.Count >= TextureCacheLimit)
+        {
+            cache.Clear();
+        }
+
+        cache[cacheKey] = resolution;
+        return resolution;
+    }
+
+    private static TextureRequestResolution BuildTexture(ReadOnlySpan<uint> words, in ShaderImageShape shape)
     {
         Span<uint> padded = stackalloc uint[8];
         words[..Math.Min(words.Length, 8)].CopyTo(padded);
@@ -309,7 +340,7 @@ public static partial class ImageRequestBuilders
         var surfaceFormat = TextureTransferLayout.SurfaceFormat(format);
         var shaderConversion = surfaceFormat.ConversionFormat != GuestPixelFormat.Invalid;
         // A sampled VkImageView must have the scalar type used by the compiled
-        // SPIR-V image. KyTy rejects a descriptor whose guest format changes
+        // SPIR-V image. Reject a descriptor whose guest format changes
         // that class instead of silently binding a float/uint/sint mismatch.
         if (!storage && shape.NumericClass != GuestPixelFormats.SampledNumericClass(format))
         {
@@ -355,7 +386,7 @@ public static partial class ImageRequestBuilders
                 $"levels={levels} maximumLevels={maximumLevels} extent={width}x{height}x{(volume ? depth : 1)}.");
         }
 
-        // KyTy accepts a face-window that is not a multiple of six only for a
+        // Accept a face-window that is not a multiple of six only for a
         // storage cube consumed as a 2D array. Sampled cube views still need
         // complete cubes.
         var partialStorageCube = storage && shape.Arrayed && !shape.OneDimensional && !shape.Volume && descriptor.Type == GuestImageType.Cube;

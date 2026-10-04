@@ -306,6 +306,7 @@ public static class GuestPixelFormats
     private static readonly FormatFacts[] Facts =
     [
         new(GuestPixelFormat.Bits8UNorm, 1, 0, 1, true, false),
+        new(GuestPixelFormat.Bits8UScaled, 1, 0, 1, true, false),
         new(GuestPixelFormat.Bits8SNorm, 0, 0, 1, false, false),
         new(GuestPixelFormat.Bits8UInt, 1, 0, 1, true, true),
         new(GuestPixelFormat.Bits16UNorm, 2, 0, 2, true, false),
@@ -315,6 +316,7 @@ public static class GuestPixelFormats
         new(GuestPixelFormat.Bits16Float, 2, 0, 2, true, false),
         new(GuestPixelFormat.Bits8_8UNorm, 2, 0, 2, true, false),
         new(GuestPixelFormat.Bits8_8SNorm, 2, 0, 2, true, false),
+        new(GuestPixelFormat.Bits8_8UScaled, 2, 0, 2, true, false),
         new(GuestPixelFormat.Bits8_8UInt, 2, 0, 2, true, true),
         new(GuestPixelFormat.Bits8_8SInt, 2, 0, 2, true, false, true),
         new(GuestPixelFormat.Bits32UInt, 4, 0, 4, true, true),
@@ -325,6 +327,9 @@ public static class GuestPixelFormats
         new(GuestPixelFormat.Bits16_16UInt, 4, 0, 4, true, true),
         new(GuestPixelFormat.Bits16_16SInt, 4, 0, 4, true, false, true),
         new(GuestPixelFormat.Bits16_16Float, 4, 0, 4, true, false),
+        // Vulkan has no normalized 11:11:10 format. Keep the guest packing sampled
+        // through the native 32-bit packed-float view, matching the host backend.
+        new(GuestPixelFormat.Bits11_11_10UNorm, 4, 0, 4, true, false),
         new(GuestPixelFormat.Bits11_11_10UInt, 4, 0, 4, true, true),
         new(GuestPixelFormat.Bits11_11_10Float, 4, 0, 4, true, false),
         new(GuestPixelFormat.Bits10_10_10_2UNorm, 4, 0, 4, true, false),
@@ -432,6 +437,7 @@ public static class GuestPixelFormats
         (GuestPixelFormat.Bits16Float, Format.R16Sfloat),
         (GuestPixelFormat.Bits8_8UNorm, Format.R8G8Unorm),
         (GuestPixelFormat.Bits8_8SNorm, Format.R8G8SNorm),
+        (GuestPixelFormat.Bits8_8UScaled, Format.R8G8Uscaled),
         (GuestPixelFormat.Bits8_8UInt, Format.R8G8Uint),
         (GuestPixelFormat.Bits8_8SInt, Format.R8G8Sint),
         (GuestPixelFormat.Bits32UInt, Format.R32Uint),
@@ -442,6 +448,7 @@ public static class GuestPixelFormats
         (GuestPixelFormat.Bits16_16UInt, Format.R16G16Uint),
         (GuestPixelFormat.Bits16_16SInt, Format.R16G16Sint),
         (GuestPixelFormat.Bits16_16Float, Format.R16G16Sfloat),
+        (GuestPixelFormat.Bits11_11_10UNorm, Format.B10G11R11UfloatPack32),
         (GuestPixelFormat.Bits11_11_10Float, Format.B10G11R11UfloatPack32),
         (GuestPixelFormat.Bits10_10_10_2UNorm, Format.A2B10G10R10UnormPack32),
         (GuestPixelFormat.Bits10_10_10_2UInt, Format.A2B10G10R10UintPack32),
@@ -544,7 +551,13 @@ public static class GuestPixelFormats
     }
 
     public static GuestPixelFormat RemapTextureFormat(GuestPixelFormat format) =>
-        format == GuestPixelFormat.Bits11_11_10UInt ? GuestPixelFormat.Bits32UInt : format;
+        format switch
+        {
+            GuestPixelFormat.Bits8UScaled => GuestPixelFormat.Bits8UNorm,
+            GuestPixelFormat.Bits8_8UScaled => GuestPixelFormat.Bits8_8UNorm,
+            GuestPixelFormat.Bits11_11_10UInt => GuestPixelFormat.Bits32UInt,
+            _ => format,
+        };
 
     public static Format HostFormat(GuestPixelFormat format) =>
         (uint)format < LookupSize ? HostLookup[(int)format] : Format.Undefined;

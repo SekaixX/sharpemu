@@ -15,7 +15,7 @@ public readonly record struct RectangleListShaders(byte[] Control, byte[] Evalua
 // PS5 rectangle lists contain three corners per primitive. The hardware
 // reconstructs the fourth corner and its varyings. Vulkan has no rectangle
 // primitive, so use a three-control-point patch and fixed TCS/TES stages, as
-// KyTy does, instead of reinterpreting the guest vertices as a triangle strip.
+// required by the guest primitive, instead of reinterpreting it as a triangle strip.
 public static class RectangleListShaderBuilder
 {
     public static RectangleListShaders Build(

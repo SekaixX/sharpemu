@@ -20,7 +20,7 @@ internal sealed partial class ShaderPipelineCache
     private const uint MaxCopyKernelSourceBytes = 16 * 1024 * 1024;
 
     // These substitutions bypass the guest draw and therefore need exact proof
-    // that the shader is a clear/fill. KyTy executes the original draw, and the
+    // that the shader is a clear/fill. Execute the original draw; the
     // recognisers below are intentionally broader than that proof, so preserve
     // normal rasterisation unless a developer explicitly opts into the legacy
     // diagnostic fast path.

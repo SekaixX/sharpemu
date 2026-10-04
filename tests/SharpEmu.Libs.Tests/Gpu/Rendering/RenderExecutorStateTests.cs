@@ -493,6 +493,35 @@ public sealed class RenderExecutorStateTests : IDisposable
         Assert.Contains("create_graphics_pipeline colors=0 depth=True topology=TriangleList restart=False", _pipelines.Calls);
     }
 
+    [Theory]
+    [InlineData(0x0u, 0u, 64u)]
+    [InlineData(0xFu, 1u, 32u)]
+    public void Attachments_AColorTargetThePixelProgramNeverExportsDoesNotBoundTheDepthPass(uint exportMasks, uint expectedColors, uint expectedExtent)
+    {
+        // Astro Bot's depth clear keeps a smaller color target bound; bounding the render area
+        // by it left most of the depth buffer uncleared and the sky failed its depth test.
+        var banks = Banks(withDepth: true);
+        banks.Context.ColorTargets[0] = RegisterWords.Color(ColorBase, 32, 32);
+        _pipelines.Graphics = Programs(pixelStage: Stage(new ShaderProgramInfo { Stage = ShaderStageKind.Pixel, PixelColorExportMasks = exportMasks }));
+        _executor.DrawIndexed(1, banks, Indexed(3));
+
+        var rendering = _host.BegunRenderings[0];
+        Assert.Equal((expectedColors, expectedExtent, expectedExtent), (rendering.ColorAttachmentCount, rendering.Width, rendering.Height));
+    }
+
+    [Fact]
+    public void Attachments_AColorTargetWithoutAnActivePixelShaderIsDroppedFromTheDepthPass()
+    {
+        var banks = Banks(withDepth: true);
+        banks.Context.ColorTargets[0] = RegisterWords.Color(ColorBase, 32, 32);
+        banks.Context.ShaderInterface.ColorShaderMask = 0;
+        _executor.DrawIndexed(1, banks, Indexed(3));
+
+        var rendering = _host.BegunRenderings[0];
+        Assert.Equal((0u, 64u, 64u), (rendering.ColorAttachmentCount, rendering.Width, rendering.Height));
+        Assert.Contains("create_graphics_pipeline colors=0 depth=True topology=TriangleList restart=False", _pipelines.Calls);
+    }
+
     [Fact]
     public void Attachments_StencilFormatIsReportedOnlyWithAStencilAspect()
     {

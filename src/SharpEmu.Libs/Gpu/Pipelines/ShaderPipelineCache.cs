@@ -238,7 +238,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ContextRegisters context,
         UserConfigRegisters userConfig,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
-        bool pixelActive) =>
+        bool pixelActive,
+        bool depthBound) =>
         GetGraphicsPrograms(
             vertex,
             pixel,
@@ -247,7 +248,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             userConfig,
             targetExportMapping,
             uint.MaxValue,
-            pixelActive);
+            pixelActive,
+            depthBound);
 
     public GraphicsPrograms GetGraphicsPrograms(
         VertexStageRegisters vertex,
@@ -257,7 +259,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         UserConfigRegisters userConfig,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
         uint boundColorSlots,
-        bool pixelActive)
+        bool pixelActive,
+        bool depthBound)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
         var vertexSource = PrepareVertexSource(vertex);
@@ -332,6 +335,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 shaderInterface,
                 targetExportMapping,
                 boundColorSlots,
+                depthBound ? pixelProgram.PixelColorExportMasks : null,
                 out var outputModes,
                 out var outputMappings);
             pixelInfo = PixelStageInputResolver.Resolve(_context, pixelSource.Registered, shaderInterface, outputModes, outputMappings, inputCount);
@@ -495,6 +499,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ShaderInterfaceRegisters shaderInterface,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
         uint boundColorSlots,
+        uint? unwrittenExportMasks,
         out byte[] outputModes,
         out ColorComponentMap[] outputMappings)
     {
@@ -504,6 +509,12 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         for (var slot = 0u; slot < ContextRegisters.ColorTargetCount; slot++)
         {
             if ((boundColorSlots & (1u << checked((int)slot))) == 0)
+            {
+                continue;
+            }
+
+            if (unwrittenExportMasks is { } exportMasks &&
+                RenderExecutor.IsUnwrittenColorTarget(context, slot, targetExportMapping[(int)slot], exportMasks))
             {
                 continue;
             }
@@ -580,6 +591,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
         var source = PrepareSource(compute.Address, ShaderStage.Compute, "compute", compute.UserScalars, compute.UserScalarCount, probeWrittenRegisters: false, userDataBase: 0);
         var input = ComputeStageInputResolver.Resolve(compute, source.Registered, dispatchInitiator, _host.ComputeSubgroupSize, dimensionX, dimensionY, dimensionZ);
+        input.WorkgroupAxisMapping = _host.ResolveComputeWorkgroupAxisMapping(input.ThreadsX, input.ThreadsY, input.ThreadsZ);
         var systemRegisters = DecodeComputeSystemRegisters(compute);
         var program = _programs.Decode(source);
         if (TrySubmitMaskedDwordCopyKernel(program, source, systemRegisters, input, out var description))
@@ -705,6 +717,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 RenderTrace.Write(
                     $"PipelineCache create graphics vertex=0x{vertexProgram.Id:X16} pixel=0x{key.PixelProgramId:X16} colors={key.Rendering.ColorCount} " +
                     $"depth={description.StaticParameters.WithDepth} samples={description.StaticParameters.Samples}");
+
             }
 
             var created = _host.CreateGraphicsPipeline(description);
@@ -809,7 +822,15 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             // host output would otherwise write an undefined value (e.g. depth-only passes that
             // leave a color target bound and export only to the null target).
             var exported = pixelStage is not null && ((pixelStage.PixelColorExportMasks >> (int)(color.Slot * 4)) & 0xFu) != 0;
-            parameters.SetColorMask(index, exported ? color.Resolution.ExportMapping.ApplyMask(context.RenderTargetMaskForSlot(color.Slot)) : 0);
+            var colorMask = exported ? color.Resolution.ExportMapping.ApplyMask(context.RenderTargetMaskForSlot(color.Slot)) : 0;
+            parameters.SetColorMask(index, colorMask);
+            if (RenderTrace.Enabled && RenderTrace.Pipeline())
+            {
+                RenderTrace.Write(
+                    $"PipelineCache output slot={color.Slot} guestMask=0x{context.RenderTargetMaskForSlot(color.Slot):X} " +
+                    $"exported={(exported ? 1 : 0)} shaderMask=0x{pixelStage?.PixelColorExportMasks ?? 0:X8} " +
+                    $"mapping=0x{color.Resolution.ExportMapping.Packed:X2} hostMask=0x{colorMask:X} format={(int)format}");
+            }
         }
 
         var withDepth = depth.HasTarget;

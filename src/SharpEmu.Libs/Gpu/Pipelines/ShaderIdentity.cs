@@ -134,4 +134,5 @@ public static class ShaderIdentity
             ArrayPool<byte>.Shared.Return(code);
         }
     }
+
 }

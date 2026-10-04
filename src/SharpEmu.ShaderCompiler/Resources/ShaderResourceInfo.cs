@@ -142,6 +142,18 @@ public sealed record StageInput(StageInputKind Kind, uint Location, uint Compone
 
 public sealed record StageOutput(StageOutputKind Kind, uint Index, uint Location, string DebugName);
 
+// One bounded runtime V# table lowered to a contiguous run of native buffer candidates,
+// selected through a key mapping in the flattened table.
+public sealed class BufferCandidateTableInfo
+{
+    public uint FirstCandidate { get; set; }
+    public uint CandidateCount { get; set; }
+    public uint MappingOffset { get; set; }
+    public uint SearchIterations { get; set; }
+
+    public BufferCandidateTableInfo Clone() => (BufferCandidateTableInfo)MemberwiseClone();
+}
+
 // The dense resource tables of a program plus the facts the pipeline layout needs.
 public sealed class ShaderResourceInfo
 {
@@ -155,6 +167,7 @@ public sealed class ShaderResourceInfo
     public List<ImageResource> Images { get; set; } = [];
     public List<SamplerResource> Samplers { get; set; } = [];
     public List<SampledImagePair> SampledPairs { get; set; } = [];
+    public List<BufferCandidateTableInfo> BufferCandidateTables { get; set; } = [];
     public List<StageInput> Inputs { get; set; } = [];
     public List<StageOutput> Outputs { get; set; } = [];
     public byte[] VertexFetchComponents { get; set; } = new byte[32];
@@ -169,6 +182,7 @@ public sealed class ShaderResourceInfo
         Images = Images.Select(image => image.Clone()).ToList(),
         Samplers = Samplers.Select(sampler => sampler.Clone()).ToList(),
         SampledPairs = SampledPairs.Select(pair => pair.Clone()).ToList(),
+        BufferCandidateTables = BufferCandidateTables.Select(table => table.Clone()).ToList(),
         Inputs = [.. Inputs],
         Outputs = [.. Outputs],
         VertexFetchComponents = (byte[])VertexFetchComponents.Clone(),

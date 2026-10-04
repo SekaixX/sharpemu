@@ -621,6 +621,8 @@ public static class AvPlayerExports
 
         public bool HasReadyFrame => _frames.Reader.TryPeek(out _);
 
+        public int QueuedFrameCount => _frames.Reader.Count;
+
         public bool IsCompleted => Volatile.Read(ref _completed) != 0;
 
         private void DecodeFrames()
@@ -748,6 +750,8 @@ public static class AvPlayerExports
                 : AudioFrameReadResult.Pending;
         }
 
+        public int QueuedFrameCount => _frames.Reader.Count;
+
         private void DecodeFrames()
         {
             try
@@ -859,6 +863,12 @@ public static class AvPlayerExports
         public ulong LastVideoTimestamp { get; set; }
         public ulong EventDataBuffer { get; set; }
         public long NextFrameIndex { get; set; }
+        public long VideoCalls { get; set; }
+        public long VideoDelivered { get; set; }
+        public long VideoPending { get; set; }
+        public long VideoSyncWait { get; set; }
+        public long VideoWriteFailures { get; set; }
+        public long VideoStatsSecond { get; set; } = -1;
         public ulong AudioBufferBase { get; set; }
         public int NextAudioBuffer { get; set; }
         public long NextAudioFrameIndex { get; set; }
@@ -912,6 +922,12 @@ public static class AvPlayerExports
             PlaybackClock.Reset();
             NextFrameIndex = 0;
             RawFrameTimestampMilliseconds = null;
+            VideoCalls = 0;
+            VideoDelivered = 0;
+            VideoPending = 0;
+            VideoSyncWait = 0;
+            VideoWriteFailures = 0;
+            VideoStatsSecond = -1;
             LastGuestBuffer = 0;
             LastVideoTimestamp = 0;
             SeekVideoFramePending = false;
@@ -1263,6 +1279,7 @@ public static class AvPlayerExports
             player.PlaybackClock.Stop();
             player.FallbackPlayback?.Pause();
             Console.Error.WriteLine($"[AVPLAYER][INFO] pause handle=0x{player.Handle:X16}");
+            TraceVideoStats(player);
         }
 
 
@@ -2322,6 +2339,14 @@ public static class AvPlayerExports
 
             try
             {
+                player.VideoCalls++;
+                var statsSecond = player.PlaybackClock.ElapsedMilliseconds / 1000;
+                if (statsSecond > player.VideoStatsSecond)
+                {
+                    player.VideoStatsSecond = statsSecond;
+                    TraceVideoStats(player);
+                }
+
             if (player.Paused)
             {
                 if (player.SeekVideoFramePending &&
@@ -2383,6 +2408,7 @@ public static class AvPlayerExports
                         return FinishStream(ctx, player);
                     }
 
+                    player.VideoSyncWait++;
                     TraceVideoPoll(
                         player,
                         $"ahead ex={extended} next={player.NextFrameIndex} expected={expectedFrame} " +
@@ -2404,6 +2430,7 @@ public static class AvPlayerExports
             if (frameResult == VideoFrameReadResult.Pending)
             {
                 player.VideoPendingCount++;
+                player.VideoPending++;
                 TraceVideoPoll(
                     player,
                     $"pending ex={extended} next={player.NextFrameIndex} " +
@@ -2430,6 +2457,7 @@ public static class AvPlayerExports
                     frameIndex,
                     extended))
             {
+                player.VideoWriteFailures++;
                 TraceVideoPoll(
                     player,
                     $"write_failed ex={extended} frame={frameIndex} raw={(player.RawFrame is not null)} " +
@@ -2437,6 +2465,7 @@ public static class AvPlayerExports
                 return SetReturn(ctx, 0);
             }
             player.LastVideoTimestamp = timestamp;
+            player.VideoDelivered++;
             player.VideoReadyCount++;
             if (skippedFrames > 0)
             {
@@ -2457,6 +2486,17 @@ public static class AvPlayerExports
                 Monitor.Exit(player.VideoDataGate);
             }
         }
+    }
+
+    private static void TraceVideoStats(PlayerState player)
+    {
+        Console.Error.WriteLine(
+            $"[AVPLAYER][INFO] video_stats handle=0x{player.Handle:X16} " +
+            $"clock_ms={player.PlaybackClock.ElapsedMilliseconds} audio_blocks={player.NextAudioFrameIndex} " +
+            $"calls={player.VideoCalls} delivered={player.VideoDelivered} " +
+            $"pending={player.VideoPending} sync_wait={player.VideoSyncWait} " +
+            $"write_fail={player.VideoWriteFailures} next_frame={player.NextFrameIndex} " +
+            $"queued={player.VideoDecoder?.QueuedFrameCount ?? 0} last_ts={player.LastVideoTimestamp}");
     }
 
     private static int FinishStream(CpuContext ctx, PlayerState player)

@@ -35,7 +35,7 @@ public sealed class ShaderPipelineCacheTests : IDisposable
 
         public List<GraphicsPipelineDescription> Descriptions { get; } = new();
 
-        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface, ContextRegisters context, UserConfigRegisters userConfig, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive) => Graphics;
+        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface, ContextRegisters context, UserConfigRegisters userConfig, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive, bool depthBound) => Graphics;
 
         public PipelineHandle CreateGraphicsPipeline(ReadOnlySpan<ColorTargetState> colors, in DepthAttachmentState depth, VertexInputInfo vertexInput, PixelInputInfo? pixelInput, ContextRegisters context, in RenderingState rendering, PrimitiveTopology topology, bool primitiveRestartEnabled, bool disableBlending, ShaderProgram vertexProgram, ShaderProgram pixelProgram)
         {
@@ -381,7 +381,8 @@ public sealed class ShaderPipelineCacheTests : IDisposable
             banks.Context,
             banks.UserConfig,
             mappings,
-            pixelActive: true);
+            pixelActive: true,
+            depthBound: false);
 
         Assert.True(programs.Available);
         var request = Assert.Single(
@@ -425,7 +426,8 @@ public sealed class ShaderPipelineCacheTests : IDisposable
             banks.UserConfig,
             mappings,
             boundColorSlots: 0b10,
-            pixelActive: true);
+            pixelActive: true,
+            depthBound: false);
 
         Assert.True(programs.Available);
         var request = Assert.Single(
@@ -496,7 +498,8 @@ public sealed class ShaderPipelineCacheTests : IDisposable
             banks.Context,
             banks.UserConfig,
             [],
-            pixelActive: false);
+            pixelActive: false,
+            depthBound: false);
 
         Assert.True(programs.Available);
         Assert.Empty(programs.VertexInput.Buffers);
@@ -547,7 +550,8 @@ public sealed class ShaderPipelineCacheTests : IDisposable
             banks.Context,
             banks.UserConfig,
             [],
-            pixelActive: false));
+            pixelActive: false,
+            depthBound: false));
 
         Assert.Contains("vertex table pointer is null", fatal.Message);
     }
@@ -579,7 +583,7 @@ public sealed class ShaderPipelineCacheTests : IDisposable
     {
         private readonly GraphicsPrograms _programs = Programs();
 
-        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface, ContextRegisters context, UserConfigRegisters userConfig, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive) => _programs;
+        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface, ContextRegisters context, UserConfigRegisters userConfig, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive, bool depthBound) => _programs;
 
         public PipelineHandle CreateGraphicsPipeline(ReadOnlySpan<ColorTargetState> colors, in DepthAttachmentState depth, VertexInputInfo vertexInput, PixelInputInfo? pixelInput, ContextRegisters context, in RenderingState rendering, PrimitiveTopology topology, bool primitiveRestartEnabled, bool disableBlending, ShaderProgram vertexProgram, ShaderProgram pixelProgram) =>
             cache.CreateGraphicsPipeline(colors, in depth, vertexInput, pixelInput, context, in rendering, topology, primitiveRestartEnabled, disableBlending, vertexProgram, pixelProgram);

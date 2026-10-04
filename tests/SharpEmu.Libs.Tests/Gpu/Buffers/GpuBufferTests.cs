@@ -34,6 +34,54 @@ public sealed class GpuBufferTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     [Fact]
+    public void SlabBuffers_ShareAChunkAndRecycleZeroedOnlyAfterForeignReads()
+    {
+        if (_vulkan is null) return;
+        using var worker = new CacheWorker(_vulkan);
+        var info = _vulkan.DeviceInfo;
+        const BufferUsageFlags flags = GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit;
+        using var download = new GpuBuffer(info, worker.Scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, 0x1000);
+        GpuBuffer? recycled = null;
+        worker.Run(() =>
+        {
+            worker.Scheduler.Begin(new SubmissionContext());
+            var first = new GpuBuffer(info, worker.Scheduler, GpuBufferUsage.DeviceLocal, 0, flags, 0x1000, allowSlab: true);
+            var allocations = info.LiveAllocations;
+            using var second = new GpuBuffer(info, worker.Scheduler, GpuBufferUsage.DeviceLocal, 0, flags, 0x1000, allowSlab: true);
+            Assert.Equal(allocations, info.LiveAllocations);
+            first.Fill(0, 0x1000, 0xA5A5A5A5);
+            worker.Scheduler.Finish();
+
+            // A readback may still copy from the released block; it must not be handed out yet.
+            var firstAddress = first.DeviceAddress;
+            using var during = new ForeignReadBuffers();
+            using (info.Slabs.BeginForeignRead())
+            {
+                first.Dispose();
+                during.Buffer = new GpuBuffer(info, worker.Scheduler, GpuBufferUsage.DeviceLocal, 0, flags, 0x1000, allowSlab: true);
+                Assert.NotEqual(firstAddress, during.Buffer.DeviceAddress);
+            }
+
+            recycled = new GpuBuffer(info, worker.Scheduler, GpuBufferUsage.DeviceLocal, 0, flags, 0x1000, allowSlab: true);
+            Assert.Equal(firstAddress, recycled.DeviceAddress);
+            download.CopyFrom(worker.Scheduler.Current, recycled, 0, 0, 0x1000, AccessFlags.MemoryWriteBit, AccessFlags.None, AccessFlags.MemoryReadBit, AccessFlags.HostReadBit);
+            worker.Scheduler.Finish();
+            download.Invalidate(0, 0x1000);
+        });
+
+        Assert.All(download.Mapped.ToArray(), value => Assert.Equal(0, value));
+        recycled!.Dispose();
+        worker.Run(() => worker.Scheduler.Shutdown());
+    }
+
+    private sealed class ForeignReadBuffers : IDisposable
+    {
+        public GpuBuffer? Buffer;
+
+        public void Dispose() => Buffer?.Dispose();
+    }
+
+    [Fact]
     public void FillAndCopyFrom_ReachTheHostThroughADownloadBuffer()
     {
         if (_vulkan is null) return;

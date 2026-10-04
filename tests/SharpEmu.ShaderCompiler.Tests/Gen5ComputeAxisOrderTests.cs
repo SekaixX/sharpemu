@@ -18,6 +18,7 @@ public sealed class Gen5ComputeAxisOrderTests
 
     [Theory]
     [InlineData(1, 1, 256, 1, 2, 0)]
+    [InlineData(0, 1, 256, 1, 2, 0)]
     [InlineData(8, 16, 128, 2, 1, 0)]
     [InlineData(256, 1, 65, 0, 2, 1)]
     public void TallZWorkgroupMovesLargestAxisToPhysicalX(

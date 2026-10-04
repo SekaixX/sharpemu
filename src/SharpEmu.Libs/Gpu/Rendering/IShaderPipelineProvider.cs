@@ -77,7 +77,8 @@ public interface IShaderPipelineProvider
         ContextRegisters context,
         UserConfigRegisters userConfig,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
-        bool pixelActive);
+        bool pixelActive,
+        bool depthBound);
 
     // The executor can discover stale colour-register slots only after decoding the pixel
     // program. Providers that specialize pixel outputs by host attachment location use this
@@ -91,7 +92,8 @@ public interface IShaderPipelineProvider
         UserConfigRegisters userConfig,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
         uint boundColorSlots,
-        bool pixelActive) =>
+        bool pixelActive,
+        bool depthBound) =>
         GetGraphicsPrograms(
             vertex,
             pixel,
@@ -99,7 +101,8 @@ public interface IShaderPipelineProvider
             context,
             userConfig,
             targetExportMapping,
-            pixelActive);
+            pixelActive,
+            depthBound);
 
     PipelineHandle CreateGraphicsPipeline(
         ReadOnlySpan<ColorTargetState> colors,

@@ -55,6 +55,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
     public bool SupportsDynamicRendering { get; }
     public bool SupportsFragmentShaderBarycentric { get; private init; }
     public bool SupportsImageViewMinLod { get; }
+    public bool SupportsFillRectangle { get; private init; }
 
     private static readonly string[] RenderingExtensionNames =
     [
@@ -410,6 +411,9 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         if (dynamicRendering) extensionNames.AddRange(RenderingExtensionNames);
         if (barycentric) extensionNames.Add(barycentricExtension);
         if (imageViewMinLod) extensionNames.Add(imageViewMinLodExtension);
+        const string fillRectangleExtension = "VK_NV_fill_rectangle";
+        var fillRectangle = HasDeviceExtensions(vk, physical, [fillRectangleExtension]);
+        if (fillRectangle) extensionNames.Add(fillRectangleExtension);
         var deviceExtensions = extensionNames.Count > 0 ? SilkMarshal.StringArrayToPtr(extensionNames.ToArray()) : 0;
         var deviceInfo = new DeviceCreateInfo
         {
@@ -447,6 +451,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             imageViewMinLod)
         {
             SupportsFragmentShaderBarycentric = barycentric,
+            SupportsFillRectangle = fillRectangle,
         };
         if (validation)
         {

@@ -29,9 +29,10 @@ public sealed unsafe class HostViewQueryTests
             Check(address, HostMemory.MEM_COMMIT, HostMemory.PAGE_READONLY);
             Assert.True(views.ChangeAccess(address, views.PageSize, HostPageProtection.ReadWrite));
             Assert.True(views.ChangeAccess(address, views.PageSize, HostPageProtection.ReadOnly));
-            var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
-            var changed = views.ChangeAccess(address, views.PageSize, HostPageProtection.ReadWrite);
-            var allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+            // One round: a second read-write change would take the unchanged-protection path.
+            var changed = false;
+            var allocatedBytes = AllocationMeasurement.SteadyState(null,
+                () => changed = views.ChangeAccess(address, views.PageSize, HostPageProtection.ReadWrite), rounds: 1);
             Assert.True(changed);
             Assert.Equal(0, allocatedBytes);
             Assert.True(views.ChangeAccess(address, views.PageSize, HostPageProtection.NoAccess));
@@ -45,8 +46,10 @@ public sealed unsafe class HostViewQueryTests
         {
             Assert.True(views.FreeOwnedRange(address, size));
         }
+        // Another thread (a parallel test, the GC) may reuse the freed range at once. A
+        // release that failed leaves this test's reservation, never committed memory.
         Assert.NotEqual((nuint)0, HostMemory.Query((void*)address, out var released));
-        Assert.Equal(HostMemory.MEM_FREE_STATE, released.State);
+        Assert.Contains(released.State, new[] { HostMemory.MEM_FREE_STATE, HostMemory.MEM_COMMIT });
     }
 
     private static void Check(ulong address, uint state, uint protection)

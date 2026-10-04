@@ -12,7 +12,7 @@ internal sealed class RuntimeEvaluationScratch : IDisposable
     private RuntimeEvaluationScratch? _nextAvailable;
     private bool _rented;
 
-    internal Dictionary<ScalarValue, ulong> Values { get; } = [];
+    internal ScalarValueCache Values { get; } = new();
     internal List<ScalarValue> Visiting { get; } = [];
 
     internal static RuntimeEvaluationScratch Rent()
@@ -31,7 +31,7 @@ internal sealed class RuntimeEvaluationScratch : IDisposable
     public void Dispose()
     {
         if (!_rented) return;
-        Values.Clear();
+        Values.Reset();
         Visiting.Clear();
         _rented = false;
         _nextAvailable = _available;

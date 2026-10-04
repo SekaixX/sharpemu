@@ -16,12 +16,18 @@ public sealed class GuestPageTracker
     private readonly PageGuard _pages;
     private readonly TrackedRegion?[] _regions = new TrackedRegion?[TrackerLayout.BlockCount];
     private readonly object _regionGate = new();
+    private readonly CpuDirtySummary _cpuDirtySummary = new();
 
     public GuestPageTracker(PageGuard pages) => _pages = pages;
 
     public bool HasCpuDirtyPages(ulong vaddr, ulong size)
     {
         RejectUploadCallbackReentry();
+        if (IsKnownCpuClean(vaddr, size))
+        {
+            return false;
+        }
+
         return VisitRegions(vaddr, size, create: true, (region, offset, bytes) =>
         {
             using var _ = region.Lock.Hold();
@@ -37,6 +43,31 @@ public sealed class GuestPageTracker
             using var _ = region.Lock.Hold();
             return region.IsModified(WriteOrigin.Gpu, offset, bytes);
         });
+    }
+
+    // Lock-free pre-check for hot readers: only the GPU queue thread sets GPU-dirty bits,
+    // so on that thread a clear answer is exact; a stale dirty answer merely sends the
+    // caller to HasGpuDirtyPages. Allocation- and lock-free.
+    public bool MayHaveGpuDirtyPages(ulong vaddr, ulong size)
+    {
+        ValidateRange(vaddr, size);
+        var remaining = size;
+        var index = vaddr / BlockBytes;
+        var offset = vaddr % BlockBytes;
+        while (remaining != 0)
+        {
+            var bytes = Math.Min(BlockBytes - offset, remaining);
+            if (Volatile.Read(ref _regions[index]) is { } region && region.IsModified(WriteOrigin.Gpu, offset, bytes))
+            {
+                return true;
+            }
+
+            remaining -= bytes;
+            offset = 0;
+            index++;
+        }
+
+        return false;
     }
 
     public bool IsCpuWriteHotRange(ulong vaddr, ulong size)
@@ -110,28 +141,52 @@ public sealed class GuestPageTracker
     // Removes protection from a range; a GPU-dirty region flushes through onFlush without the lock.
     public bool InvalidateRegion(ulong vaddr, ulong size, Action onFlush)
     {
-        RejectUploadCallbackReentry();
-        var tracked = false;
-        VisitRegions(vaddr, size, create: false, (region, offset, bytes) =>
+        var tracked = InvalidateRegion(vaddr, size, out var needsGpuFlush);
+        if (needsGpuFlush)
         {
-            tracked = true;
-            bool shouldFlush;
-            using (region.Lock.Hold())
+            onFlush();
+        }
+
+        return tracked;
+    }
+
+    // Marks the CPU write in every region whose bytes the GPU has not modified and
+    // reports whether any region still holds GPU data the caller must download first
+    // (one download of the whole range covers them all). Allocation-free: guest
+    // command writes land here once per dword.
+    public bool InvalidateRegion(ulong vaddr, ulong size, out bool needsGpuFlush)
+    {
+        RejectUploadCallbackReentry();
+        ValidateRange(vaddr, size);
+        var tracked = false;
+        needsGpuFlush = false;
+        var remaining = size;
+        var index = vaddr / BlockBytes;
+        var offset = vaddr % BlockBytes;
+        while (remaining != 0)
+        {
+            var bytes = Math.Min(BlockBytes - offset, remaining);
+            if (Volatile.Read(ref _regions[index]) is { } region)
             {
-                shouldFlush = region.IsModified(WriteOrigin.Gpu, offset, bytes);
-                if (!shouldFlush)
+                tracked = true;
+                using (region.Lock.Hold())
                 {
-                    region.MarkCpuWrite(region.BaseAddress + offset, bytes);
+                    if (region.IsModified(WriteOrigin.Gpu, offset, bytes))
+                    {
+                        needsGpuFlush = true;
+                    }
+                    else
+                    {
+                        region.MarkCpuWrite(region.BaseAddress + offset, bytes);
+                    }
                 }
             }
 
-            if (shouldFlush)
-            {
-                onFlush();
-            }
+            remaining -= bytes;
+            offset = 0;
+            index++;
+        }
 
-            return false;
-        });
         return tracked;
     }
 
@@ -341,6 +396,66 @@ public sealed class GuestPageTracker
         }
     }
 
+    // True when every block of the range is tracked and has no CPU-dirty page. A missing
+    // region is not known clean: the precise path creates it, fully dirty.
+    // Visits the maximal runs of the range whose 4 MiB blocks may hold CPU-dirty pages: a block
+    // with no region yet starts all dirty, and a region's summary bit is set while any of its
+    // pages is dirty. Known-clean blocks are skipped without a lock, the same test
+    // HasCpuDirtyPages starts with, so a caller that only uploads dirty pages loses nothing.
+    public void ForEachPossiblyCpuDirtyRange(ulong vaddr, ulong size, Action<ulong, ulong> visit)
+    {
+        if (size == 0)
+        {
+            return;
+        }
+
+        if (!new GuestSpan(vaddr, size).IsValid)
+        {
+            // Outside the tracked space nothing is known clean; the caller decides as before.
+            visit(vaddr, size);
+            return;
+        }
+
+        var end = vaddr + size;
+        var last = (end - 1) / BlockBytes;
+        var runStart = 0UL;
+        var inRun = false;
+        for (var index = vaddr / BlockBytes; index <= last; index++)
+        {
+            var possiblyDirty = Volatile.Read(ref _regions[index]) == null || _cpuDirtySummary.IsDirty(index);
+            if (possiblyDirty && !inRun)
+            {
+                runStart = Math.Max(vaddr, index * BlockBytes);
+                inRun = true;
+            }
+            else if (!possiblyDirty && inRun)
+            {
+                visit(runStart, index * BlockBytes - runStart);
+                inRun = false;
+            }
+        }
+
+        if (inRun)
+        {
+            visit(runStart, end - runStart);
+        }
+    }
+
+    private bool IsKnownCpuClean(ulong vaddr, ulong size)
+    {
+        ValidateRange(vaddr, size);
+        var last = (vaddr + size - 1) / BlockBytes;
+        for (var index = vaddr / BlockBytes; index <= last; index++)
+        {
+            if (Volatile.Read(ref _regions[index]) == null || _cpuDirtySummary.IsDirty(index))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // Visits (region, offset, bytes) per 4 MiB chunk; a true result stops the walk early.
     private bool VisitRegions(ulong vaddr, ulong size, bool create, Func<TrackedRegion, ulong, ulong, bool> visit)
     {
@@ -379,7 +494,7 @@ public sealed class GuestPageTracker
                 return existing;
             }
 
-            var created = new TrackedRegion(_pages, index * BlockBytes);
+            var created = new TrackedRegion(_pages, index * BlockBytes, _cpuDirtySummary);
             Volatile.Write(ref _regions[index], created);
             return created;
         }

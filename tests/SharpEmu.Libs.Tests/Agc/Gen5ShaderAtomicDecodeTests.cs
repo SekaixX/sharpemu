@@ -285,9 +285,11 @@ public sealed class Gen5ShaderAtomicDecodeTests
     }
 
     [Theory]
-    [InlineData(0xD8F83412u, "DsAppend")]
-    [InlineData(0xD8F43412u, "DsConsume")]
-    public void DsWaveCounter_UsesM0AndReturnsOldValue(uint word, string opcode)
+    [InlineData(0xD8F83412u, "DsAppend", false)]
+    [InlineData(0xD8FA3412u, "DsAppend", true)]
+    [InlineData(0xD8F43412u, "DsConsume", false)]
+    [InlineData(0xD8F63412u, "DsConsume", true)]
+    public void DsWaveCounter_UsesM0AndReturnsOldValue(uint word, string opcode, bool global)
     {
         var instruction = DecodeSingle(word, 0x07000000);
 
@@ -298,7 +300,7 @@ public sealed class Gen5ShaderAtomicDecodeTests
         Assert.Equal(0x12u, control.Offset0);
         Assert.Equal(0x34u, control.Offset1);
         Assert.Equal(0x3412u, control.SingleOffsetBytes);
-        Assert.False(control.Gds);
+        Assert.Equal(global, control.Gds);
     }
 
     [Fact]
@@ -335,6 +337,17 @@ public sealed class Gen5ShaderAtomicDecodeTests
         var instruction = DecodeSingle(0x7E027302);
 
         Assert.Equal("VFfbhU32", instruction.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Vector(2) }, instruction.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(1) }, instruction.Destinations);
+    }
+
+    [Fact]
+    public void VFfbhI32_DecodesVop1Opcode3B()
+    {
+        // V_FFBH_I32 v1, v2 (Astro Bot vertex program 0x7D308CDE1E9F2E5A).
+        var instruction = DecodeSingle(0x7E027702);
+
+        Assert.Equal("VFfbhI32", instruction.Opcode);
         Assert.Equal(new[] { Gen5Operand.Vector(2) }, instruction.Sources);
         Assert.Equal(new[] { Gen5Operand.Vector(1) }, instruction.Destinations);
     }

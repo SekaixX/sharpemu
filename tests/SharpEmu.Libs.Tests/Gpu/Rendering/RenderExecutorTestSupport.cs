@@ -114,6 +114,8 @@ internal sealed class RecordingRenderHost : IRenderHost, IMeshRenderHost
 
     public uint[]? LastMeshDrawData { get; private set; }
 
+    public bool AcceptIndirectDispatch { get; set; } = true;
+
     public BufferBinding[] LastVertexBindings { get; private set; } = [];
 
     public ImageLayout ColorLayout { get; set; } = ImageLayout.ColorAttachmentOptimal;
@@ -354,6 +356,9 @@ internal sealed class RecordingRenderHost : IRenderHost, IMeshRenderHost
     public void DrawIndexed(uint indexCount, uint instanceCount, uint firstIndex, int vertexOffset, uint firstInstance) =>
         Calls.Add($"draw_indexed {indexCount} {instanceCount} {firstIndex} {vertexOffset} {firstInstance}");
 
+    public void DrawIndexedIndirect(BufferBinding arguments) =>
+        Calls.Add($"draw_indexed_indirect {arguments.Handle:X}:{arguments.Offset:X}");
+
     public void PushMeshDrawData(in PipelineHandle pipeline, ReadOnlySpan<uint> drawData)
     {
         LastMeshDrawData = drawData.ToArray();
@@ -368,7 +373,7 @@ internal sealed class RecordingRenderHost : IRenderHost, IMeshRenderHost
     public bool TryDispatchIndirect(ulong argumentsAddress)
     {
         Calls.Add($"dispatch_indirect {argumentsAddress:X}");
-        return true;
+        return AcceptIndirectDispatch;
     }
 
     public void ShaderWriteBarrier(PipelineStageFlags sourceStages) => Calls.Add($"write_barrier {sourceStages}");
@@ -487,7 +492,8 @@ internal sealed class FakePipelineProvider : IShaderPipelineProvider
         ContextRegisters context,
         UserConfigRegisters userConfig,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
-        bool pixelActive)
+        bool pixelActive,
+        bool depthBound)
     {
         Calls.Add($"get_graphics_programs pixelActive={pixelActive}");
         ExportMappings.Add(targetExportMapping.ToArray());
@@ -502,7 +508,8 @@ internal sealed class FakePipelineProvider : IShaderPipelineProvider
         UserConfigRegisters userConfig,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
         uint boundColorSlots,
-        bool pixelActive)
+        bool pixelActive,
+        bool depthBound)
     {
         BoundColorSlotMasks.Add(boundColorSlots);
         return GetGraphicsPrograms(
@@ -512,7 +519,8 @@ internal sealed class FakePipelineProvider : IShaderPipelineProvider
             context,
             userConfig,
             targetExportMapping,
-            pixelActive);
+            pixelActive,
+            depthBound);
     }
 
     public PipelineHandle CreateGraphicsPipeline(

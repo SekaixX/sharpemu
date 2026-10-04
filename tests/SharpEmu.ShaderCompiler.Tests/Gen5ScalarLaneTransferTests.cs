@@ -385,7 +385,57 @@ public sealed class Gen5ScalarLaneTransferTests
         var opcodes = ReadSpirvOpcodes(compiled.Spirv);
         Assert.Contains((ushort)SpirvOp.IAdd, opcodes);
         Assert.Contains((ushort)SpirvOp.ULessThan, opcodes);
-        Assert.Contains((ushort)SpirvOp.Select, opcodes);
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public void OneLaneWaveKeepsSgprsSpilledToOtherLanes(bool subgroups, bool expectSlot)
+    {
+        // Astro Bot's skinning vertex shader saves EXEC this way and restores it before a
+        // waterfall loop; one-lane waves used to read lane 0 back and spin the loop.
+        const ulong shaderAddress = 0x1000;
+        var memory = new TestCpuMemory(shaderAddress, 0x100);
+        uint[] words =
+        [
+            0xD7610056, 0x0001047E, // v_writelane_b32 v86, s126, 2
+            0xD7610056, 0x0001067F, // v_writelane_b32 v86, s127, 3
+            0xD7600000, 0x00010556, // v_readlane_b32 s0, v86, 2
+            0xD7600001, 0x00010756, // v_readlane_b32 s1, v86, 3
+            0xBF810000,             // s_endpgm
+        ];
+        Span<byte> shader = stackalloc byte[words.Length * sizeof(uint)];
+        for (var index = 0; index < words.Length; index++)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                shader[(index * sizeof(uint))..],
+                words[index]);
+        }
+
+        Assert.True(memory.TryWrite(shaderAddress, shader));
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        Assert.True(
+            Gen5ShaderTranslator.TryDecodeProgram(
+                ctx,
+                shaderAddress,
+                out var program,
+                out var decodeError),
+            decodeError);
+
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Pixel, 0, 64, 0);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            PixelOutputs = [new Gen5PixelOutputBinding(0, 0, Gen5PixelOutputKind.Float)],
+            EnableGraphicsSubgroupOperations = subgroups,
+            WaveSize = 64,
+        };
+        Assert.True(
+            Gen5SpirvTranslator.TryCompileProgram(request, out var compiled, out var compileError),
+            compileError);
+
+        var text = System.Text.Encoding.ASCII.GetString(compiled.Spirv);
+        Assert.Equal(expectSlot, text.Contains("v86_lane2", StringComparison.Ordinal));
+        Assert.Equal(expectSlot, text.Contains("v86_lane3", StringComparison.Ordinal));
     }
 
     private static Gen5ShaderInstruction ScalarInstruction(

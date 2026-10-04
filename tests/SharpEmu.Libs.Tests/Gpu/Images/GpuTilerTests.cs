@@ -264,21 +264,30 @@ public sealed class GpuTilerTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     [Fact]
-    public void Detile_ReleasesTheScratchAfterTheTick()
+    // Scratches go back to a pool when their tick completes instead of being freed, so
+    // the next tick's scratches of the same sizes reuse them without new allocations.
+    public void Detile_ReusesTheScratchAfterTheTick()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new ImageTestHarness(_vulkan);
         var tilerCase = TilerCases.Create(TileBlockKind.Standard4KB, 4, TilerCases.Shape.Blocks, 77)!;
         var tiled = harness.Upload(tilerCase.Tiled);
         var baseline = harness.Device.LiveAllocations;
-        harness.Run(() =>
+        for (var round = 0; round < 3; round++)
         {
-            harness.Tiler.Detile(tiled.Handle, 0, tilerCase.Transfer.TiledSize, tilerCase.Transfer.LinearSize, new[] { tilerCase.Transfer });
-            harness.Tiler.GetScratchBuffer(64);
+            harness.Run(() =>
+            {
+                var linear = harness.Tiler.Detile(tiled.Handle, 0, tilerCase.Transfer.TiledSize, tilerCase.Transfer.LinearSize, new[] { tilerCase.Transfer });
+                var scratch = harness.Tiler.GetScratchBuffer(64);
+                Assert.Equal(tilerCase.Transfer.LinearSize, linear.Size);
+                Assert.Equal(64UL, scratch.Size);
+                Assert.NotEqual(linear.Buffer.Handle, scratch.Buffer.Handle);
+                Assert.Equal(baseline + 2, harness.Device.LiveAllocations);
+                harness.Scheduler.Finish();
+            });
             Assert.Equal(baseline + 2, harness.Device.LiveAllocations);
-            harness.Scheduler.Finish();
-        });
-        Assert.Equal(baseline, harness.Device.LiveAllocations);
+        }
+
         harness.AssertNoValidationMessages();
     }
 

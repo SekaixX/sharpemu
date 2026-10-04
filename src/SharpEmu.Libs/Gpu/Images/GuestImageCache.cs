@@ -27,6 +27,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private readonly GuestBufferCache _bufferCache;
     private readonly IGuestBackedSpace _backing;
     private readonly SlotTable<CachedImage> _slots = new();
+    private readonly ImageBackingPool? _backingPool;
     private readonly ImagePageOwnerTable _pageOwners = new();
     private readonly Dictionary<(Format Format, GuestImageType Type, uint Samples), ResourceSlotIdentifier> _nullImages = new();
     private RecencyQueue<ResourceSlotIdentifier> _recencyQueue = new();
@@ -43,7 +44,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
     // Opt-in diagnostics for tracing a single sampled image through cache lookup,
     // ownership refresh, and Vulkan upload.  The address filter keeps normal runs
-    // quiet and makes the probe useful for comparing a Kyty-known-good texture.
+    // quiet and makes the probe useful for comparing a known-good texture.
     // Environment settings are fixed before the emulator child starts. Cache them once so
     // disabled diagnostics do not query the process environment on every image operation.
     private static readonly bool TextureTraceEnabled =
@@ -109,6 +110,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _readbackLinearImages = readbackLinearImages;
         _blit = new ColorToMultisampleDepthBlit(device, scheduler);
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
+        _backingPool = ImageBackingPool.Enabled ? new ImageBackingPool(device) : null;
     }
 
     public ulong TotalUsedMemory => _totalUsedMemory;
@@ -153,6 +155,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         _disposed = true;
         _slots.ForEach((_, image) => image.Dispose());
+        _backingPool?.Dispose();
         _tiler.Dispose();
         _blit.Dispose();
     }
@@ -237,6 +240,12 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
                     replacement.Type = request.View.Type is ImageViewType.Type1D or ImageViewType.Type1DArray
                         ? GuestImageType.Color1D : GuestImageType.Color2D;
                     result = GrowImage(replacement, result);
+                }
+                else if (request.Role == ImageRole.StorageImage && viewMip < 0 && viewLayer < 0 &&
+                         resolved.Description.IsBlock && !request.Description.IsBlock &&
+                         (resolved.Backing.Usage & ImageUsageFlags.StorageBit) == 0)
+                {
+                    result = ReplaceCompressedForStorage(request.Description, result);
                 }
             }
 
@@ -454,13 +463,25 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             }
         }
 
-        TakeGpuOwnership(image);
         if (request.Description.HasStencil)
         {
-            AssociateStencilRange(imageIdentifier, request.Description.Stencil);
+            image.Description.Stencil = request.Description.Stencil;
+            RefreshStencilPlane(imageIdentifier, image, request.Description.Metadata.StencilCompressed);
         }
 
+        TakeGpuOwnership(image);
         return image.GetOrCreateView(request.View);
+    }
+
+    private void RefreshStencilPlane(ResourceSlotIdentifier depthIdentifier, CachedImage depth, bool stencilCompressed)
+    {
+        var association = AssociateStencilRange(depthIdentifier, depth.Description.Stencil);
+        if (stencilCompressed || depth.Description.Samples != 1)
+        {
+            return;
+        }
+
+        RefreshFromGuest(association, RefreshRequest(_slots[association]));
     }
 
     public void MarkGpuWritten(ResourceSlotIdentifier imageIdentifier)
@@ -474,13 +495,24 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         WatchImage(imageIdentifier);
         TakeGpuOwnership(image);
+        if (image.Description.HasStencil)
+        {
+            TakeStencilOwnership(imageIdentifier, image);
+        }
+    }
+
+    private void TakeStencilOwnership(ResourceSlotIdentifier depthIdentifier, CachedImage depth)
+    {
+        var association = AssociateStencilRange(depthIdentifier, depth.Description.Stencil);
+        WatchImage(association);
+        TakeGpuOwnership(_slots[association]);
     }
 
     private static void TakeGpuOwnership(CachedImage image)
     {
-        if (image.DepthOwner.IsValid || !image.Backing.Exists)
+        if (!image.DepthOwner.IsValid && !image.Backing.Exists)
         {
-            throw SubmissionScheduler.Fatal($"A stencil association cannot own image contents: address=0x{image.Description.Data.Address:X16}.");
+            throw SubmissionScheduler.Fatal($"GPU ownership needs a native image or a stencil association: address=0x{image.Description.Data.Address:X16}.");
         }
 
         image.ClearBufferModified();
@@ -549,7 +581,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private ResourceSlotIdentifier InsertImage(in ImageDescription description)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageCreate);
-        var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description));
+        var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description, _backingPool));
         if (!ImageDescription.IsEmptyRange(description.Data))
         {
             AddToIndex(imageIdentifier);

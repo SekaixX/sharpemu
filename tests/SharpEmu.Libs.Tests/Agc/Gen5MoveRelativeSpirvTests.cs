@@ -23,11 +23,14 @@ public sealed class Gen5MoveRelativeSpirvTests
     // [15:8]=op(0x03), [7:0]=ssrc0. m0 is SGPR 124, inline constant 2 is 130.
     private const uint SMovM0 = 0xBE800000u | (124u << 16) | (0x03u << 8) | 130u;
 
+    // s_mov_b32 m0, s3: a value the translator cannot bound.
+    private const uint SMovM0FromUserData = 0xBE800000u | (124u << 16) | (0x03u << 8) | 3u;
+
     [Fact]
     public void MovrelsB32_ReadsTheSourceRegisterThroughADynamicIndex()
     {
-        // s_mov_b32 m0, 2 ; v_movrels_b32 v5, v3   ->   v5 = vgpr[3 + m0]
-        var spirv = Compile([SMovM0, Vop1 | (5u << 17) | (0x43u << 9) | (256u + 3u)]);
+        // s_mov_b32 m0, s3 ; v_movrels_b32 v5, v3   ->   v5 = vgpr[3 + m0]
+        var spirv = Compile([SMovM0FromUserData, Vop1 | (5u << 17) | (0x43u << 9) | (256u + 3u)]);
 
         Assert.True(
             HasDynamicVectorRegisterAccess(spirv),
@@ -37,8 +40,8 @@ public sealed class Gen5MoveRelativeSpirvTests
     [Fact]
     public void MovreldB32_WritesTheDestinationRegisterThroughADynamicIndex()
     {
-        // s_mov_b32 m0, 2 ; v_movreld_b32 v5, v3   ->   vgpr[5 + m0] = v3
-        var spirv = Compile([SMovM0, Vop1 | (5u << 17) | (0x42u << 9) | (256u + 3u)]);
+        // s_mov_b32 m0, s3 ; v_movreld_b32 v5, v3   ->   vgpr[5 + m0] = v3
+        var spirv = Compile([SMovM0FromUserData, Vop1 | (5u << 17) | (0x42u << 9) | (256u + 3u)]);
 
         Assert.True(
             HasDynamicVectorRegisterAccess(spirv),
@@ -48,8 +51,8 @@ public sealed class Gen5MoveRelativeSpirvTests
     [Fact]
     public void MovrelsdB32_TranslatesWithoutDroppingShader()
     {
-        // s_mov_b32 m0, 2 ; v_movrelsd_b32 v5, v3  ->  vgpr[5 + m0] = vgpr[3 + m0]
-        var spirv = Compile([SMovM0, Vop1 | (5u << 17) | (0x44u << 9) | (256u + 3u)]);
+        // s_mov_b32 m0, s3 ; v_movrelsd_b32 v5, v3  ->  vgpr[5 + m0] = vgpr[3 + m0]
+        var spirv = Compile([SMovM0FromUserData, Vop1 | (5u << 17) | (0x44u << 9) | (256u + 3u)]);
 
         Assert.True(
             HasDynamicVectorRegisterAccess(spirv),
@@ -66,6 +69,21 @@ public sealed class Gen5MoveRelativeSpirvTests
         Assert.True(
             HasDynamicVectorRegisterAccess(spirv),
             "V_MOVRELSD_2_B32 must index the VGPR array with a computed index");
+    }
+
+    [Theory]
+    [InlineData(0x43u)]
+    [InlineData(0x42u)]
+    [InlineData(0x44u)]
+    public void RelativeMovesWithAKnownM0_UseConstantRegisterNumbers(uint opcode)
+    {
+        // s_mov_b32 m0, 2 lets the translator pick the register directly, so the VGPR
+        // array is never indexed at run time.
+        var spirv = Compile([SMovM0, Vop1 | (5u << 17) | (opcode << 9) | (256u + 3u)]);
+
+        Assert.False(
+            HasDynamicVectorRegisterAccess(spirv),
+            "a relative move with a known M0 must not index the VGPR array at run time");
     }
 
     [Fact]

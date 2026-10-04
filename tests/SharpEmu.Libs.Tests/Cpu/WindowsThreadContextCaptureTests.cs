@@ -74,8 +74,11 @@ public sealed class WindowsThreadContextCaptureTests
         Assert.NotEqual((nuint)0, HostMemory.Query((void*)address, out var before));
         Assert.Equal(HostMemory.PAGE_EXECUTE_READ, before.Protect);
         code.Dispose();
+        // Another thread may reuse the freed range at once; only the original executable
+        // allocation still being there is a leak.
         Assert.NotEqual((nuint)0, HostMemory.Query((void*)address, out var after));
-        Assert.Equal(HostMemory.MEM_FREE_STATE, after.State);
+        Assert.False(after.State == HostMemory.MEM_COMMIT && after.Protect == HostMemory.PAGE_EXECUTE_READ &&
+            after.AllocationBase == (ulong)address);
     }
 
     [Fact]

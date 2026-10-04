@@ -114,6 +114,18 @@ public sealed partial class GpuCommandInterpreter
             return;
         }
 
+        if (_host.ResolvesIndirectDrawOnGpu && IndexTypeAndSize is 0 or 1 && TryGetGpuIndexRange(out var gpuIndexCount))
+        {
+            // The host reads the five arguments on the GPU. It draws from the whole index
+            // range; the arguments pick the indices. The host falls back to reading them
+            // itself when the draw needs the counts.
+            _deferredInstanceCountAddress = argumentsAddress + 4;
+            _host.DrawIndexed(SubmitId, new DrawIndexedArguments(
+                packetAddress, opcode, gpuIndexCount, IndexBaseAddress, IndexTypeAndSize, 1, 0, 0,
+                DrawOffsetSource.IndirectArguments, argumentsAddress, UnboundedIndexBuffer: IndexBufferSize == 0));
+            return;
+        }
+
         var indexCountPerInstance = ReadDword(argumentsAddress);
         var indexedInstanceCount = ReadDword(argumentsAddress + 4);
         var startIndex = ReadDword(argumentsAddress + 8);
@@ -122,7 +134,69 @@ public sealed partial class GpuCommandInterpreter
         var indexAddress = IndexBaseAddress + (startIndex * IndexElementSize);
         var indexCount = IndexBufferSize != 0 ? Math.Min(indexCountPerInstance, IndexBufferSize) : indexCountPerInstance;
         InstanceCount = indexedInstanceCount;
+        if (IndexBufferSize == 0 && IndexTypeAndSize is 0 or 1)
+        {
+            LearnIndexExtent(startIndex, indexCountPerInstance);
+        }
+
         DrawIndexed(packetAddress, opcode, indexCount, indexAddress, indexedInstanceCount, unchecked((int)baseVertex), indexedStartInstance, DrawOffsetSource.IndirectArguments);
+    }
+
+    // An index buffer without a size (INDEX_BUFFER_SIZE never set) has no bound the GPU
+    // path could bind. The extent the draws from an index base have used so far, rounded
+    // up to the end of its 16 KiB page, stands in for it; every 1024th such draw reads its
+    // arguments on the CPU again so the extent can grow.
+    private const ulong IndexExtentPageSize = 0x4000;
+    private const ulong MaxIndexExtentBytes = 64ul << 20;
+    private const int MaxIndexExtents = 4096;
+    private readonly Dictionary<ulong, ulong> _indexExtents = new();
+    private uint _indexExtentDraws;
+
+    private bool TryGetGpuIndexRange(out uint indexCount)
+    {
+        if (IndexBufferSize != 0)
+        {
+            indexCount = IndexBufferSize;
+            return true;
+        }
+
+        indexCount = 0;
+        if ((++_indexExtentDraws & 1023) == 0 || !_indexExtents.TryGetValue(IndexBaseAddress, out var extentBytes))
+        {
+            return false;
+        }
+
+        indexCount = (uint)(extentBytes / IndexElementSize);
+        return indexCount != 0;
+    }
+
+    private void LearnIndexExtent(uint startIndex, uint indexCount)
+    {
+        if (indexCount == 0 || IndexBaseAddress == 0)
+        {
+            return;
+        }
+
+        var end = IndexBaseAddress + (((ulong)startIndex + indexCount) * IndexElementSize);
+        var extentBytes = ((end + IndexExtentPageSize - 1) & ~(IndexExtentPageSize - 1)) - IndexBaseAddress;
+        if (extentBytes > MaxIndexExtentBytes)
+        {
+            return;
+        }
+
+        if (_indexExtents.TryGetValue(IndexBaseAddress, out var known))
+        {
+            if (known >= extentBytes)
+            {
+                return;
+            }
+        }
+        else if (_indexExtents.Count >= MaxIndexExtents)
+        {
+            _indexExtents.Clear();
+        }
+
+        _indexExtents[IndexBaseAddress] = extentBytes;
     }
 
     internal void DispatchDirect(uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0) =>
@@ -135,7 +209,22 @@ public sealed partial class GpuCommandInterpreter
             throw _host.Fatal($"The indirect dispatch arguments base is zero: offset=0x{dataOffset:X}.");
         }
 
-        var argumentsAddress = DispatchIndirectArgumentsBase + dataOffset;
+        DispatchIndirectAt(DispatchIndirectArgumentsBase + dataOffset, dispatchInitiator);
+    }
+
+    private const uint DispatchInitiatorUseThreadDimensions = 1u << 5;
+
+    // Group counts written by an earlier shader are only in GPU memory; reading them
+    // here waits for the GPU. When the host dispatches indirectly they stay there.
+    // Thread-unit dispatches still need the counts to convert them to groups.
+    private void DispatchIndirectAt(ulong argumentsAddress, uint dispatchInitiator)
+    {
+        if (_host.ResolvesIndirectDispatchOnGpu && (dispatchInitiator & DispatchInitiatorUseThreadDimensions) == 0)
+        {
+            DispatchDirect(0, 0, 0, dispatchInitiator, argumentsAddress);
+            return;
+        }
+
         DispatchDirect(ReadDword(argumentsAddress), ReadDword(argumentsAddress + 4), ReadDword(argumentsAddress + 8), dispatchInitiator, argumentsAddress);
     }
 
@@ -271,7 +360,7 @@ public sealed partial class GpuCommandInterpreter
                 throw _host.Fatal($"The indirect dispatch arguments address is zero: address=0x{packet.PacketAddress:X16}.");
             }
 
-            DispatchDirect(ReadDword(argumentsAddress), ReadDword(argumentsAddress + 4), ReadDword(argumentsAddress + 8), payload[2], argumentsAddress);
+            DispatchIndirectAt(argumentsAddress, payload[2]);
             return 3;
         }
 

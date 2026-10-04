@@ -132,7 +132,7 @@ public sealed class Gen5DispatcherGuardTests
             spirv,
             "dispatcherBackedgeGuardLimit");
 
-        AssertDispatcherVulkanPath(spirv);
+        AssertStructuredLoopVulkanPath(spirv);
         Assert.Equal(2, stores.Count);
         Assert.Equal(2, StoresToNamedVariable(spirv, "dispatcherGuardHit").Count);
         AssertIncrementSelect(
@@ -156,9 +156,16 @@ public sealed class Gen5DispatcherGuardTests
             spirv,
             "dispatcherBackedgeGuardLimit");
 
-        AssertDispatcherVulkanPath(spirv);
+        AssertStructuredLoopVulkanPath(spirv);
         Assert.Equal(2, stores.Count);
         Assert.Equal(2, StoresToNamedVariable(spirv, "dispatcherGuardHit").Count);
+        AssertFunctionVariable(spirv, guard);
+        AssertFunctionVariable(
+            spirv,
+            Assert.Single(
+                new SpirvModuleInspector(spirv).Names,
+                pair => pair.Value == "dispatcherGuardHit").Key);
+        AssertNoZeroMemoryPointers(spirv);
         AssertIncrementSelect(
             instructions,
             guard,
@@ -272,6 +279,43 @@ public sealed class Gen5DispatcherGuardTests
         Assert.Contains(
             instructions,
             instruction => instruction.Opcode == SpirvOp.Switch);
+    }
+
+    private static void AssertStructuredLoopVulkanPath(byte[] spirv)
+    {
+        var instructions = ReadInstructions(spirv);
+        Assert.Contains(
+            instructions,
+            instruction => instruction.Opcode == SpirvOp.LoopMerge);
+        Assert.DoesNotContain(
+            instructions,
+            instruction => instruction.Opcode == SpirvOp.Switch);
+    }
+
+    private static void AssertFunctionVariable(byte[] spirv, uint variable)
+    {
+        var declaration = Assert.Single(
+            ReadInstructions(spirv),
+            instruction =>
+                instruction.Opcode == SpirvOp.Variable &&
+                instruction.Operands.Length >= 3 &&
+                instruction.Operands[1] == variable);
+        Assert.Equal(
+            (uint)SpirvStorageClass.Function,
+            declaration.Operands[2]);
+    }
+
+    private static void AssertNoZeroMemoryPointers(byte[] spirv)
+    {
+        Assert.DoesNotContain(
+            ReadInstructions(spirv),
+            instruction =>
+                (instruction.Opcode == SpirvOp.Load &&
+                 instruction.Operands.Length >= 3 &&
+                 instruction.Operands[2] == 0) ||
+                (instruction.Opcode == SpirvOp.Store &&
+                 instruction.Operands.Length >= 1 &&
+                 instruction.Operands[0] == 0));
     }
 
     private static void AssertWorkgroupBarriers(

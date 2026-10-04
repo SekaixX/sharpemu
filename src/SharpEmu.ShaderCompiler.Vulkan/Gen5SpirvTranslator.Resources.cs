@@ -121,8 +121,12 @@ public static partial class Gen5SpirvTranslator
             (ulong)Math.Max(request.LocalSizeX, 1) *
             Math.Max(request.LocalSizeY, 1) *
             Math.Max(request.LocalSizeZ, 1));
+        // A partial guest wave that fits in one physical subgroup never needs
+        // cross-half exchange. This includes one-lane GDS producer kernels.
+        var fitsOneHostSubgroup = localInvocationCount <= request.HostSubgroupSize;
         if (request.HostSubgroupSize == 32 &&
             blockers.Count != 0 &&
+            !fitsOneHostSubgroup &&
             localInvocationCount != 64)
         {
             error =
@@ -711,19 +715,20 @@ public static partial class Gen5SpirvTranslator
                 ImageComponentKind.Uint => _uintType,
                 _ => _floatType,
             };
+            // The image request builder binds guest 1D textures through 1D views,
+            // so the shader declaration must be 1D as well.
             var spirvDimension = dimension switch
             {
                 ImageDimension.Dim1D or ImageDimension.Dim1DArray => SpirvImageDim.Dim1D,
                 ImageDimension.Dim3D => SpirvImageDim.Dim3D,
                 _ => SpirvImageDim.Dim2D,
             };
-            var arrayed = dimension is ImageDimension.Dim1DArray or ImageDimension.Dim2DArray or ImageDimension.Dim2DMsaaArray;
-            var multisampled = dimension is ImageDimension.Dim2DMsaa or ImageDimension.Dim2DMsaaArray;
             if (spirvDimension == SpirvImageDim.Dim1D)
             {
                 _module.AddCapability(isStorage ? SpirvCapability.Image1D : SpirvCapability.Sampled1D);
             }
-
+            var arrayed = dimension is ImageDimension.Dim1DArray or ImageDimension.Dim2DArray or ImageDimension.Dim2DMsaaArray;
+            var multisampled = dimension is ImageDimension.Dim2DMsaa or ImageDimension.Dim2DMsaaArray;
             var format = atomic ? SpirvImageFormat.R32ui : SpirvImageFormat.Unknown;
             if (isStorage && !atomic)
             {
@@ -1322,16 +1327,44 @@ public static partial class Gen5SpirvTranslator
                 }
                 else if (entry.Kind == MemoryResourceKind.ScalarBuffer)
                 {
-                    if (entry.Resource == MemoryAccessInfo.NoResource)
+                    if (entry.Resource != MemoryAccessInfo.NoResource)
                     {
-                        error = "scalar buffer load has no dense buffer";
-                        return false;
+                        var bindingIndex = (int)entry.Resource;
+                        var byteAddress = IAdd(dynamicOffset, UInt(unchecked((uint)control.ImmediateOffsetBytes + (uint)component * sizeof(uint))));
+                        byteAddress = ApplyGuestBufferByteBias(bindingIndex, byteAddress);
+                        value = LoadBufferWord(bindingIndex, ShiftRightLogical(byteAddress, UInt(2)));
                     }
+                    else
+                    {
+                        // A runtime SRT V#: its SGPRs hold the descriptor, so build the
+                        // guest address from the base and go through the device-address
+                        // page table, bounded by the descriptor's stride and record count.
+                        if (instruction.Sources.Count == 0 || instruction.Sources[0].Kind != Gen5OperandKind.ScalarRegister)
+                        {
+                            error = "runtime scalar buffer load has no scalar base";
+                            return false;
+                        }
 
-                    var bindingIndex = (int)entry.Resource;
-                    var byteAddress = IAdd(dynamicOffset, UInt(unchecked((uint)control.ImmediateOffsetBytes + (uint)component * sizeof(uint))));
-                    byteAddress = ApplyGuestBufferByteBias(bindingIndex, byteAddress);
-                    value = LoadBufferWord(bindingIndex, ShiftRightLogical(byteAddress, UInt(2)));
+                        var baseRegister = instruction.Sources[0].Value;
+                        var descriptorWord1 = LoadS(baseRegister + 1);
+                        var stride = BitwiseAnd(ShiftRightLogical(descriptorWord1, UInt(16)), UInt(0x3FFF));
+                        var records = LoadS(baseRegister + 2);
+                        var size = _module.AddInstruction(
+                            SpirvOp.Select,
+                            _uintType,
+                            _module.AddInstruction(SpirvOp.IEqual, _boolType, stride, UInt(0)),
+                            records,
+                            _module.AddInstruction(SpirvOp.IMul, _uintType, stride, records));
+                        var baseAddress = Pair64(LoadS(baseRegister), BitwiseAnd(descriptorWord1, UInt(0xFFFF)));
+                        var byteOffset = IAdd(dynamicOffset, UInt(unchecked((uint)control.ImmediateOffsetBytes + (uint)component * sizeof(uint))));
+                        var address = And64(IAdd64(baseAddress, Widen(byteOffset)), ULong(DeviceAddressMask & ~3ul));
+                        var inRange = _module.AddInstruction(
+                            SpirvOp.ULessThan,
+                            _boolType,
+                            ShiftRightLogical(byteOffset, UInt(2)),
+                            ShiftRightLogical(size, UInt(2)));
+                        value = LoadBoundedDeviceDword(address, inRange);
+                    }
                 }
                 else
                 {
@@ -1391,6 +1424,11 @@ public static partial class Gen5SpirvTranslator
 
             address = IAdd64(address, SignedOffset64(control.OffsetBytes));
             var entry = request.Memory[memoryIndex];
+            if (control.UsesFlatAddress && entry.AddressSpace != FlatAddressSpace.Global)
+            {
+                return TryEmitFlatLocalMemory(instruction, control, memoryOpcode, entry.AddressSpace, address, out error);
+            }
+
             var writes = entry.Access is MemoryAccess.Write or MemoryAccess.Atomic;
             var accessBytes = Math.Max((entry.DataBits + 7) / 8, 1u) * Math.Max(entry.DataDwords, 1u);
             var allowed = writes ? IsWrittenAccessAllowed(memoryIndex, address, accessBytes) : _module.ConstantBool(true);
@@ -1472,6 +1510,241 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
+        // Routes each lane of an aperture-derived FLAT access like the hardware: LDS or
+        // scratch at the low dword when the high dword is in an aperture, otherwise a
+        // global access through the page table.
+        private bool TryEmitFlatLocalMemory(
+            Gen5ShaderInstruction instruction,
+            Gen5GlobalMemoryControl control,
+            string memoryOpcode,
+            FlatAddressSpace addressSpace,
+            uint address,
+            out string error)
+        {
+            error = string.Empty;
+            var store = memoryOpcode.StartsWith("GlobalStoreDword", StringComparison.Ordinal);
+            var load = memoryOpcode.StartsWith("GlobalLoadDword", StringComparison.Ordinal);
+            if (!store && !load)
+            {
+                error = $"{instruction.Opcode} through the {addressSpace} flat aperture is not implemented";
+                return false;
+            }
+
+            var canShare = addressSpace is FlatAddressSpace.Shared or FlatAddressSpace.SharedOrPrivate;
+            var canPrivate = addressSpace is FlatAddressSpace.Private or FlatAddressSpace.SharedOrPrivate;
+            if (canShare && _lds == 0)
+            {
+                error = "a shared flat aperture access has no LDS storage";
+                return false;
+            }
+
+            if (canPrivate && (_scratch == 0 || _scratchDwordCount == 0))
+            {
+                error = "a private flat aperture access has no scratch storage";
+                return false;
+            }
+
+            var offset = _module.AddInstruction(SpirvOp.UConvert, _uintType, address);
+            var aperture = _module.AddInstruction(
+                SpirvOp.UConvert,
+                _uintType,
+                ShiftRightLogical64(address, _module.Constant64(_ulongType, 32 + Gen5InlineConstants.ApertureShift)));
+            var isShared = _module.AddInstruction(SpirvOp.IEqual, _boolType, aperture,
+                UInt(Gen5InlineConstants.SharedApertureHigh >> Gen5InlineConstants.ApertureShift));
+            var isPrivate = _module.AddInstruction(SpirvOp.IEqual, _boolType, aperture,
+                UInt(Gen5InlineConstants.PrivateApertureHigh >> Gen5InlineConstants.ApertureShift));
+
+            void Shared()
+            {
+                for (uint index = 0; index < control.DwordCount; index++)
+                {
+                    var pointer = LdsPointer(offset, index * sizeof(uint));
+                    if (store)
+                        Store(pointer, LoadV(control.SourceVectorRegister + index));
+                    else
+                        StoreV(control.DestinationVectorRegister + index, Load(_uintType, pointer));
+                }
+            }
+
+            void Private()
+            {
+                for (uint index = 0; index < control.DwordCount; index++)
+                {
+                    var pointer = ScratchPointer(offset, index * sizeof(uint));
+                    if (store)
+                        Store(pointer, LoadV(control.SourceVectorRegister + index));
+                    else
+                        StoreV(control.DestinationVectorRegister + index, Load(_uintType, pointer));
+                }
+            }
+
+            void Global()
+            {
+                var aligned = And64(address, ULong(~3ul));
+                for (uint index = 0; index < control.DwordCount; index++)
+                {
+                    var dwordAddress = index == 0 ? aligned : IAdd64(aligned, ULong((ulong)index * sizeof(uint)));
+                    if (store)
+                        StoreDeviceDword(dwordAddress, LoadV(control.SourceVectorRegister + index), _module.ConstantBool(true));
+                    else
+                        StoreV(control.DestinationVectorRegister + index, LoadDeviceDword(dwordAddress));
+                }
+            }
+
+            // Inactive lanes must not touch any of the three storages.
+            EmitExecConditional(() =>
+            {
+                if (canShare && canPrivate)
+                    EmitConditional(isShared, Shared, () => EmitConditional(isPrivate, Private, Global));
+                else if (canShare)
+                    EmitConditional(isShared, Shared, Global);
+                else
+                    EmitConditional(isPrivate, Private, Global);
+            });
+            return true;
+        }
+
+        private bool TryEmitScratchMemory(
+            Gen5ShaderInstruction instruction,
+            Gen5GlobalMemoryControl control,
+            out string error)
+        {
+            error = string.Empty;
+            if (_scratch == 0 || _scratchDwordCount == 0)
+            {
+                error = "scratch storage was not declared";
+                return false;
+            }
+
+            var address = control.ScalarAddress < 125
+                ? LoadS(control.ScalarAddress)
+                : LoadV(control.VectorAddress);
+            if (control.DynamicOffsetRegister is { } dynamicOffsetRegister)
+            {
+                address = IAdd(address, LoadS(dynamicOffsetRegister));
+            }
+            if (control.OffsetBytes != 0)
+            {
+                address = IAdd(address, UInt(unchecked((uint)control.OffsetBytes)));
+            }
+
+            if (instruction.Opcode.StartsWith("ScratchStore", StringComparison.Ordinal))
+            {
+                EmitExecConditional(() =>
+                {
+                    if (TryGetSubdwordStoreInfo(instruction.Opcode, out var byteCount, out var sourceShift))
+                    {
+                        StoreScratchBytes(address, LoadV(control.SourceVectorRegister), byteCount, sourceShift);
+                        return;
+                    }
+
+                    for (uint index = 0; index < control.DwordCount; index++)
+                    {
+                        Store(
+                            ScratchPointer(address, index * sizeof(uint)),
+                            control.SourceIsScalar
+                                ? LoadS(control.SourceVectorRegister + index)
+                                : LoadV(control.SourceVectorRegister + index));
+                    }
+                });
+                return true;
+            }
+
+            if (!instruction.Opcode.StartsWith("ScratchLoad", StringComparison.Ordinal))
+            {
+                error = $"unsupported scratch opcode {instruction.Opcode}";
+                return false;
+            }
+
+            EmitExecConditional(() =>
+            {
+                if (TryGetSubdwordLoadInfo(instruction.Opcode, out var byteCount, out var signExtend, out var d16, out var d16High))
+                {
+                    var destination = control.DestinationVectorRegister;
+                    var value = LoadScratchBytes(address, byteCount, signExtend);
+                    if (d16)
+                    {
+                        value = d16High
+                            ? BitwiseOr(BitwiseAnd(LoadV(destination), UInt(0x0000_FFFF)), ShiftLeftLogical(BitwiseAnd(value, UInt(0xFFFF)), UInt(16)))
+                            : BitwiseOr(BitwiseAnd(LoadV(destination), UInt(0xFFFF_0000)), BitwiseAnd(value, UInt(0xFFFF)));
+                    }
+
+                    StoreV(destination, value);
+                    return;
+                }
+
+                for (uint index = 0; index < control.DwordCount; index++)
+                {
+                    StoreV(
+                        control.DestinationVectorRegister + index,
+                        Load(_uintType, ScratchPointer(address, index * sizeof(uint))));
+                }
+            });
+            return true;
+        }
+
+        private uint ScratchPointer(uint byteAddress, uint offsetBytes = 0)
+        {
+            var address = offsetBytes == 0
+                ? byteAddress
+                : IAdd(byteAddress, UInt(offsetBytes));
+            var dwordIndex = ShiftRightLogical(address, UInt(2));
+            if (_scratchDwordCount > 1)
+            {
+                dwordIndex = _module.AddInstruction(
+                    SpirvOp.UMod,
+                    _uintType,
+                    dwordIndex,
+                    UInt(_scratchDwordCount));
+            }
+
+            return _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _scratchElementPointer,
+                _scratch,
+                dwordIndex);
+        }
+
+        private uint LoadScratchBytes(uint byteAddress, uint byteCount, bool signExtend)
+        {
+            var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
+            var value = BitwiseAnd(
+                ShiftRightLogical(Load(_uintType, ScratchPointer(byteAddress)), shift),
+                UInt(byteCount == 1 ? 0xFFu : 0xFFFFu));
+            if (signExtend)
+            {
+                value = Bitcast(
+                    _uintType,
+                    _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, value),
+                        UInt(0),
+                        UInt(byteCount * 8)));
+            }
+
+            return value;
+        }
+
+        private void StoreScratchBytes(uint byteAddress, uint value, uint byteCount, uint sourceShift)
+        {
+            if (sourceShift != 0)
+            {
+                value = ShiftRightLogical(value, UInt(sourceShift));
+            }
+
+            var pointer = ScratchPointer(byteAddress);
+            var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
+            var elementMask = UInt(byteCount == 1 ? 0xFFu : 0xFFFFu);
+            var shiftedMask = ShiftLeftLogical(elementMask, shift);
+            var merged = BitwiseOr(
+                BitwiseAnd(
+                    Load(_uintType, pointer),
+                    _module.AddInstruction(SpirvOp.Not, _uintType, shiftedMask)),
+                ShiftLeftLogical(BitwiseAnd(value, elementMask), shift));
+            Store(pointer, merged);
+        }
+
         // ---- buffers ----
 
         private bool TryResolveLayoutBuffer(uint pc, out int bindingIndex, out BufferResource resource)
@@ -1493,6 +1766,160 @@ public static partial class Gen5SpirvTranslator
             bindingIndex = (int)entry.Resource;
             resource = request.Resources.Info.Buffers[bindingIndex];
             return true;
+        }
+
+        // BufferLoweringStrategy.PhysicalStorageBuffer: a raw buffer access whose
+        // V# was read from a runtime scalar address. The descriptor dwords live in
+        // the SGPRs named by the instruction, so build the guest address from the
+        // runtime base and go through the device-address page table.
+        // num_records/stride bound the access, so a null or empty descriptor binds
+        // nothing, matching the static path's range check. Formatted/typed/atomic
+        // accesses never reach here; the chooser escalates them to
+        // BoundedCandidateTable.
+        private bool TryEmitPhysicalStorageBufferMemory(
+            Gen5ShaderInstruction instruction,
+            Gen5BufferMemoryControl control,
+            out string error)
+        {
+            error = string.Empty;
+            if (control.Typed || instruction.Opcode.Contains("Format", StringComparison.Ordinal))
+            {
+                error = $"runtime buffer descriptor does not support the formatted access {instruction.Opcode}";
+                return false;
+            }
+
+            if (instruction.Opcode.StartsWith("BufferAtomic", StringComparison.Ordinal))
+            {
+                error = $"runtime buffer descriptor does not support the atomic access {instruction.Opcode}";
+                return false;
+            }
+
+            if (instruction.Sources.Count < 2 ||
+                instruction.Sources[1].Kind != Gen5OperandKind.ScalarRegister)
+            {
+                error = "runtime buffer descriptor has no scalar resource base";
+                return false;
+            }
+
+            var srsrc = instruction.Sources[1].Value;
+            var scalarOffset = instruction.Sources.Count > 2
+                ? GetRawSource(instruction, 2)
+                : UInt(0);
+            var vectorIndex = control.IndexEnabled ? LoadV(control.VectorAddress) : UInt(0);
+            var vectorOffset = control.OffsetEnabled
+                ? LoadV(control.VectorAddress + (control.IndexEnabled ? 1u : 0u))
+                : UInt(0);
+
+            var descriptorWord1 = LoadS(srsrc + 1);
+            var stride = BitwiseAnd(ShiftRightLogical(descriptorWord1, UInt(16)), UInt(0x3FFF));
+            var byteOffset = IAdd(UInt(unchecked((uint)control.OffsetBytes)), scalarOffset);
+            byteOffset = IAdd(byteOffset, vectorOffset);
+            byteOffset = IAdd(
+                byteOffset,
+                _module.AddInstruction(SpirvOp.IMul, _uintType, vectorIndex, stride));
+
+            // size = stride == 0 ? num_records : stride * num_records, in bytes.
+            var records = LoadS(srsrc + 2);
+            var size = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, stride, UInt(0)),
+                records,
+                _module.AddInstruction(SpirvOp.IMul, _uintType, stride, records));
+
+            var dwordOffset = ShiftRightLogical(byteOffset, UInt(2));
+            var dwordSize = ShiftRightLogical(size, UInt(2));
+            var baseAddress = Pair64(
+                LoadS(srsrc),
+                BitwiseAnd(descriptorWord1, UInt(0xFFFF)));
+            var address = IAdd64(baseAddress, Widen(byteOffset));
+
+            uint InRange(uint index)
+            {
+                var dword = index == 0 ? dwordOffset : IAdd(dwordOffset, UInt(index));
+                return _module.AddInstruction(SpirvOp.ULessThan, _boolType, dword, dwordSize);
+            }
+
+            if (instruction.Opcode.StartsWith("BufferStoreDword", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("BufferStoreByte", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("BufferStoreShort", StringComparison.Ordinal))
+            {
+                EmitExecConditional(() =>
+                {
+                    if (TryGetSubdwordStoreInfo(instruction.Opcode, out var byteCount, out var sourceShift))
+                    {
+                        StoreDeviceBytes(
+                            address,
+                            LoadV(control.VectorData),
+                            byteCount,
+                            sourceShift,
+                            InRange(0));
+                        return;
+                    }
+
+                    for (uint index = 0; index < control.DwordCount; index++)
+                    {
+                        StoreDeviceDword(
+                            index == 0 ? address : IAdd64(address, ULong((ulong)index * sizeof(uint))),
+                            LoadV(control.VectorData + index),
+                            InRange(index));
+                    }
+                });
+                return true;
+            }
+
+            if (TryGetSubdwordLoadInfo(
+                    instruction.Opcode,
+                    out var loadByteCount,
+                    out var signExtend,
+                    out var d16,
+                    out var d16High))
+            {
+                StoreV(
+                    control.VectorData,
+                    LoadSubdwordDeviceValue(
+                        address,
+                        LoadV(control.VectorData),
+                        loadByteCount,
+                        signExtend,
+                        d16,
+                        d16High));
+                return true;
+            }
+
+            if (!instruction.Opcode.StartsWith("BufferLoad", StringComparison.Ordinal) &&
+                !instruction.Opcode.StartsWith("TBufferLoad", StringComparison.Ordinal))
+            {
+                error = $"unsupported runtime buffer opcode {instruction.Opcode}";
+                return false;
+            }
+
+            for (uint index = 0; index < control.DwordCount; index++)
+            {
+                StoreV(
+                    control.VectorData + index,
+                    LoadBoundedDeviceDword(
+                        index == 0 ? address : IAdd64(address, ULong((ulong)index * sizeof(uint))),
+                        InRange(index)));
+            }
+
+            return true;
+        }
+
+        private uint LoadBoundedDeviceDword(uint address64, uint inRange)
+        {
+            var (pointer, valid) = ResolveDeviceAddress(address64);
+            Store(_deviceWordScratch, UInt(0));
+            EmitConditional(LogicalAnd(inRange, valid), () =>
+                Store(
+                    _deviceWordScratch,
+                    _module.AddInstruction(
+                        SpirvOp.Load,
+                        _uintType,
+                        DeviceWordPointer(pointer),
+                        2u,
+                        4u)));
+            return Load(_uintType, _deviceWordScratch);
         }
 
         // ---- images ----

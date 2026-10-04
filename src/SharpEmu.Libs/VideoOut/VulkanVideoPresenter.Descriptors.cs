@@ -305,6 +305,20 @@ internal static unsafe partial class VulkanVideoPresenter
                     FormatImageDescription(tracedImage.Description));
             }
             BindImage(imageIdentifier, storage);
+            if (ShouldTraceTextureBindings())
+            {
+                var cached = _imageCache.GetImage(imageIdentifier);
+                var description = cached.Description;
+                Console.Error.WriteLine(
+                    $"TextureBinding stage={program.Stage} hash=0x{program.Hash:X16} index={index} " +
+                    $"address=0x{descriptor.BaseAddress:X16} " +
+                    $"descriptor={descriptor.BaseAddress:X16} size={descriptor.Width + 1}x{descriptor.Height + 1} " +
+                    $"format={(uint)descriptor.Format} tile={(uint)descriptor.TileMode} " +
+                    $"image=0x{description.Data.Address:X16} size=0x{description.Data.Size:X} " +
+                    $"extent={description.Extent.Width}x{description.Extent.Height} pitch={description.Pitch} " +
+                    $"guestFormat={(uint)description.GuestFormat} imageTile={(uint)description.TileMode} " +
+                    $"backing={cached.Backing.Extent.Width}x{cached.Backing.Extent.Height} format={cached.Backing.Format}");
+            }
             return new TextureResource
             {
                 Address = descriptor.BaseAddress,
@@ -319,7 +333,31 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // Compare bits stay only on depth-compare samplers; a forced point sampler drops its filters.
-        private Sampler ResolveSampler(SamplerResource sampler, uint[] words, ShaderProgramInfo program, int index, ShaderStageResources stage)
+        // A sampler takes the numeric class of the views it samples; integer only when every
+        // paired view is integer, since a float view needs a float border and filtering.
+        private static bool SamplesIntegerViews(ShaderResourceInfo info, TextureResource[] images, int sampler)
+        {
+            var paired = false;
+            foreach (var pair in info.SampledPairs)
+            {
+                if (pair.Sampler != sampler || pair.Image >= images.Length || images[pair.Image].IsHostMovie)
+                {
+                    continue;
+                }
+
+                if (!ViewFormatRules.IsIntegerFormat(images[pair.Image].Request.View.Format))
+                {
+                    return false;
+                }
+
+                paired = true;
+            }
+
+            return paired;
+        }
+
+        private Sampler ResolveSampler(SamplerResource sampler, uint[] words, ShaderProgramInfo program, int index, ShaderStageResources stage,
+            bool integerView)
         {
             if (words.Length < 4)
             {
@@ -355,7 +393,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"user_data=[{string.Join(",", stage.Resources.UserData.Select(word => $"{word:X8}"))}]");
             }
 
-            return _samplerStore.GetSampler(descriptor);
+            return _samplerStore.GetSampler(descriptor, integerView);
         }
 
         // The guest textures the movie path matches; built only while a decoded frame is active.
@@ -418,7 +456,8 @@ internal static unsafe partial class VulkanVideoPresenter
             descriptors.Samplers = _stageSamplerArrays.Rent(info.Samplers.Count);
             for (var index = 0; index < info.Samplers.Count; index++)
             {
-                descriptors.Samplers[index] = ResolveSampler(info.Samplers[index], snapshot.Samplers[index], program, index, stage);
+                descriptors.Samplers[index] = ResolveSampler(info.Samplers[index], snapshot.Samplers[index], program, index, stage,
+                    SamplesIntegerViews(info, descriptors.Images, index));
             }
 
             var shaderData = _stageShaderDataArrays.Rent(checked((int)layout.ShaderDataDwordCount));
@@ -728,6 +767,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (range.Base >= PageOwnerTable.AddressSpaceSize || range.Size > PageOwnerTable.AddressSpaceSize - range.Base)
                 {
                     throw SubmissionScheduler.Fatal($"A device-address range is outside the cache: handle={range.Handle} base=0x{range.Base:X16} size=0x{range.Size:X} hash=0x{program.Hash:X16}.");
+                }
+
+                // Unmapped read-only pointers resolve to zero through the page table.
+                if (!range.Written && !_guestMemory.CanRead(range.Base, 1))
+                {
+                    continue;
                 }
 
                 var size = ClampMappedSize(range.Base, range.Size);
@@ -1170,6 +1215,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     DebugName = bindPoint == PipelineBindPoint.Compute ? "SharpEmu dispatch" : "SharpEmu draw",
                     Textures = textures,
                     TextureCount = textureCount,
+                    FeedbackSnapshots = preparation.FeedbackSnapshots?.ToArray() ?? [],
                     OverflowBuffers = preparation.OverflowBuffers.Count == 0 ? null : preparation.OverflowBuffers.ToArray(),
                 });
                 texturesTransferred = true;

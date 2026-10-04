@@ -71,6 +71,47 @@ public sealed class RenderExecutorDrawTests : IDisposable
         Assert.Contains("create_graphics_pipeline colors=1 depth=False topology=TriangleList restart=False", _pipelines.Calls);
     }
 
+    private const ulong IndirectArguments = RecordingRenderHost.MemoryBase + 0x60_0000;
+
+    private void WriteIndirectArguments(params uint[] words)
+    {
+        var bytes = new byte[words.Length * 4];
+        for (var i = 0; i < words.Length; i++)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(i * 4), words[i]);
+        }
+
+        _host.WriteGuest(IndirectArguments, bytes);
+    }
+
+    [Fact]
+    public void IndirectIndexedDraw_LetsTheGpuReadTheArguments()
+    {
+        _pipelines.Graphics = Programs(vertexBuffers: [new VertexInputBuffer(VertexBase, 16, 4)]);
+        var arguments = Indexed(40, source: DrawOffsetSource.IndirectArguments) with { IndirectArgumentsAddress = IndirectArguments };
+        _executor.DrawIndexed(7, Banks(), arguments);
+
+        AssertOrder(
+            "obtain 100500000 50 written=False",
+            "obtain 100600000 14 written=False",
+            "begin_rendering",
+            "bind_pipeline Graphics A1",
+            "draw_indexed_indirect",
+            "reset_bindings");
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("draw_indexed ", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void IndirectIndexedStrip_ReadsTheArgumentsOnTheCpu()
+    {
+        WriteIndirectArguments(6, 2, 4, 3, 1);
+        var arguments = Indexed(40, source: DrawOffsetSource.IndirectArguments) with { IndirectArgumentsAddress = IndirectArguments };
+        _executor.DrawIndexed(7, Banks(PrimitiveTriangleStrip), arguments);
+
+        AssertOrder("obtain 100500008 C written=False", "draw_indexed 6 2 0 3 1", "reset_bindings");
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("draw_indexed_indirect", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void AutoDraw_RecordsThePhasesAndTheVertexOffsets()
     {
@@ -196,7 +237,10 @@ public sealed class RenderExecutorDrawTests : IDisposable
     [InlineData(true)]
     public void ExperimentalUnregisteredLegacyFusedGeometryProgram_SkipsBeforeResolution(bool autoDraw)
     {
+        // A separate GS program address keeps this off the compact primitive-shader path,
+        // which draws an unregistered program whose GS address is zero.
         var banks = LegacyFusedGeometryBanks();
+        banks.Shader.Vertex.GeometryAddress = UnregisteredGeometryShader;
         var experimentalExecutor = new RenderExecutor(
             _host,
             _pipelines,
@@ -222,6 +266,7 @@ public sealed class RenderExecutorDrawTests : IDisposable
     public void ExperimentalFusedGeometryRegistration_IsAddressSpecific()
     {
         var banks = LegacyFusedGeometryBanks();
+        banks.Shader.Vertex.GeometryAddress = UnregisteredGeometryShader;
         _pipelines.FusedGraphicsPrograms.Add(VertexShader + 0x1000);
         var experimentalExecutor = new RenderExecutor(
             _host,
@@ -272,6 +317,37 @@ public sealed class RenderExecutorDrawTests : IDisposable
         Assert.Contains(_host.Calls, call => call.StartsWith("draw_indexed ", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public void RegisteredMergedGeometryProgram_WithoutMeshSupportAndNoGeometryAddressSkips()
+    {
+        var banks = LegacyFusedGeometryBanks();
+        banks.Shader.Vertex.GeometryAddress = 0;
+        _pipelines.FusedGraphicsPrograms.Add(VertexShader);
+        _pipelines.FusedGeometrySupported = false;
+
+        _executor.DrawIndexed(1, banks, Indexed(3));
+
+        Assert.Equal([VertexShader], _pipelines.FusedGraphicsProgramQueries);
+        Assert.Empty(_pipelines.Calls);
+        Assert.DoesNotContain(_host.Calls, call => call.StartsWith("draw", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void RegisteredMergedGeometryProgram_WithInvalidStateAndNoGeometryAddressSkips()
+    {
+        var banks = LegacyFusedGeometryBanks();
+        banks.Shader.Vertex.GeometryAddress = 0;
+        banks.Context.ShaderInterface.GeometryMaxVerticesOut = 0;
+        banks.Context.ShaderInterface.MaxOutputPerSubgroup = 0x40;
+        _pipelines.FusedGraphicsPrograms.Add(VertexShader);
+
+        _executor.DrawIndexed(1, banks, Indexed(3));
+
+        Assert.Equal([VertexShader], _pipelines.FusedGraphicsProgramQueries);
+        Assert.Empty(_pipelines.Calls);
+        Assert.DoesNotContain(_host.Calls, call => call.StartsWith("draw", StringComparison.Ordinal));
+    }
+
     [Theory]
     [InlineData(0x00002020u)]
     [InlineData(0x00002031u)]
@@ -316,6 +392,8 @@ public sealed class RenderExecutorDrawTests : IDisposable
         Assert.DoesNotContain(_host.Calls, call => call.StartsWith("draw", StringComparison.Ordinal));
     }
 
+    private const ulong UnregisteredGeometryShader = 0x5000;
+
     private static RegisterBanks LegacyFusedGeometryBanks()
     {
         var banks = Banks();
@@ -329,15 +407,32 @@ public sealed class RenderExecutorDrawTests : IDisposable
     }
 
     [Theory]
-    [InlineData(0u)]
-    [InlineData(1u)]
-    public void PrimitiveShaderVertexPath_WithDefaultGeometryStateDraws(uint subgroupControl)
+    [InlineData(0x02002000u, 0u)]
+    [InlineData(0x02002000u, 1u)]
+    [InlineData(0x00002000u, 0u)]
+    [InlineData(0x00002000u, 1u)]
+    public void PrimitiveShaderVertexPath_WithDefaultGeometryStateDraws(uint stageMask, uint subgroupControl)
     {
         var banks = Banks();
-        banks.Context.ShaderStages = 0x02002000;
+        banks.Context.ShaderStages = stageMask;
         banks.Shader.Vertex.GeometryAddress = 0x3000;
         banks.Context.ShaderInterface.PrimitiveShaderSubgroupControl = subgroupControl;
         banks.Context.ShaderInterface.MaxOutputPerSubgroup = 0x40;
+        _executor.DrawIndexed(1, banks, Indexed(3));
+
+        Assert.Contains(_host.Calls, c => c.StartsWith("draw_indexed", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void PrimitiveShaderVertexPath_WithFixedNggStateAndNoGeometryShaderDraws()
+    {
+        var banks = Banks();
+        banks.Context.ShaderStages = 0x00002030;
+        banks.Context.ShaderInterface.PrimitiveShaderSubgroupControl = 1;
+        banks.Context.ShaderInterface.MaxOutputPerSubgroup = 0xC0;
+        banks.Context.ShaderInterface.GeometryMaxVerticesOut = 3;
+        banks.Context.ShaderInterface.GeometryOutputPrimitiveType = 2;
+
         _executor.DrawIndexed(1, banks, Indexed(3));
 
         Assert.Contains(_host.Calls, c => c.StartsWith("draw_indexed", StringComparison.Ordinal));
@@ -461,6 +556,40 @@ public sealed class RenderExecutorDrawTests : IDisposable
             "prepare_bindings Mesh",
             "prepare_device_addresses");
         Assert.Contains("draw_mesh_tasks 1 1 1", _host.Calls);
+    }
+
+    [Fact]
+    public void IndirectIndexedMeshDraw_ResolvesCountsBeforeBuildingMeshWork()
+    {
+        _pipelines.Graphics.VertexInput.Mesh = new MeshInputInfo
+        {
+            InputPrimitive = GuestPrimitiveType.TriangleList,
+            PrimitivesPerGroup = 2,
+            VerticesPerGroup = 6,
+            MaxVertices = 6,
+            MaxPrimitives = 2,
+            OutputPrimitive = 2,
+            ThreadsX = 64,
+        };
+        _pipelines.Graphics.VertexInput.Stage = Stage(
+            Program(ShaderStageKind.Mesh, usesDeviceAddresses: true));
+        WriteIndirectArguments(6, 3, 4, 7, 2);
+        var arguments = Indexed(40, source: DrawOffsetSource.IndirectArguments) with
+        {
+            IndirectArgumentsAddress = IndirectArguments,
+        };
+
+        _executor.DrawIndexed(1, Banks(), arguments);
+
+        Assert.Equal(1, _host.GuestReads);
+        Assert.Equal(
+            [6u, 7u, 2u, 2u, (uint)(IndexBase + 8), (uint)((IndexBase + 8) >> 32)],
+            _host.LastMeshDrawData);
+        Assert.Contains($"register_device_address_range {IndexBase + 8:X} C", _host.Calls);
+        Assert.Contains("draw_mesh_tasks 1 3 1", _host.Calls);
+        Assert.DoesNotContain(
+            _host.Calls,
+            call => call.StartsWith("draw_indexed_indirect", StringComparison.Ordinal));
     }
 
     [Fact]

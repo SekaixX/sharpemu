@@ -556,6 +556,20 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        // RenderExecutor records indirect workgroup dispatches with vkCmdDispatchIndirect.
+        // SHARPEMU_CPU_INDIRECT_DISPATCH=1 reads the counts back on the CPU as before.
+        public bool ResolvesIndirectDispatchOnGpu => !_cpuIndirectDispatch;
+
+        // RenderExecutor records indexed indirect draws with vkCmdDrawIndexedIndirect.
+        // SHARPEMU_CPU_INDIRECT_DRAW=1 reads the arguments back on the CPU as before.
+        public bool ResolvesIndirectDrawOnGpu => !_cpuIndirectDraw;
+
+        private static readonly bool _cpuIndirectDraw = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_CPU_INDIRECT_DRAW"), "1", StringComparison.Ordinal);
+
+        private static readonly bool _cpuIndirectDispatch = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_CPU_INDIRECT_DISPATCH"), "1", StringComparison.Ordinal);
+
         public void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
         {
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDispatchTranslation);
@@ -647,7 +661,7 @@ internal static unsafe partial class VulkanVideoPresenter
             try
             {
                 var surface = new DisplaySurfaceWords(
-                    displayBuffer.Address, 0, displayBuffer.PixelFormat, displayBuffer.Width, displayBuffer.Height, displayBuffer.TilingMode, 0, 0, 0, false);
+                    displayBuffer.Address, 0, displayBuffer.PixelFormat, displayBuffer.Width, displayBuffer.Height, displayBuffer.TilingMode, displayBuffer.Option, 0, 0, false);
                 var request = ImageRequestBuilders.DisplaySurface(surface);
                 _ = BeginBatchedGuestCommands();
                 var imageIdentifier = _imageCache.FindImage(ref request);

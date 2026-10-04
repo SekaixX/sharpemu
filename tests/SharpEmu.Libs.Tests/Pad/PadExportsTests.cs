@@ -502,6 +502,68 @@ public sealed class PadExportsTests : IDisposable
     }
 
     [Fact]
+    public void PadReadState_InvalidatesCurrentThreadCacheAfterCrossThreadFocusLoss()
+    {
+        const ulong outputAddress = Base + 0x100;
+        HostWindowInput.Connect();
+        try
+        {
+            PadExports.ResetForTests();
+            InitializePad();
+            var handle = OpenPad();
+            _ctx[CpuRegister.Rdi] = unchecked((ulong)handle);
+            _ctx[CpuRegister.Rsi] = outputAddress;
+
+            // Populate this thread's cache with pressed input. Pinning its
+            // timestamp after the worker notification makes the one-millisecond
+            // cache window deterministic instead of relying on scheduler timing.
+            HostWindowInput.SetKey(0x28, true);
+            Assert.Equal(0, PadExports.PadReadState(_ctx));
+            var worker = new Thread(() => HostWindowInput.SetFocused(false));
+            worker.Start();
+            Assert.True(worker.Join(TimeSpan.FromSeconds(5)));
+            typeof(PadExports)
+                .GetField(
+                    "_lastInputSampleTicks",
+                    System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.Static)!
+                .SetValue(null, long.MaxValue);
+
+            Assert.Equal(0, PadExports.PadReadState(_ctx));
+            Span<byte> buttons = stackalloc byte[4];
+            Assert.True(_memory.TryRead(outputAddress, buttons));
+            Assert.Equal(0u, BitConverter.ToUInt32(buttons));
+        }
+        finally
+        {
+            HostWindowInput.Disconnect();
+            PadExports.ResetForTests();
+        }
+    }
+
+    [Fact]
+    public void ResetRuntimeState_StartsTheNextGuestWithAFreshPadSession()
+    {
+        InitializePad();
+        var oldHandle = OpenPad();
+        _ctx[CpuRegister.Rdi] = unchecked((ulong)oldHandle);
+        _ctx[CpuRegister.Rsi] = 1;
+        Assert.Equal(0, PadExports.PadSetAngularVelocityDeadbandState(_ctx));
+
+        PadExports.ResetRuntimeState();
+
+        Assert.Equal(NotInitialized, GetPadHandle());
+        _ctx[CpuRegister.Rdi] = unchecked((ulong)oldHandle);
+        Assert.Equal(InvalidHandle, PadExports.PadResetOrientation(_ctx));
+
+        InitializePad();
+        var newHandle = OpenPad();
+        Assert.Equal(1, newHandle);
+        Assert.True(PadExports.TryGetAngularVelocityDeadbandStateForTests(newHandle, out var enabled));
+        Assert.False(enabled);
+    }
+
+    [Fact]
     public void ResetOrientation_RequiresAnOpenHandle()
     {
         InitializePad();
@@ -569,6 +631,24 @@ public sealed class PadExportsTests : IDisposable
         {
             Assert.Equal(0, value);
         }
+
+        Span<byte> guard = stackalloc byte[8];
+        Assert.True(_memory.TryRead(cookieAddress, guard));
+        Assert.Equal(cookie, BitConverter.ToUInt64(guard));
+    }
+
+    [Fact]
+    public void GetExtControllerInformation_DoesNotOverwriteCallerCookie()
+    {
+        const ulong informationAddress = Base + 0x100;
+        const ulong cookieAddress = informationAddress + 0x30;
+        const ulong cookie = 0xC0DEC0DECAFEBA00UL;
+
+        Assert.True(_memory.TryWrite(cookieAddress, BitConverter.GetBytes(cookie)));
+        _ctx[CpuRegister.Rdi] = 1;
+        _ctx[CpuRegister.Rsi] = informationAddress;
+
+        Assert.Equal(0, PadExports.PadGetExtControllerInformation(_ctx));
 
         Span<byte> guard = stackalloc byte[8];
         Assert.True(_memory.TryRead(cookieAddress, guard));
@@ -734,5 +814,33 @@ public sealed class PadExportsTests : IDisposable
     {
         _ctx[CpuRegister.Rdi] = unchecked((ulong)handle);
         return PadExports.PadClose(_ctx);
+    }
+
+    [NativeX64Fact]
+    public void ReadState_RejectsHandleZeroOnceAPadIsOpen()
+    {
+        const ulong dataAddress = Base + 0x200;
+        try
+        {
+            PadExports.PadInit(_ctx);
+            _ctx[CpuRegister.Rdi] = 0x10000000;
+            _ctx[CpuRegister.Rsi] = 0;
+            _ctx[CpuRegister.Rdx] = 0;
+            _ctx[CpuRegister.Rcx] = 0;
+            var handle = PadExports.PadOpen(_ctx);
+            Assert.True(handle > 0);
+
+            _ctx[CpuRegister.Rdi] = 0;
+            _ctx[CpuRegister.Rsi] = dataAddress;
+            Assert.Equal(InvalidHandle, PadExports.PadReadState(_ctx));
+
+            _ctx[CpuRegister.Rdi] = unchecked((ulong)handle);
+            _ctx[CpuRegister.Rsi] = dataAddress;
+            Assert.Equal(0, PadExports.PadReadState(_ctx));
+        }
+        finally
+        {
+            PadExports.ResetOpenedPadForTests();
+        }
     }
 }

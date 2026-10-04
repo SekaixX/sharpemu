@@ -246,9 +246,14 @@ public sealed class GuestSpaceOwner : IDisposable
 
     public bool TryReadBacking(ulong address, Span<byte> data) => _views.TryReadBacking(address, data);
 
+    // Reads through a view that covers the whole range without any lock; false otherwise.
+    public bool TryReadSingleView(ulong address, Span<byte> data) => _views.TryReadSingleView(address, data);
+
     public bool TryCopyBacking(ulong destination, ulong source, ulong size) => _views.TryCopyBacking(destination, source, size);
 
     public bool IsBacked(ulong address, ulong size) => _views.Contains(address, size);
+
+    public bool IsBackedWithoutLock(ulong address, ulong size) => _views.ContainsWithoutLock(address, size);
 
     public bool IsRestoredView(ulong address) => _views.IsRestoredView(address);
 

@@ -117,7 +117,7 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
 
     // One float2 position program and one solid red pixel program over empty resource plans.
     private sealed class FixedProgramProvider(IShaderPipelineHost host, ulong vertexAddress, bool pushData = false,
-        byte[]? interpolationShader = null) : IShaderPipelineProvider
+        byte[]? interpolationShader = null, uint vertexCount = VertexCount) : IShaderPipelineProvider
     {
         private const uint Float2Format = 64;
         private static readonly uint[] UserRegisters = [0, 1];
@@ -165,7 +165,8 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
             ContextRegisters context,
             UserConfigRegisters userConfig,
             ReadOnlySpan<ColorComponentMap> targetExportMapping,
-            bool pixelActive)
+            bool pixelActive,
+            bool depthBound)
         {
             EnsureModules();
             return new()
@@ -174,8 +175,8 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
                 Pixel = _pixelProgram,
                 VertexInput = new VertexInputInfo
                 {
-                    Buffers = [new VertexInputBuffer(vertexAddress, VertexStride, VertexCount)],
-                    Attributes = [new VertexAttributeResource(new BufferDescriptorWords((uint)vertexAddress, (uint)(vertexAddress >> 32) | (VertexStride << 16), VertexCount, Float2Format << 12), 0, 2, 0, 0, 0, 0)],
+                    Buffers = [new VertexInputBuffer(vertexAddress, VertexStride, vertexCount)],
+                    Attributes = [new VertexAttributeResource(new BufferDescriptorWords((uint)vertexAddress, (uint)(vertexAddress >> 32) | (VertexStride << 16), vertexCount, Float2Format << 12), 0, 2, 0, 0, 0, 0)],
                     Stage = new ShaderStageResources(_vertex, _snapshot),
                 },
                 PixelInput = new PixelInputInfo { InputCount = 0, Stage = new ShaderStageResources(_pixel, _snapshot) },
@@ -662,6 +663,104 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
         }
 
         harness.Shutdown();
+    }
+
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(1, 0)]
+    [InlineData(2, 0)]
+    [InlineData(3, 0)]
+    [InlineData(0, 1)]
+    [InlineData(1, 1)]
+    [InlineData(2, 1)]
+    [InlineData(3, 1)]
+    [InlineData(0, 2)]
+    [InlineData(1, 2)]
+    [InlineData(2, 2)]
+    [InlineData(3, 2)]
+    public void RectangleList_ThreeCornersCoverTheRectangleWithoutFetchingAFourthVertex(int omittedCorner, int drawKind)
+    {
+        if (!Ready()) return;
+        if (!_vulkan.SupportsFillRectangle)
+        {
+            Assert.False(GatePrerequisites.DeviceRequired, "The required device lacks VK_NV_fill_rectangle.");
+            return;
+        }
+
+        using var presenter = new PresenterUnderTest(_vulkan);
+        presenter.LoadRenderingCommands();
+        var harness = presenter.Harness;
+        var target = harness.MapBacked(0x10000, ReadWrite);
+        var vertices = harness.MapBacked(0x10000, ReadWrite);
+        var words = RegisterWords.Color(target, Size, Size);
+        (float X, float Y)[] corners = [(-1, -1), (1, -1), (-1, 1), (1, 1)];
+        var supplied = corners.Where((_, index) => index != omittedCorner).ToArray();
+        harness.Write(vertices, Triangle(supplied[0].X, supplied[0].Y,
+            supplied[1].X, supplied[1].Y, supplied[2].X, supplied[2].Y));
+        // Unrelated data immediately after the three guest vertices must not become a corner.
+        harness.Write(vertices + VertexCount * VertexStride, Triangle(3.0556f, -1, 0, 0, 0, 0));
+        var banks = Banks(words);
+        banks.UserConfig.PrimitiveType = 7;
+        banks.Context.ShaderInterface.GeometryOutputPrimitiveType = 3;
+        var executor = new RenderExecutor(presenter.RenderHost,
+            new FixedProgramProvider((IShaderPipelineHost)presenter.Instance, vertices));
+        if (drawKind != 0)
+        {
+            var indices = harness.MapBacked(0x10000, ReadWrite);
+            harness.Write(indices, Bytes((ushort)0, (ushort)1, (ushort)2));
+            var indirectArguments = drawKind == 2 ? harness.MapBacked(0x10000, ReadWrite) : 0;
+            if (indirectArguments != 0)
+                harness.Write(indirectArguments, Bytes(3u, 1u, 0u, 0u, 0u));
+            presenter.Run(() => executor.DrawIndexed(1, banks,
+                new DrawIndexedArguments(0, 0, VertexCount, indices, 0, 1, 0, 0, DrawOffsetSource.Packet,
+                    IndirectArgumentsAddress: indirectArguments)));
+        }
+        else
+        {
+            presenter.Run(() => executor.DrawAuto(1, banks, Draw()));
+        }
+
+        presenter.Run(() => presenter.InvokeMethod("FlushBatchedGuestCommands"));
+        harness.Finish();
+        var pixels = harness.ReadImageBytes(TargetImage(presenter, words));
+        Assert.Equal((int)(Size * Size), Enumerable.Range(0, (int)(Size * Size))
+            .Count(index => BitConverter.ToUInt32(pixels, index * 4) == Red));
+        harness.Shutdown();
+        _vulkan.AssertNoValidationMessages();
+    }
+
+    [Fact]
+    public void RectangleList_TwoRectanglesUseThreeVerticesEach()
+    {
+        if (!Ready()) return;
+        if (!_vulkan.SupportsFillRectangle)
+        {
+            Assert.False(GatePrerequisites.DeviceRequired, "The required device lacks VK_NV_fill_rectangle.");
+            return;
+        }
+
+        using var presenter = new PresenterUnderTest(_vulkan);
+        presenter.LoadRenderingCommands();
+        var harness = presenter.Harness;
+        var target = harness.MapBacked(0x10000, ReadWrite);
+        var vertices = harness.MapBacked(0x10000, ReadWrite);
+        var words = RegisterWords.Color(target, Size, Size);
+        harness.Write(vertices, Triangle(-1, -1, 0, -1, -1, 1));
+        harness.Write(vertices + VertexCount * VertexStride, Triangle(0, -1, 1, -1, 0, 1));
+        var banks = Banks(words);
+        banks.UserConfig.PrimitiveType = 7;
+        banks.Context.ShaderInterface.GeometryOutputPrimitiveType = 3;
+        var executor = new RenderExecutor(presenter.RenderHost,
+            new FixedProgramProvider((IShaderPipelineHost)presenter.Instance, vertices, vertexCount: 6));
+        presenter.Run(() => executor.DrawAuto(1, banks,
+            new DrawAutoArguments(0, 0, 6, 1, 0, 0, DrawOffsetSource.Packet)));
+        presenter.Run(() => presenter.InvokeMethod("FlushBatchedGuestCommands"));
+        harness.Finish();
+        var pixels = harness.ReadImageBytes(TargetImage(presenter, words));
+        Assert.Equal((int)(Size * Size), Enumerable.Range(0, (int)(Size * Size))
+            .Count(index => BitConverter.ToUInt32(pixels, index * 4) == Red));
+        harness.Shutdown();
+        _vulkan.AssertNoValidationMessages();
     }
 
     [Fact]

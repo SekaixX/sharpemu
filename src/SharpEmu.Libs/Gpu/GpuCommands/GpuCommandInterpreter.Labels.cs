@@ -252,6 +252,23 @@ public sealed partial class GpuCommandInterpreter
             GdsWordOffset: wordOffset, GdsWordCount: wordCount));
     }
 
+    // Release-memory completions stay in the recording command buffer instead of
+    // submitting it at every packet: labels are already written to guest memory,
+    // only the interrupt waits for the GPU, and RunSlice submits the buffer when
+    // the slice ends or blocks, so every deferred interrupt still reaches the GPU.
+    // Submitting per packet produced ~430 tiny submissions per Astro Bot frame.
+    // SHARPEMU_DEFER_RELEASE_FLUSH=0 restores the per-packet submit.
+    private static readonly bool DeferReleaseFlush = !string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_DEFER_RELEASE_FLUSH"), "0", StringComparison.Ordinal);
+
+    private void FlushReleaseMemory()
+    {
+        if (!DeferReleaseFlush)
+        {
+            _host.Flush();
+        }
+    }
+
     internal void QueueInterrupt(uint interruptContextId) =>
         _host.RecordEndOfPipe(new EndOfPipeWrite(EndOfPipeWriteKind.InterruptOnly, SubmitId, EventId: InterruptEventId, ContextId: interruptContextId));
 
@@ -319,10 +336,7 @@ public sealed partial class GpuCommandInterpreter
         if (dataSelection == 1)
         {
             WriteEndOfPipe(false, cachePolicy, 0, 0x2F, cacheAction, 6, 2, destination, (uint)value, interruptSelector, interruptContextId);
-            // A CPU waiter can consume this label without an interrupt. Submit
-            // all preceding work for every selector, matching the known-good
-            // Unity forward-progress behavior.
-            _host.Flush();
+            FlushReleaseMemory();
             return;
         }
 
@@ -336,7 +350,7 @@ public sealed partial class GpuCommandInterpreter
             WriteEndOfPipe(false, cachePolicy, 0, 0x2F, cacheAction, 6, 1, destination, (uint)value, interruptSelector, interruptContextId);
             if (interruptSelector == 1)
             {
-                _host.Flush();
+                FlushReleaseMemory();
             }
 
             return;
@@ -366,7 +380,7 @@ public sealed partial class GpuCommandInterpreter
             case 2:
             case 4:
                 QueueInterrupt(interruptContextId);
-                _host.Flush();
+                FlushReleaseMemory();
                 return;
             default:
                 throw _host.Fatal($"The release-memory interrupt selector is unknown: selector={interruptSelector}.");

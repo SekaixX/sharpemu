@@ -198,6 +198,53 @@ public sealed class ScalarValueGraphTests
     }
 
     [Fact]
+    public void DescriptorPickedByUniformBranch_IsASelect()
+    {
+        // if (s4 != 0) s8 = 9; with s8 = 7 before: the join is a select on the runtime flag.
+        var program = Program(
+            MoveScalar(0, 8, 7),
+            Sopc(4, "SCmpLgU32", Gen5Operand.Scalar(4), Operand(0)),
+            Branch(8, "SCbranchScc0", 1),
+            MoveScalar(12, 8, 9),
+            MoveScalar(16, 9, 0),
+            MoveScalar(20, 10, 16),
+            MoveScalar(24, 11, 0),
+            BufferLoad(28, 8),
+            EndProgram(36));
+        var plan = Extract(program, userDataCount: 8);
+        var userData = new uint[8];
+
+        Assert.True(RuntimeValueEvaluator.EvaluateDescriptorSource(plan, plan.Info.Buffers[0].Source, Inputs(userData), out var result));
+        Assert.Equal(7u, result.Dwords[0]);
+        userData[4] = 1;
+        Assert.True(RuntimeValueEvaluator.EvaluateDescriptorSource(plan, plan.Info.Buffers[0].Source, Inputs(userData), out result));
+        Assert.Equal(9u, result.Dwords[0]);
+    }
+
+    [Fact]
+    public void DescriptorReloadedInsideLoop_SharesOneSampler()
+    {
+        // The table pointer in s[0:1] reaches the loop body through phis that only merge
+        // the entry value with themselves; the reloads must stay the same descriptor.
+        var program = Program(
+            ScalarLoad(0, 0, destination: 16, count: 8),
+            ScalarLoad(8, 0, destination: 8, count: 4, immediateOffset: 0x80),
+            Image(16, "ImageSampleLz", 16, 8),
+            MoveScalar(24, 24, 0),
+            ScalarLoad(32, 0, destination: 16, count: 8),
+            ScalarLoad(40, 0, destination: 8, count: 4, immediateOffset: 0x80),
+            Image(48, "ImageSampleLz", 16, 8),
+            Sop2(56, "SAddI32", 24, Gen5Operand.Scalar(24), Operand(1)),
+            Sopc(64, "SCmpLgU32", Gen5Operand.Scalar(24), Operand(4)),
+            Branch(72, "SCbranchScc1", -11),
+            EndProgram(76));
+        var plan = Extract(program, userDataCount: 2);
+
+        Assert.Single(plan.Info.Samplers);
+        Assert.Single(plan.Info.Images);
+    }
+
+    [Fact]
     public void ControlDependentStandaloneLoadStaysExplicit()
     {
         var program = Program(
@@ -358,6 +405,37 @@ public sealed class ScalarValueGraphTests
     {
         var error = Assert.Throws<ResourcePlanException>(() => Extract(Program(BufferLoad(0, 20), EndProgram(8)), userDataCount: 16));
         Assert.Contains("not a valid runtime value", error.Message);
+    }
+
+    [Fact]
+    public void BitwiseMaskCanResolveUndefinedDescriptorBits()
+    {
+        var plan = Extract(Program(
+            Sop2(0, "SAndB32", 0, Gen5Operand.Scalar(20), Operand(0)),
+            MoveScalar(4, 1, 0),
+            MoveScalar(8, 2, 0),
+            MoveScalar(12, 3, 0),
+            BufferLoad(16, 0),
+            EndProgram(24)), userDataCount: 0);
+
+        Assert.True(RuntimeValueEvaluator.EvaluateDescriptorSource(plan, plan.Info.Buffers[0].Source, Inputs([]), out var descriptor));
+        Assert.Equal([0u, 0u, 0u, 0u], descriptor.Dwords);
+    }
+
+    [Fact]
+    public void DirectExecutionMaskWriteKeepsBranchConditionDefined()
+    {
+        var program = Program(
+            MoveScalar(0, 126, 0),
+            Branch(4, "SCbranchExecz", 0),
+            EndProgram(8));
+
+        var graph = ScalarValueGraph.Build(program, 0, 0);
+
+        Assert.True(graph.BranchConditions.TryGetValue(4, out var condition));
+        Assert.False(condition.IsUndefined);
+        Assert.True(condition.IsConstant);
+        Assert.Equal(1u, condition.ConstantU32);
     }
 
     // ---- Requirement A: lane provenance and uniform vector values ----

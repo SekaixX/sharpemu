@@ -164,7 +164,16 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
 
     uint IShaderPipelineHost.ComputeSubgroupSize => 64;
 
+    // MSL keeps the guest workgroup dimensions and IDs in logical XYZ order.
+    ComputeWorkgroupAxisMapping IShaderPipelineHost.ResolveComputeWorkgroupAxisMapping(
+        uint threadsX,
+        uint threadsY,
+        uint threadsZ) => ComputeWorkgroupAxisMapping.Identity;
+
     bool IShaderPipelineHost.GraphicsSubgroupOperationsEnabled => true;
+
+    // Metal has no 64-bit workgroup atomics here; keep the non-atomic 32-bit pair.
+    bool IShaderPipelineHost.SharedInt64AtomicsEnabled => false;
 
     RenderHostLimits IShaderPipelineHost.Limits => new(MaxDimension, MaxDimension, MaxDimension, MaxDimension);
 
@@ -175,6 +184,9 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
     bool IShaderPipelineHost.TryReadGuestWord(ulong address, out uint word) => TryReadWord(address, out word);
 
     bool IShaderPipelineHost.TryReadCleanGuestWord(ulong address, out uint word) => TryReadWord(address, out word);
+
+    bool IShaderPipelineHost.TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean) =>
+        Memory.TryRead(address, destination);
 
     private bool TryReadWord(ulong address, out uint word)
     {

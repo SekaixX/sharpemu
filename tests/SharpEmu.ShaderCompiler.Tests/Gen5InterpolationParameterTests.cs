@@ -146,9 +146,106 @@ public sealed class Gen5InterpolationParameterTests
         Assert.Contains("Pull-model interpolation", error);
     }
 
+    [Fact]
+    public void ProvokingVertexMove_UsesAFlatInputWithoutPerVertexSupport()
+    {
+        var request = Request(2, false, inputCntl: 0x1, supportsPerVertex: false);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        Assert.DoesNotContain(instructions, instruction => instruction.Opcode == SpirvOp.Capability &&
+            instruction.Operands[0] == (uint)SpirvCapability.FragmentBarycentricKhr);
+        Assert.DoesNotContain(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.PerVertexKhr);
+        var input = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.Location).Operands[0];
+        Assert.Contains(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[0] == input && instruction.Operands[1] == (uint)SpirvDecoration.Flat);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
+    [InlineData(0u)]
+    [InlineData(1u)]
+    public void VertexDifferenceMove_FallsBackToInterpolatedInputWithoutPerVertexSupport(uint selector)
+    {
+        var request = Request(selector, false, inputCntl: 0x1, supportsPerVertex: false);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        Assert.DoesNotContain(instructions, instruction => instruction.Opcode == SpirvOp.Capability &&
+            instruction.Operands[0] == (uint)SpirvCapability.FragmentBarycentricKhr);
+        Assert.DoesNotContain(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.PerVertexKhr);
+        Assert.DoesNotContain(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.Flat);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Fact]
+    public void SlotsReadingOneParameter_ShareOneInput()
+    {
+        // PS slots 1 and 2 both read VS parameter 1; the second slot must not move to a
+        // location the vertex program never writes.
+        Gen5ShaderInstruction Move(uint pc, uint attribute, uint destination) =>
+            new(pc, Gen5ShaderEncoding.Vintrp, "VInterpMovF32",
+                [1], [Gen5Operand.Vector(1)], [Gen5Operand.Vector(destination)], new Gen5InterpolationControl(attribute, 0));
+        var program = ResourceTestProgram.Program(Move(0, 1, 4), Move(4, 2, 5), ResourceTestProgram.EndProgram(8));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Pixel, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            PixelInputAddress = 2,
+            PixelInputEnable = 2,
+            PixelInputCntl = [0, 0x1, 0x1],
+            PixelCustomInterpolationMask = 6,
+            SupportsPerVertexPixelInputs = true,
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var input = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.PerVertexKhr).Operands[0];
+        var location = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[0] == input && instruction.Operands[1] == (uint)SpirvDecoration.Location);
+        Assert.Equal(1u, location.Operands[2]);
+        Assert.Equal(2, instructions.Count(instruction => instruction.Opcode == SpirvOp.AccessChain &&
+            instruction.Operands[2] == input));
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Fact]
+    public void SmoothSlotSharingAPerVertexParameter_InterpolatesThePerVertexInput()
+    {
+        // Slot 1 is read per vertex, slot 2 interpolates the same VS parameter: one per-vertex
+        // input serves both, and slot 2 is rebuilt from the vertices with the barycentrics.
+        var move = new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Vintrp, "VInterpMovF32",
+            [1], [Gen5Operand.Vector(1)], [Gen5Operand.Vector(4)], new Gen5InterpolationControl(1, 0));
+        var smooth = new Gen5ShaderInstruction(4, Gen5ShaderEncoding.Vintrp, "VInterpP2F32",
+            [0], [Gen5Operand.Vector(1)], [Gen5Operand.Vector(5)], new Gen5InterpolationControl(2, 0));
+        var program = ResourceTestProgram.Program(move, smooth, ResourceTestProgram.EndProgram(8));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Pixel, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            PixelInputAddress = 2,
+            PixelInputEnable = 2,
+            PixelInputCntl = [0, 0x1, 0x1],
+            PixelCustomInterpolationMask = 2,
+            SupportsPerVertexPixelInputs = true,
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var input = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.PerVertexKhr).Operands[0];
+        var inputLocations = instructions.Where(instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.Location && instruction.Operands[0] == input).ToArray();
+        Assert.Equal(1u, Assert.Single(inputLocations).Operands[2]);
+        Assert.Contains(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn && instruction.Operands[2] == (uint)SpirvBuiltIn.BaryCoordKhr);
+        Assert.Equal(4, instructions.Count(instruction => instruction.Opcode == SpirvOp.AccessChain &&
+            instruction.Operands[2] == input));
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
     private static ShaderCompileRequest Request(
         uint selector, bool custom, uint inputs = 2, string opcode = "VInterpMovF32",
-        bool noPerspective = false, bool flat = true)
+        bool noPerspective = false, bool flat = true, uint inputCntl = 0x401, bool supportsPerVertex = true)
     {
         var interpolation = new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Vintrp, opcode,
             [selector], [Gen5Operand.Vector(selector)], [Gen5Operand.Vector(4)], new Gen5InterpolationControl(1, 2));
@@ -158,8 +255,9 @@ public sealed class Gen5InterpolationParameterTests
         {
             PixelInputAddress = inputs | (noPerspective ? 0x20u : 0u),
             PixelInputEnable = inputs | (noPerspective ? 0x20u : 0u),
-            PixelInputCntl = [0, flat ? 0x401u : 1u],
+            PixelInputCntl = [0, flat ? inputCntl : inputCntl & ~0x400u],
             PixelCustomInterpolationMask = custom ? 2u : 0u,
+            SupportsPerVertexPixelInputs = supportsPerVertex,
         };
     }
 

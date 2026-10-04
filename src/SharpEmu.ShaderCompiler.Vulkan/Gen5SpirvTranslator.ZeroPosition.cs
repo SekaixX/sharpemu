@@ -7,7 +7,7 @@ public static partial class Gen5SpirvTranslator
 {
     private sealed partial class CompilationContext
     {
-        // Kyty reserves one clip-distance plane for vertices whose homogeneous
+        // Reserve one clip-distance plane for vertices whose homogeneous
         // position is exactly (0, 0, 0, 0). Such a position would otherwise
         // reach rasterization and trigger an undefined 0/0 perspective divide
         // on some Vulkan drivers (notably NVIDIA).

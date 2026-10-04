@@ -73,6 +73,112 @@ public sealed class KernelMemoryCompatExportsTests
         Assert.Equal(expected, KernelMemoryCompatExports.FormatStringFromVarArgs(context, format, 3));
     }
 
+    [Theory]
+    [InlineData("a/b/c.xml", '/', 1, 3)]
+    [InlineData("a/b/c.xml", '.', 5, 5)]
+    [InlineData("a/b/c.xml", 'z', -1, -1)]
+    [InlineData("a/b/c.xml", '\0', 9, 9)]
+    [InlineData("", 'a', -1, -1)]
+    public void StrchrStrrchr_MatchNativeLibc(string text, char needle, int firstIndex, int lastIndex)
+    {
+        const ulong address = GuestMemoryBase + 0x100;
+        var memory = new FakeCpuMemory(GuestMemoryBase, 0x1000);
+        memory.WriteCString(address, text);
+
+        Assert.Equal(ExpectedMatch(address, firstIndex), ScanString(memory, address, needle, last: false));
+        Assert.Equal(ExpectedMatch(address, lastIndex), ScanString(memory, address, needle, last: true));
+    }
+
+    [Fact]
+    public void StrchrStrrchr_ScanAcrossPagesAndPastChunkSize()
+    {
+        // Starts just before a page boundary and runs well past one 4 KiB chunk.
+        const ulong address = GuestMemoryBase + 0xFF0;
+        var text = "<" + new string('x', 6000) + ">" + new string('y', 100) + ">";
+        var memory = new FakeCpuMemory(GuestMemoryBase, 0x3000);
+        memory.WriteCString(address, text);
+
+        Assert.Equal(address + 6001, ScanString(memory, address, '>', last: false));
+        Assert.Equal(address + (ulong)text.Length - 1, ScanString(memory, address, '>', last: true));
+        Assert.Equal(address + (ulong)text.Length, ScanString(memory, address, '\0', last: false));
+    }
+
+    [Fact]
+    public void StrchrStrrchr_StringEndingAtEndOfMappedMemory()
+    {
+        // The first chunk would read past the mapping, so the byte-wise fallback
+        // must still find the terminator that lies inside it.
+        var memory = new FakeCpuMemory(GuestMemoryBase, 0x1000);
+        const ulong address = GuestMemoryBase + 0x1000 - 6;
+        memory.WriteCString(address, "a/b/c");
+
+        Assert.Equal(address + 1, ScanString(memory, address, '/', last: false));
+        Assert.Equal(address + 3, ScanString(memory, address, '/', last: true));
+    }
+
+    [Fact]
+    public void StrchrStrrchr_UnterminatedStringAtEndOfMemoryFaults()
+    {
+        var memory = new FakeCpuMemory(GuestMemoryBase, 0x1000);
+        const ulong address = GuestMemoryBase + 0x1000 - 4;
+        Assert.True(memory.TryWrite(address, "abcd"u8));
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = address;
+        context[CpuRegister.Rsi] = 'z';
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, KernelMemoryCompatExports.Strchr(context));
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, KernelMemoryCompatExports.Strrchr(context));
+    }
+
+    [Fact]
+    public void StrchrStrrchr_ScanMappedMemoryInPlace()
+    {
+        using var memory = new PhysicalVirtualMemory();
+        Assert.True(memory.TryAllocateGuestMemory(0x4000, 0x1000, out var baseAddress));
+
+        // Crosses a page boundary and runs past one 4 KiB page.
+        var address = baseAddress + 0xFF0;
+        var text = "<" + new string('x', 6000) + ">" + new string('y', 100) + ">";
+        Assert.True(memory.TryWrite(address, Encoding.ASCII.GetBytes(text + "\0")));
+
+        Assert.True(memory.TryScanCString(address, (byte)'>', findLast: false, 1_048_576, out var first));
+        Assert.Equal(address + 6001, first);
+        Assert.True(memory.TryScanCString(address, (byte)'>', findLast: true, 1_048_576, out var last));
+        Assert.Equal(address + (ulong)text.Length - 1, last);
+        Assert.True(memory.TryScanCString(address, 0, findLast: true, 1_048_576, out var terminator));
+        Assert.Equal(address + (ulong)text.Length, terminator);
+        Assert.True(memory.TryScanCString(address, (byte)'z', findLast: false, 1_048_576, out var missing));
+        Assert.Equal(0UL, missing);
+
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = address;
+        context[CpuRegister.Rsi] = '>';
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, KernelMemoryCompatExports.Strrchr(context));
+        Assert.Equal(address + (ulong)text.Length - 1, context[CpuRegister.Rax]);
+    }
+
+    [Fact]
+    public void StrchrStrrchr_UnmappedMemoryIsNotScannedInPlace()
+    {
+        using var memory = new PhysicalVirtualMemory();
+        Assert.False(memory.TryScanCString(0x7_0000_0000, (byte)'a', findLast: false, 1_048_576, out _));
+    }
+
+    private static ulong ExpectedMatch(ulong address, int index) =>
+        index < 0 ? 0 : address + (ulong)index;
+
+    private static ulong ScanString(FakeCpuMemory memory, ulong address, char needle, bool last)
+    {
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = address;
+        context[CpuRegister.Rsi] = needle;
+        var result = last
+            ? KernelMemoryCompatExports.Strrchr(context)
+            : KernelMemoryCompatExports.Strchr(context);
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        return context[CpuRegister.Rax];
+    }
+
     [Fact]
     public void PosixStat_MissingFileReturnsMinusOne()
     {

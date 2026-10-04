@@ -62,10 +62,10 @@ public sealed class GpuMemoryAccessProfileTests
     public void FaultMeasurementDoesNotAllocateAfterInitialization()
     {
         GpuMemoryAccessProfile.Initialize();
-        for (var index = 0; index < 100; index++) MeasureFault();
-        var before = GC.GetAllocatedBytesForCurrentThread();
-        for (var index = 0; index < 1000; index++) MeasureFault();
-        Assert.Equal(before, GC.GetAllocatedBytesForCurrentThread());
+        var allocated = AllocationMeasurement.SteadyState(
+            () => { for (var index = 0; index < 100; index++) MeasureFault(); },
+            () => { for (var index = 0; index < 1000; index++) MeasureFault(); });
+        Assert.Equal(0, allocated);
     }
 
     [Fact]

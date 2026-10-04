@@ -631,6 +631,61 @@ public sealed class Gen5SharedMemoryBarrierTests
         Assert.Contains("requires exactly one 64-lane guest wave", error, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void BlockedSubgroup32Wave64_AllowsSingleLaneGdsAppend()
+    {
+        var program = ResourceTestProgram.Program(
+            ResourceTestProgram.DataShare(
+                0,
+                "DsAppend",
+                gds: true,
+                [Gen5Operand.Scalar(124)],
+                [0]),
+            ResourceTestProgram.EndProgram(8));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(
+            program,
+            userDataCount: 0,
+            waveSize: 64);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            WaveSize = 64,
+            HostSubgroupSize = 32,
+            LocalSizeX = 1,
+        };
+
+        Assert.True(
+            Gen5SpirvTranslator.TryCompileProgram(
+                request,
+                out var shader,
+                out var error),
+            error);
+
+        var opcodes = new List<SpirvOp>();
+        uint[]? localSize = null;
+        for (var offset = 20; offset < shader.Spirv.Length;)
+        {
+            var instruction = BinaryPrimitives.ReadUInt32LittleEndian(
+                shader.Spirv.AsSpan(offset));
+            var wordCount = checked((int)(instruction >> 16));
+            var opcode = (SpirvOp)(instruction & 0xFFFF);
+            uint Operand(int index) => BinaryPrimitives.ReadUInt32LittleEndian(
+                shader.Spirv.AsSpan(offset + index * sizeof(uint)));
+            opcodes.Add(opcode);
+            if (opcode == SpirvOp.ExecutionMode &&
+                Operand(2) == (uint)SpirvExecutionMode.LocalSize)
+            {
+                localSize = [Operand(3), Operand(4), Operand(5)];
+            }
+
+            offset += wordCount * sizeof(uint);
+        }
+
+        Assert.Contains(SpirvOp.AtomicIAdd, opcodes);
+        Assert.DoesNotContain(SpirvOp.ControlBarrier, opcodes);
+        Assert.NotNull(localSize);
+        Assert.Equal([1u, 1u, 1u], localSize);
+    }
+
     [Theory]
     [InlineData(32u)]
     [InlineData(64u)]

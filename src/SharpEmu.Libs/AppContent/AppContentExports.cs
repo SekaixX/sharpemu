@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.Libs.Kernel;
 using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
@@ -139,7 +140,7 @@ public static class AppContentExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        Directory.CreateDirectory(ResolveTemp0Root());
+        Directory.CreateDirectory(KernelMemoryCompatExports.ResolveTemp0Root());
         var mountPointBytes = Encoding.ASCII.GetBytes($"{Temp0MountPoint}\0");
         if (!ctx.Memory.TryWrite(mountPointAddress, mountPointBytes))
         {
@@ -191,7 +192,7 @@ public static class AppContentExports
     {
         try
         {
-            var storageRoot = ResolveTemp0Root();
+            var storageRoot = KernelMemoryCompatExports.ResolveTemp0Root();
             Directory.CreateDirectory(storageRoot);
             var volumeRoot = Path.GetPathRoot(Path.GetFullPath(storageRoot));
             if (!string.IsNullOrWhiteSpace(volumeRoot))
@@ -268,28 +269,4 @@ public static class AppContentExports
         Console.Error.WriteLine($"[LOADER][TRACE] app_content.{message}");
     }
 
-    private static string ResolveTemp0Root()
-    {
-        const string temp0VariableName = "SHARPEMU_TEMP0_DIR";
-        var configuredRoot = Environment.GetEnvironmentVariable(temp0VariableName);
-        if (!string.IsNullOrWhiteSpace(configuredRoot))
-        {
-            return Path.GetFullPath(configuredRoot);
-        }
-
-        var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
-        var appName = string.IsNullOrWhiteSpace(app0Root)
-            ? "default"
-            : Path.GetFileName(Path.TrimEndingDirectorySeparator(app0Root));
-        if (string.IsNullOrWhiteSpace(appName))
-        {
-            appName = "default";
-        }
-
-        var invalidChars = Path.GetInvalidFileNameChars();
-        appName = new string(appName.Select(ch => invalidChars.Contains(ch) ? '_' : ch).ToArray());
-        var root = Path.Combine(AppContext.BaseDirectory, "user", "temp", appName, "temp0");
-        Environment.SetEnvironmentVariable(temp0VariableName, root);
-        return root;
-    }
 }

@@ -5245,7 +5245,7 @@ public static partial class KernelMemoryCompatExports
         return root;
     }
 
-    private static string ResolveTemp0Root()
+    internal static string ResolveTemp0Root()
     {
         const string temp0VariableName = "SHARPEMU_TEMP0_DIR";
         var configuredRoot = Environment.GetEnvironmentVariable(temp0VariableName);
@@ -5267,7 +5267,7 @@ public static partial class KernelMemoryCompatExports
 
             var invalidChars = Path.GetInvalidFileNameChars();
             appName = new string(appName.Select(ch => invalidChars.Contains(ch) ? '_' : ch).ToArray());
-            root = Path.Combine(AppContext.BaseDirectory, "user", "temp", appName, "temp0");
+            root = Path.Combine(Path.GetTempPath(), "SharpEmu", "temp0", appName, Path.GetRandomFileName());
             Environment.SetEnvironmentVariable(temp0VariableName, root);
         }
 
@@ -7047,7 +7047,7 @@ public static partial class KernelMemoryCompatExports
 
     private static int KernelGetdirentriesCore(CpuContext ctx, int fd, ulong bufferAddress, int requested, ulong basePointerAddress)
     {
-        if (fd < 0 || bufferAddress == 0 || requested < 512)
+        if (fd < 0 || bufferAddress == 0 || requested < 12)
         {
             ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
@@ -7088,27 +7088,41 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        var entryName = directory.Entries[currentIndex];
-        directory.NextIndex = currentIndex + 1;
+        var payload = new byte[Math.Min(requested, 65536)];
+        var written = 0;
+        while (currentIndex < directory.Entries.Length)
+        {
+            var entryName = directory.Entries[currentIndex];
+            var entryBytes = Encoding.UTF8.GetBytes(entryName);
+            var nameLength = Math.Min(entryBytes.Length, 255);
+            var recordLength = (8 + nameLength + 1 + 3) & ~3;
+            if (recordLength > payload.Length - written)
+            {
+                if (written == 0)
+                {
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+                }
 
-        var entryBytes = Encoding.UTF8.GetBytes(entryName);
-        var nameLength = Math.Min(entryBytes.Length, 255);
-        var entryPath = Path.Combine(directory.Path, entryName);
-        var entryType = Directory.Exists(entryPath) ? (byte)4 : (byte)8;
+                break;
+            }
 
-        var payload = new byte[512];
-        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, sizeof(uint)), ComputeDirectoryEntryHash(entryBytes.AsSpan(0, nameLength)));
-        BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(4, sizeof(ushort)), 512);
-        payload[6] = entryType;
-        payload[7] = unchecked((byte)nameLength);
-        entryBytes.AsSpan(0, nameLength).CopyTo(payload.AsSpan(8));
+            var record = payload.AsSpan(written, recordLength);
+            BinaryPrimitives.WriteUInt32LittleEndian(record, ComputeDirectoryEntryHash(entryBytes.AsSpan(0, nameLength)));
+            BinaryPrimitives.WriteUInt16LittleEndian(record[4..], unchecked((ushort)recordLength));
+            record[6] = Directory.Exists(Path.Combine(directory.Path, entryName)) ? (byte)4 : (byte)8;
+            record[7] = unchecked((byte)nameLength);
+            entryBytes.AsSpan(0, nameLength).CopyTo(record[8..]);
+            written += recordLength;
+            currentIndex++;
+        }
 
-        if (!TryWriteCompat(ctx, bufferAddress, payload))
+        if (!TryWriteCompat(ctx, bufferAddress, payload.AsSpan(0, written)))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        ctx[CpuRegister.Rax] = 512;
+        directory.NextIndex = currentIndex;
+        ctx[CpuRegister.Rax] = unchecked((ulong)written);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -7500,18 +7514,108 @@ public static partial class KernelMemoryCompatExports
 
         // The terminator counts as part of the scanned range, so strchr(s, '\0')
         // returns a pointer to the string's null byte just like a native libc.
+        if (!TryScanCString(ctx, address, needle, findLast: false, out var match))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = match;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [ThreadStatic]
+    private static byte[]? _cStringScanChunk;
+
+    // strchr/strrchr run hundreds of thousands of times per second in Astro
+    // Bot's XML loader. Mapped guest memory is searched in place; otherwise
+    // page-bounded chunks are copied out and searched with the vectorised span
+    // helpers. A chunk that cannot be read whole is rescanned byte by byte, so
+    // a string ending just before an unmapped byte behaves as before.
+    private static bool TryScanCString(CpuContext ctx, ulong address, byte needle, bool findLast, out ulong match)
+    {
+        const int pageSize = 4096;
+        const int firstChunkSize = 256;
+        const ulong scanLimit = 1_048_576;
+        if (ctx.Memory.TryScanCString(address, needle, findLast, scanLimit, out match))
+        {
+            return true;
+        }
+
+        match = 0;
+        Span<byte> firstChunk = stackalloc byte[firstChunkSize];
+        ulong offset = 0;
+        while (offset < scanLimit)
+        {
+            var current = address + offset;
+            var pageRemaining = pageSize - (int)(current & (pageSize - 1));
+            var length = (int)Math.Min((ulong)Math.Min(pageRemaining, offset == 0 ? firstChunkSize : pageSize), scanLimit - offset);
+            var chunk = offset == 0
+                ? firstChunk[..length]
+                : (_cStringScanChunk ??= new byte[pageSize]).AsSpan(0, length);
+            if (!TryReadCompat(ctx, current, chunk))
+            {
+                return TryScanCStringBytewise(ctx, current, needle, findLast, scanLimit - offset, ref match);
+            }
+
+            if (!findLast)
+            {
+                var stop = chunk.IndexOfAny(needle, (byte)0);
+                if (stop >= 0)
+                {
+                    match = chunk[stop] == needle ? current + (ulong)stop : 0;
+                    return true;
+                }
+
+                offset += (ulong)length;
+                continue;
+            }
+
+            var nulIndex = chunk.IndexOf((byte)0);
+            var searched = nulIndex >= 0 ? chunk[..(nulIndex + 1)] : chunk;
+            var found = findLast ? searched.LastIndexOf(needle) : searched.IndexOf(needle);
+            if (found >= 0)
+            {
+                match = current + (ulong)found;
+                if (!findLast)
+                {
+                    return true;
+                }
+            }
+
+            if (nulIndex >= 0)
+            {
+                return true;
+            }
+
+            offset += (ulong)length;
+        }
+
+        return true;
+    }
+
+    private static bool TryScanCStringBytewise(
+        CpuContext ctx,
+        ulong address,
+        byte needle,
+        bool findLast,
+        ulong remaining,
+        ref ulong match)
+    {
         Span<byte> current = stackalloc byte[1];
-        for (ulong index = 0; index < 1_048_576; index++)
+        for (ulong index = 0; index < remaining; index++)
         {
             if (!TryReadCompat(ctx, address + index, current))
             {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                return false;
             }
 
             if (current[0] == needle)
             {
-                ctx[CpuRegister.Rax] = address + index;
-                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                match = address + index;
+                if (!findLast)
+                {
+                    return true;
+                }
             }
 
             if (current[0] == 0)
@@ -7520,8 +7624,7 @@ public static partial class KernelMemoryCompatExports
             }
         }
 
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return true;
     }
 
     [SysAbiExport(
@@ -7538,29 +7641,12 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        ulong match = 0;
-        var found = false;
-        Span<byte> current = stackalloc byte[1];
-        for (ulong index = 0; index < 1_048_576; index++)
+        if (!TryScanCString(ctx, address, needle, findLast: true, out var match))
         {
-            if (!TryReadCompat(ctx, address + index, current))
-            {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-            }
-
-            if (current[0] == needle)
-            {
-                match = address + index;
-                found = true;
-            }
-
-            if (current[0] == 0)
-            {
-                break;
-            }
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        ctx[CpuRegister.Rax] = found ? match : 0;
+        ctx[CpuRegister.Rax] = match;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 

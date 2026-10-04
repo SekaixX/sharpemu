@@ -3,6 +3,7 @@
 
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.ShaderCompiler;
+using SharpEmu.ShaderCompiler.Resources;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.Tests.Gpu.Scheduling;
 using SharpEmu.Libs.Tests.Gpu.Vulkan;
@@ -16,6 +17,25 @@ namespace SharpEmu.Libs.Tests.Gpu.Images;
 public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixture>
 {
     private const ulong Base = 0x1_0000_0000;
+
+    [Fact]
+    public void EightBitUnsignedScaledTextureUsesUnormBackingWithShaderConversion()
+    {
+        Assert.Equal(ImageNumericClass.Float, GuestImageFormat.SampledNumericClass(GuestImageFormat.Format8Uscaled));
+        Assert.Equal(1u, GuestImageFormat.Remap(GuestImageFormat.Format8Uscaled));
+
+        var request = ImageRequestBuilders.Texture(
+            RegisterWords.Texture(Base, GuestPixelFormat.Bits8UScaled, 32, 32),
+            new ShaderImageShape(false, false, false, false, TextureNumericClass.Float));
+        Assert.Equal(Format.R8Unorm, request.Request.Description.PixelFormat);
+        Assert.True(request.ExactFormat);
+
+        var twoChannel = ImageRequestBuilders.Texture(
+            RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8UScaled, 32, 32),
+            new ShaderImageShape(false, false, false, false, TextureNumericClass.Float));
+        Assert.Equal(Format.R8G8Unorm, twoChannel.Request.Description.PixelFormat);
+        Assert.True(twoChannel.ExactFormat);
+    }
 
     [Fact]
     public void StorageWithoutMipOperandUsesOnlyTheBaseMip()
@@ -320,6 +340,25 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.Equal(0u, request.View.BaseLayer);
         Assert.Equal(4u, request.View.LayerCount);
         Assert.Equal(4 * 16384UL, resolution.Value.BackingSize);
+    }
+
+    [Fact]
+    public void ColorTarget_VolumeAcceptsExclusiveSliceMax()
+    {
+        var words = RegisterWords.Color(
+            Base,
+            64,
+            64,
+            GuestTileMode.Standard4KB,
+            sliceMax: 64,
+            dimension: 2,
+            depth: 63);
+
+        var resolution = ImageRequestBuilders.ColorTarget(words, 0xF, 0, false);
+
+        Assert.NotNull(resolution);
+        Assert.Equal(64u, resolution.Value.Request.View.LayerCount);
+        Assert.Equal(64u, resolution.Value.Request.Description.Extent.Depth);
     }
 
     [Fact]
@@ -668,6 +707,22 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.Equal(ImageUsageFlags.TransferSrcBit, request.View.Usage);
     }
 
+    [Theory]
+    [InlineData(0x8100070422000000UL, Format.A2B10G10R10UnormPack32, 8UL)]
+    [InlineData(0x8100070400000000UL, Format.A2R10G10B10UnormPack32, 40UL)]
+    [InlineData(0x8100000622000000UL, Format.A2B10G10R10UnormPack32, 32UL)]
+    [InlineData(0x8100000600000000UL, Format.A2R10G10B10UnormPack32, 0UL)]
+    public void DisplaySurface_Packed10BitFormatsPreserveEncodedValues(ulong pixelFormat, Format expectedFormat, ulong option)
+    {
+        var surface = new DisplaySurfaceWords(Base, 0, pixelFormat, 3840, 2160, 0, option, 0, 0, false);
+        var request = ImageRequestBuilders.DisplaySurface(surface);
+        Assert.Equal(expectedFormat, request.Description.PixelFormat);
+        Assert.Equal(GuestPixelFormat.Bits10_10_10_2UNorm, request.Description.GuestFormat);
+        Assert.Equal(4u, request.Description.BytesPerBlock);
+        Assert.Equal(expectedFormat, request.View.Format);
+        Assert.True(DisplayFormatRule.Supports(request.Description));
+    }
+
     [Fact]
     public void DisplaySurface_RejectsUnsupportedAttributes()
     {
@@ -675,7 +730,8 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.Throws<SchedulerFatalException>(() => ImageRequestBuilders.DisplaySurface(new DisplaySurfaceWords(Base, 0, 0x8000000022000000, 1920, 1080, 1, 0, 0, 0, false)));
         Assert.Throws<SchedulerFatalException>(() => ImageRequestBuilders.DisplaySurface(new DisplaySurfaceWords(Base, 0, 0x1234, 1920, 1080, 0, 0, 0, 0, false)));
         Assert.Throws<SchedulerFatalException>(() => ImageRequestBuilders.DisplaySurface(new DisplaySurfaceWords(Base, 0, 0x8000000022000000, 0, 1080, 0, 0, 0, 0, false)));
-        Assert.Equal(3, fatal.Messages.Count);
+        Assert.Throws<SchedulerFatalException>(() => ImageRequestBuilders.DisplaySurface(new DisplaySurfaceWords(Base, 0, 0x8100070422000000, 1920, 1080, 0, 1, 0, 0, false)));
+        Assert.Equal(4, fatal.Messages.Count);
     }
 
     private readonly record struct GuestSpanCheck(ulong Address, ulong Size);

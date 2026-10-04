@@ -16,12 +16,12 @@ public sealed class GuestMemoryStateCollection
 }
 
 [Collection(GuestMemoryStateCollection.Name)]
-public sealed unsafe class SharedBackingViewsTests
+public sealed class SharedBackingViewsTests
 {
     private static byte[] Pattern(int length, byte value) => Enumerable.Repeat(value, length).ToArray();
 
     [Fact]
-    public void SingleMappingReadsDoNotAllocateTemporarySegments()
+    public unsafe void SingleMappingReadsDoNotAllocateTemporarySegments()
     {
         if (!Supported) return;
         var host = HostViewMemory.Create();
@@ -33,20 +33,20 @@ public sealed unsafe class SharedBackingViewsTests
         try
         {
             *(ulong*)(baseAddress + Segment - 8) = Marker;
-            Span<byte> bytes = stackalloc byte[8];
-            for (var index = 0; index < 256; index++)
-                Assert.True(store.TryReadBacking(baseAddress + Segment - 8, bytes));
-
-            var initialAllocation = GC.GetAllocatedBytesForCurrentThread();
+            var bytes = new byte[8];
             var succeeded = true;
-            for (var index = 0; index < 1024; index++)
-                succeeded &= store.TryReadBacking(baseAddress + Segment - 8, bytes);
-            var allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - initialAllocation;
+            void ReadMarker(int count)
+            {
+                for (var index = 0; index < count; index++)
+                    succeeded &= store.TryReadBacking(baseAddress + Segment - 8, bytes);
+            }
+
+            var allocatedBytes = AllocationMeasurement.SteadyState(() => ReadMarker(256), () => ReadMarker(1024));
 
             Assert.True(succeeded);
             Assert.Equal(Marker, System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(bytes));
             Assert.Equal(0L, allocatedBytes);
-            bytes.Fill(0xA5);
+            bytes.AsSpan().Fill(0xA5);
             Assert.False(store.TryReadBacking(baseAddress + Segment - 4, bytes));
             Assert.True(bytes.SequenceEqual(new byte[] { 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5 }));
         }
@@ -108,7 +108,7 @@ public sealed unsafe class SharedBackingViewsTests
     }
 
     [Fact]
-    public void CopyInAndOut_ShareBytesWithTheView()
+    public unsafe void CopyInAndOut_ShareBytesWithTheView()
     {
         if (!Supported)
         {
@@ -137,7 +137,7 @@ public sealed unsafe class SharedBackingViewsTests
     }
 
     [Fact]
-    public void TwoViewsOfOneOffset_ShareBytesAndTheSecondSurvives()
+    public unsafe void TwoViewsOfOneOffset_ShareBytesAndTheSecondSurvives()
     {
         if (!Supported)
         {
@@ -159,6 +159,8 @@ public sealed unsafe class SharedBackingViewsTests
         Assert.True(store.Unmap(first, Segment, out _));
         Assert.False(store.Contains(first, Segment));
         Assert.True(store.Contains(second, Segment));
+        Assert.False(store.ContainsWithoutLock(first, Segment));
+        Assert.True(store.ContainsWithoutLock(second, Segment));
         Assert.Equal(Marker, *(ulong*)second);
 
         Assert.True(store.Unmap(second, Segment, out _));
@@ -168,8 +170,64 @@ public sealed unsafe class SharedBackingViewsTests
         Assert.True(host.FreeHole(second, hole));
     }
 
+    // Single-view transfers run without the lock against a snapshot of the views; they
+    // must stay exact on a stable view and fail or succeed cleanly on a view that is
+    // being unmapped and remapped at the same time.
     [Fact]
-    public void Transfers_WorkWhileTheViewIsNoAccessOrReadOnly()
+    public async Task LockFreeTransfers_StayConsistentWhileOtherViewsChange()
+    {
+        if (!Supported)
+        {
+            return;
+        }
+
+        var host = HostViewMemory.Create();
+        using var store = new SharedBackingViews(host, BackingSize);
+        var hole = HoleSize(host);
+        var stable = ReserveFreeHole(host, hole);
+        var churn = ReserveFreeHole(host, hole);
+        Assert.True(host.SplitHole(stable, Segment));
+        Assert.True(host.SplitHole(churn, Segment));
+        Assert.True(store.TryMapReservedRange(stable, Segment, 0, HostPageProtection.ReadWrite, out _));
+
+        var stop = 0;
+        var failures = 0;
+        var workers = Enumerable.Range(0, 2).Select(worker => Task.Run(() =>
+        {
+            Span<byte> bytes = stackalloc byte[8];
+            var slot = stable + (ulong)(worker * 64);
+            for (var value = 1UL; Volatile.Read(ref stop) == 0; value++)
+            {
+                if (!store.TryWriteBacking(slot, BitConverter.GetBytes(value)) ||
+                    !store.TryReadBacking(slot, bytes) ||
+                    BitConverter.ToUInt64(bytes) != value)
+                {
+                    Interlocked.Increment(ref failures);
+                }
+
+                _ = store.TryReadBacking(churn + 8, bytes);
+            }
+        })).ToArray();
+
+        for (var round = 0; round < 200; round++)
+        {
+            Assert.True(store.TryMapReservedRange(churn, Segment, Segment, HostPageProtection.ReadWrite, out _));
+            Assert.True(store.Unmap(churn, Segment, out _));
+        }
+
+        Volatile.Write(ref stop, 1);
+        await Task.WhenAll(workers);
+        Assert.Equal(0, Volatile.Read(ref failures));
+
+        Assert.True(store.Unmap(stable, Segment, out _));
+        Assert.True(host.JoinHoles(stable, hole));
+        Assert.True(host.JoinHoles(churn, hole));
+        Assert.True(host.FreeHole(stable, hole));
+        Assert.True(host.FreeHole(churn, hole));
+    }
+
+    [Fact]
+    public unsafe void Transfers_WorkWhileTheViewIsNoAccessOrReadOnly()
     {
         if (!Supported)
         {
@@ -196,7 +254,7 @@ public sealed unsafe class SharedBackingViewsTests
     }
 
     [Fact]
-    public void UnmapThenRemap_KeepsBackingContents()
+    public unsafe void UnmapThenRemap_KeepsBackingContents()
     {
         if (!Supported)
         {
@@ -221,7 +279,7 @@ public sealed unsafe class SharedBackingViewsTests
     }
 
     [Fact]
-    public void PartialUnmap_SplitsTheRecordAndTransfersNeverCopyAcrossTheGap()
+    public unsafe void PartialUnmap_SplitsTheRecordAndTransfersNeverCopyAcrossTheGap()
     {
         if (!Supported)
         {
@@ -244,6 +302,11 @@ public sealed unsafe class SharedBackingViewsTests
         Assert.True(store.Contains(baseAddress, Segment));
         Assert.False(store.Contains(middle, Segment));
         Assert.True(store.Contains(right, Segment));
+        Assert.True(store.ContainsWithoutLock(baseAddress, Segment));
+        Assert.False(store.ContainsWithoutLock(middle, Segment));
+        Assert.True(store.ContainsWithoutLock(right, Segment));
+        Assert.False(store.ContainsWithoutLock(baseAddress, 3 * Segment));
+        Assert.Equal(store.Contains(baseAddress, 3 * Segment), store.ContainsWithoutLock(baseAddress, 3 * Segment));
         Assert.Equal(Marker, *(ulong*)baseAddress);
         Assert.Equal(~Marker, *(ulong*)right);
 
@@ -287,7 +350,7 @@ public sealed unsafe class SharedBackingViewsTests
     }
 
     [Fact]
-    public void InjectedFailures_RollBackViewsAndRecordsTogether()
+    public unsafe void InjectedFailures_RollBackViewsAndRecordsTogether()
     {
         if (!Supported)
         {

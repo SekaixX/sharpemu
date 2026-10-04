@@ -122,12 +122,19 @@ public sealed class BufferUploadProfileTests
     public void SlowSampleUpdatesDoNotAllocateAfterCounterInitialization()
     {
         var counters = new BufferUploadProfile.Counters();
-        for (var index = 0; index < 100; index++)
-            counters.Record(default, 0x1000, 4096, 0, 0, 0, index, recordSlowSample: true);
-        var before = GC.GetAllocatedBytesForCurrentThread();
-        for (var index = 100; index < 1100; index++)
-            counters.Record(default, 0x1000, 4096, 0, 0, 0, index, recordSlowSample: true);
-        Assert.Equal(before, GC.GetAllocatedBytesForCurrentThread());
+        var index = 0;
+        var allocated = AllocationMeasurement.SteadyState(
+            () =>
+            {
+                for (; index < 100; index++)
+                    counters.Record(default, 0x1000, 4096, 0, 0, 0, index, recordSlowSample: true);
+            },
+            () =>
+            {
+                for (var end = index + 1000; index < end; index++)
+                    counters.Record(default, 0x1000, 4096, 0, 0, 0, index, recordSlowSample: true);
+            });
+        Assert.Equal(0, allocated);
     }
 
     [Fact]

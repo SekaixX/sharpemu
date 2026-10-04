@@ -25,6 +25,7 @@ public sealed class JsonExportRegistrationTests
         ("9KUZFjI1IxA", "_ZN3sce4Json6StringC1EPKc"),
         ("cG1VE2HMl6c", "_ZN3sce4Json6StringD1Ev"),
         ("+drDFyAS6u4", "_ZN3sce4Json11Initializer27setGlobalNullAccessCallbackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_"),
+        ("i1393UBWu1U", "_ZN3sce4Json11Initializer28setGlobalSpecialFloatHandlerEPFKNS0_5ValueENS0_12FunctionTypeEdPS3_PvPbES6_"),
         ("GvGvswb0v34", "_ZN3sce4Json14InitParameter2C2Ev"),
         ("W72B9ylU2JA", "_ZN3sce4Json18InitParameterRtti216setAllocatorRttiEPNS0_14AllocParamRttiEPv"),
         ("WVZBP4IyM+E", "_ZN3sce4Json14InitParameter225setSpecialFloatFormatTypeENS0_22SpecialFloatFormatTypeE"),
@@ -65,6 +66,23 @@ public sealed class JsonExportRegistrationTests
         Assert.Equal(0UL, ctx[CpuRegister.Rax]);
         Assert.Equal(0x8_0012_3456UL, JsonObjectHeap.GlobalNullAccessCallback);
         Assert.Equal(0x1_0000_0800UL, JsonObjectHeap.GlobalNullAccessCallbackContext);
+    }
+
+    [Fact]
+    public void SetGlobalSpecialFloatHandler_StoresHookAndReturnsOk()
+    {
+        JsonObjectHeap.ResetForTests();
+        var manager = CreateRegisteredManager();
+        var ctx = new CpuContext(new FakeCpuMemory(0x1_0000_0000, 0x1000), Generation.Gen5);
+        ctx[CpuRegister.Rdi] = 0x1_0000_0000; // Initializer instance
+        ctx[CpuRegister.Rsi] = 0x8_0045_6789; // guest callback
+        ctx[CpuRegister.Rdx] = 0x1_0000_0900; // user context
+
+        Assert.True(manager.TryDispatch("i1393UBWu1U", ctx, out var result));
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.Equal(0UL, ctx[CpuRegister.Rax]);
+        Assert.Equal(0x8_0045_6789UL, JsonObjectHeap.GlobalSpecialFloatHandler);
+        Assert.Equal(0x1_0000_0900UL, JsonObjectHeap.GlobalSpecialFloatHandlerContext);
     }
 
     [Fact]

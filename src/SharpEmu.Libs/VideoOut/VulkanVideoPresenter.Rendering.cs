@@ -32,6 +32,10 @@ internal static unsafe partial class VulkanVideoPresenter
     private const string AttachmentFeedbackLoopDynamicStateExtensionName = "VK_EXT_attachment_feedback_loop_dynamic_state";
     private const int DrawsPerBatch = 64;
 
+    // A full batch does not split an open render pass. The pass still ends at this
+    // higher cap so a long pass cannot retain the batch indefinitely.
+    private const int DrawsPerBatchInRenderPass = 512;
+
     // Guest write aspects select the attachment layout and feedback-loop handling. The host
     // rendering scope still stores every bound depth/stencil attachment, including a guest
     // read-only one, so synchronization must always declare the attachment write access.
@@ -61,6 +65,10 @@ internal static unsafe partial class VulkanVideoPresenter
 
             public Dictionary<CachedImage, CachedImage>? StencilStorageImages { get; set; }
 
+            public HashSet<CachedImage>? StencilStorageWriteBackImages { get; set; }
+
+            public List<CachedImage>? FeedbackSnapshots { get; set; }
+
             public bool Committed { get; set; }
 
             public bool CommandsRecorded { get; set; }
@@ -80,13 +88,22 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         try
                         {
-                            if (CommandsRecorded)
+                            if (CommandsRecorded && StencilStorageWriteBackImages is not null &&
+                                StencilStorageWriteBackImages.Contains(attachment))
                                 attachment.CopyStencilStorage(storage, owner._bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: true);
                         }
                         finally
                         {
                             owner._scheduler.QueueCompletionAction(storage.Dispose);
                         }
+                    }
+                }
+
+                if (!Committed && FeedbackSnapshots is { } feedbackSnapshots)
+                {
+                    foreach (var snapshot in feedbackSnapshots)
+                    {
+                        snapshot.Dispose();
                     }
                 }
 
@@ -301,6 +318,12 @@ internal static unsafe partial class VulkanVideoPresenter
         public ResourceSlotIdentifier FindImage(ref ImageRequest request, bool exactFormat)
         {
             _ = BeginBatchedGuestCommands();
+            if (request.Role == ImageRole.ColorTarget && request.Description.DccSliceSize is var sliceSize and not 0)
+            {
+                _imageCache.SynchronizeGuestDccMetadata(request.Description.Metadata.Range.Address, sliceSize,
+                    request.View.BaseLayer, request.View.LayerCount);
+            }
+
             return _imageCache.FindImage(ref request, exactFormat);
         }
 
@@ -438,7 +461,7 @@ internal static unsafe partial class VulkanVideoPresenter
             // Acquire the decoded frame before any stage selects its movie texture planes.
             PumpHostMovieFrame();
 
-            if (_batchDrawCount >= DrawsPerBatch)
+            if (_batchDrawCount >= (_renderingActive ? DrawsPerBatchInRenderPass : DrawsPerBatch))
             {
                 EndRendering();
                 FlushBatchedGuestCommands();
@@ -457,6 +480,40 @@ internal static unsafe partial class VulkanVideoPresenter
             _pipelineEntries.TryGetValue(pipeline.Pipeline, out var entry)
                 ? entry
                 : throw SubmissionScheduler.Fatal($"The pipeline handle is unknown: pipeline={pipeline.Pipeline} layout={pipeline.Layout}.");
+
+        // Vulkan cannot sample a stencil aspect while the same aspect is attached for writes.
+        // Use a per-draw storage copy for read-only stencil feedback and keep the attachment authoritative.
+        private void PrepareStencilFeedback(TextureResource[] bindings)
+        {
+            if (!_hasBoundDepth)
+            {
+                return;
+            }
+
+            var depthImage = _imageCache.GetImage(_boundDepth.Image);
+            var attachmentView = _boundDepth.Target.Target.Request.View;
+            var writes = _boundDepthLoadState.AttachmentWriteAspects(_boundDepth.Target.Target.Format);
+            if ((writes & ImageAspectFlags.StencilBit) == 0)
+            {
+                return;
+            }
+
+            foreach (var binding in bindings)
+            {
+                if (binding.IsHostMovie || binding.CachedImage is not { } image ||
+                    !ReferenceEquals(image, depthImage) || !ViewFormatRules.IsStencilViewFormat(binding.Request.View.Format) ||
+                    !ViewsOverlap(binding.Request.View, attachmentView))
+                {
+                    continue;
+                }
+
+                var storage = AcquireStencilStorage(binding, image, writeBack: false);
+                binding.CachedImage = storage;
+                binding.Image = storage.Backing.Handle;
+                binding.View = storage.GetOrCreateView(binding.Request.View with { Aspect = ImageAspectFlags.ColorBit });
+                binding.MipViews = [];
+            }
+        }
 
 
         // The layout each sampled image reads through; a target read by its own draw uses the general layout.
@@ -494,6 +551,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                 }
             }
+
+            // Create feedback copies after load clears have been materialized;
+            // otherwise a shader would sample the pre-clear contents.
+            PrepareDepthFeedback(bindings);
+            PrepareStencilFeedback(bindings);
 
             var command = BeginBatchedGuestCommands();
             foreach (var binding in bindings)
@@ -571,7 +633,6 @@ internal static unsafe partial class VulkanVideoPresenter
             (ulong)sampled.BaseLayer < (ulong)attachment.BaseLayer + attachment.LayerCount &&
             (ulong)attachment.BaseLayer < (ulong)sampled.BaseLayer + sampled.LayerCount;
 
-        // Clears the depth view with a transfer so the draw can sample the cleared image.
         private void RecordSampledDepthClear(CachedImage image, in ImageViewDescription view, Format format)
         {
             var aspects = (_boundDepthLoadState.DepthClearEnabled ? ImageAspectFlags.DepthBit : 0) |
@@ -941,6 +1002,17 @@ internal static unsafe partial class VulkanVideoPresenter
                 _boundGraphicsPipeline?.Id ?? 0,
                 groupCountX,
                 groupCountY);
+            CountDraw();
+        }
+
+        void IRenderHost.DrawIndexedIndirect(BufferBinding arguments)
+        {
+            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
+            var command = BeginBatchedGuestCommands();
+            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
+            _vk.CmdDrawIndexedIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 20);
+            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
+                _boundGraphicsPipeline?.Id ?? 0, 0, 0);
             CountDraw();
         }
 

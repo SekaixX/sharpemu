@@ -16,6 +16,14 @@ public sealed class RuntimeValueValidator
     private readonly ScalarValue? _activeMask;
     private readonly HashSet<ScalarValue> _visiting = [];
 
+    // Set when a failure traces back to a phi that isn't loop-invariant (e.g. a
+    // hash-table/linear-probe bindless lookup): the value genuinely has no single
+    // compile-time source, as opposed to using an operation or memory shape we just
+    // don't recognize. Callers use this to decide whether degrading to a null
+    // descriptor is reasonable instead of failing outright. This fallback remains
+    // limited to image/sampler handles specifically.
+    public bool ControlDependent { get; private set; }
+
     public RuntimeValueValidator(ScalarValueGraph graph, uint userDataBase, uint userDataCount, int tableReadCount, ScalarValue? activeMask = null)
     {
         _graph = graph;
@@ -28,7 +36,7 @@ public sealed class RuntimeValueValidator
     public static bool IsUniformOperation(ScalarOperation operation) => operation switch
     {
         ScalarOperation.ConvertU32F32 or ScalarOperation.ConvertF32U32 or
-        ScalarOperation.Construct64 or ScalarOperation.Extract64 or
+        ScalarOperation.Construct64 or ScalarOperation.Extract64 or ScalarOperation.QuadMask32 or
         ScalarOperation.BitFieldInsert or ScalarOperation.BitFieldUExtract or ScalarOperation.BitFieldSExtract or
         ScalarOperation.IAdd32 or ScalarOperation.IAdd64 or ScalarOperation.AddCarry32 or
         ScalarOperation.ISub32 or ScalarOperation.ISub64 or ScalarOperation.IMul32 or ScalarOperation.IMul64 or
@@ -59,7 +67,8 @@ public sealed class RuntimeValueValidator
 
         try
         {
-            return ValidateNode(value);
+            var result = ValidateNode(value);
+            return result;
         }
         finally
         {
@@ -82,15 +91,35 @@ public sealed class RuntimeValueValidator
             case ScalarValueKind.UserData:
                 return value.UserDataRegister >= _userDataBase && value.UserDataRegister - _userDataBase < _userDataCount;
             case ScalarValueKind.ShaderBase:
+            case ScalarValueKind.MemoryAperture:
                 return true;
             case ScalarValueKind.Phi:
             {
                 var invariant = _graph.ResolveInvariantPhi(value);
-                return invariant is not null && Validate(invariant);
+                if (invariant is null)
+                {
+                    ControlDependent = true;
+                    return false;
+                }
+
+                return Validate(invariant);
             }
             case ScalarValueKind.FirstLane:
-                return value.Operands.Length == 2 &&
-                    new RuntimeValueValidator(_graph, _userDataBase, _userDataCount, _tableReadCount, value.Operands[1]).Validate(value.Operands[0]);
+            {
+                if (value.Operands.Length != 2)
+                {
+                    return false;
+                }
+
+                var nested = new RuntimeValueValidator(_graph, _userDataBase, _userDataCount, _tableReadCount, value.Operands[1]);
+                var ok = nested.Validate(value.Operands[0]);
+                if (nested.ControlDependent)
+                {
+                    ControlDependent = true;
+                }
+
+                return ok;
+            }
             case ScalarValueKind.ResourceTableWord:
                 return value.Payload < (ulong)_tableReadCount;
             case ScalarValueKind.ScalarAddressWord:

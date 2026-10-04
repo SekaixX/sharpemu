@@ -35,11 +35,14 @@ public sealed class ImageQueryResultsTests
     [InlineData(16)]
     public void InlineQueriesDoNotAllocate(int count)
     {
-        for (var warmup = 0; warmup < 100; warmup++) Sum(count);
-        var before = GC.GetAllocatedBytesForCurrentThread();
         var sum = 0UL;
-        for (var iteration = 0; iteration < 1000; iteration++) sum += Sum(count);
-        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        var allocated = AllocationMeasurement.SteadyState(
+            () => { for (var warmup = 0; warmup < 100; warmup++) Sum(count); },
+            () =>
+            {
+                sum = 0;
+                for (var iteration = 0; iteration < 1000; iteration++) sum += Sum(count);
+            });
         Assert.Equal(0, allocated);
         Assert.Equal((ulong)(count * (count - 1) / 2) * 1000, sum);
     }

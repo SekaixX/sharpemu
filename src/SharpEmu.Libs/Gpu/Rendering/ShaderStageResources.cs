@@ -60,6 +60,7 @@ public class ShaderProgramInfo
     public int InstanceOffsetScalarRegister { get; init; } = NoScalarRegister;
     public bool UsesDeviceAddresses { get; init; }
     public bool HasBitwiseExclusiveOr { get; init; }
+    public Pipelines.ConstantFill? ConstantFill { get; init; }
     public BufferResourceInfo[] Buffers { get; init; } = [];
     public ImageResourceInfo[] Images { get; init; } = [];
     public int SamplerCount { get; init; }
@@ -262,6 +263,29 @@ public sealed class PixelInputInfo
     public bool PositionXY => PositionX && PositionY;
 }
 
+// Maps each guest logical workgroup axis to the physical axis used by the
+// compiled host shader. Identity is the default for backends that preserve XYZ.
+public readonly record struct ComputeWorkgroupAxisMapping(int LogicalX, int LogicalY, int LogicalZ)
+{
+    public static ComputeWorkgroupAxisMapping Identity { get; } = new(0, 1, 2);
+
+    public bool IsIdentity => this == Identity;
+
+    public bool IsValid =>
+        LogicalX is >= 0 and < 3 &&
+        LogicalY is >= 0 and < 3 &&
+        LogicalZ is >= 0 and < 3 &&
+        LogicalX != LogicalY && LogicalX != LogicalZ && LogicalY != LogicalZ;
+
+    public int PhysicalAxisOfLogical(int logicalAxis) => logicalAxis switch
+    {
+        0 => LogicalX,
+        1 => LogicalY,
+        2 => LogicalZ,
+        _ => throw new ArgumentOutOfRangeException(nameof(logicalAxis)),
+    };
+}
+
 public sealed class ComputeInputInfo
 {
     public uint ThreadsX { get; init; }
@@ -282,6 +306,7 @@ public sealed class ComputeInputInfo
     public bool NeedsLocalDataShareBarriers { get; init; }
     public uint HostSubgroupSize { get; init; } = 64;
     public int WorkgroupRegister { get; init; }
+    public ComputeWorkgroupAxisMapping WorkgroupAxisMapping { get; set; } = ComputeWorkgroupAxisMapping.Identity;
     public ShaderStageResources Stage { get; set; }
 }
 

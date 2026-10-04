@@ -13,12 +13,26 @@ public static partial class HttpExports
 
     private static readonly ConcurrentDictionary<int, HttpContext> Contexts = new();
     private static readonly ConcurrentDictionary<int, HttpTemplate> Templates = new();
+    private static readonly ConcurrentDictionary<int, HttpConnection> Connections = new();
     private static int _nextContextId;
     private static int _nextTemplateId = 0x1000;
+    private static int _nextConnectionId = 0x2000;
 
     private sealed record HttpContext(int NetMemoryId, int SslContextId, ulong PoolSize);
 
-    private sealed record HttpTemplate(int ContextId, ulong UserAgentAddress, int HttpVersion, bool AutoProxyConfig);
+    private sealed record HttpTemplate(
+        int ContextId,
+        ulong UserAgentAddress,
+        int HttpVersion,
+        bool AutoProxyConfig,
+        uint ConnectTimeoutMicroseconds = 30_000_000);
+
+    private sealed record HttpConnection(
+        int TemplateId,
+        string ServerName,
+        string Scheme,
+        ushort Port,
+        bool KeepAlive);
 
     [SysAbiExport(
         Nid = "A9cVMUtEp4Y",
@@ -73,9 +87,90 @@ public static partial class HttpExports
     public static int HttpDeleteTemplate(CpuContext ctx)
     {
         var templateId = unchecked((int)ctx[CpuRegister.Rdi]);
-        return Templates.TryRemove(templateId, out _)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn(HttpErrorInvalidId);
+        if (!Templates.TryRemove(templateId, out _))
+        {
+            return ctx.SetReturn(HttpErrorInvalidId);
+        }
+
+        RemoveTemplateConnections(templateId);
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "Kiwv9r4IZCc",
+        ExportName = "sceHttpCreateConnection",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceHttp")]
+    public static int HttpCreateConnection(CpuContext ctx)
+    {
+        var templateId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var serverNameAddress = ctx[CpuRegister.Rsi];
+        var schemeAddress = ctx[CpuRegister.Rdx];
+        var port = unchecked((ushort)ctx[CpuRegister.Rcx]);
+        var keepAlive = ctx[CpuRegister.R8] != 0;
+
+        if (!Templates.ContainsKey(templateId))
+        {
+            return ctx.SetReturn(HttpErrorInvalidId);
+        }
+
+        if (serverNameAddress == 0 || schemeAddress == 0)
+        {
+            return ctx.SetReturn(HttpErrorInvalidValue);
+        }
+
+        var serverResult = ReadUriSource(ctx.Memory, serverNameAddress, out var serverName);
+        if (serverResult != 0)
+        {
+            return ctx.SetReturn(serverResult);
+        }
+
+        var schemeResult = ReadUriSource(ctx.Memory, schemeAddress, out var scheme);
+        if (schemeResult != 0)
+        {
+            return ctx.SetReturn(schemeResult);
+        }
+
+        if (serverName.Length == 0 || scheme.Length == 0)
+        {
+            return ctx.SetReturn(HttpErrorInvalidValue);
+        }
+
+        var id = Interlocked.Increment(ref _nextConnectionId);
+        Connections[id] = new HttpConnection(templateId, serverName, scheme, port, keepAlive);
+        TraceHttp(
+            "create_connection",
+            id,
+            unchecked((ulong)templateId),
+            port,
+            keepAlive ? 1UL : 0UL,
+            0);
+        ctx[CpuRegister.Rax] = unchecked((ulong)id);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "0S9tTH0uqTU",
+        ExportName = "sceHttpSetConnectTimeOut",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceHttp")]
+    public static int HttpSetConnectTimeOut(CpuContext ctx)
+    {
+        var id = unchecked((int)ctx[CpuRegister.Rdi]);
+        var timeoutMicroseconds = unchecked((uint)ctx[CpuRegister.Rsi]);
+        if (timeoutMicroseconds == 0)
+        {
+            return ctx.SetReturn(HttpErrorInvalidValue);
+        }
+
+        if (!Templates.TryGetValue(id, out var template))
+        {
+            return ctx.SetReturn(HttpErrorInvalidId);
+        }
+
+        Templates[id] = template with { ConnectTimeoutMicroseconds = timeoutMicroseconds };
+        TraceHttp("set_connect_timeout", id, timeoutMicroseconds, 0, 0, 0);
+        return ctx.SetReturn(0);
     }
 
     [SysAbiExport(
@@ -96,10 +191,22 @@ public static partial class HttpExports
             if (pair.Value.ContextId == contextId)
             {
                 Templates.TryRemove(pair.Key, out _);
+                RemoveTemplateConnections(pair.Key);
             }
         }
 
         return ctx.SetReturn(0);
+    }
+
+    private static void RemoveTemplateConnections(int templateId)
+    {
+        foreach (var connection in Connections)
+        {
+            if (connection.Value.TemplateId == templateId)
+            {
+                Connections.TryRemove(connection.Key, out _);
+            }
+        }
     }
 
     private static void TraceHttp(string operation, int id, ulong arg0, ulong arg1, ulong arg2, ulong arg3)

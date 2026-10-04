@@ -32,6 +32,8 @@ public enum ScalarValueKind : byte
     ScalarAddressWord,
     ScalarBufferWord,
     ResourceTableWord,
+    // The high dword of a GFX10 LDS/scratch aperture (payload: the inline operand).
+    MemoryAperture,
 }
 
 // Operations a value node can apply to its operands. The validator accepts only the
@@ -155,6 +157,9 @@ public sealed class ScalarValue
     public static ScalarValue ConstantOf(bool value) =>
         new(ScalarValueKind.Constant, ScalarValueType.Bool, ScalarOperation.None, []) { Payload = value ? 1u : 0u };
 
+    public static ScalarValue MemoryAperture(uint operand) =>
+        new(ScalarValueKind.MemoryAperture, ScalarValueType.U32, ScalarOperation.None, []) { Payload = operand };
+
     public static ScalarValue Undefined(ScalarValueType type) =>
         new(ScalarValueKind.Undefined, type, ScalarOperation.None, []);
 
@@ -198,6 +203,7 @@ public sealed class ScalarValue
     {
         ScalarValueKind.Constant => Type == ScalarValueType.U64 ? $"0x{Payload:X}ul" : Type == ScalarValueType.Bool ? (Payload != 0 ? "true" : "false") : $"0x{(uint)Payload:X}",
         ScalarValueKind.UserData => $"UserData(s{Payload})",
+        ScalarValueKind.MemoryAperture => $"Aperture({Payload})",
         ScalarValueKind.Operation => $"{Operation}({string.Join(", ", Operands.Select(operand => operand.ToString()))})",
         ScalarValueKind.Phi => $"Phi#{Id}(block {PhiBlock})",
         _ => $"{Kind}#{Id}",
@@ -227,13 +233,29 @@ public static class ScalarValueEquivalence
             return true;
         }
 
+        // A loop re-reads loop-invariant registers through phis that only merge the
+        // entry value with themselves; compare the value they carry. Otherwise every
+        // descriptor load inside a loop looks new, and a shader that reloads the same
+        // three samplers 104 times exceeds the sampler table (Astro Bot 0xD97F248195E22298).
+        left = ResolveInvariant(memory, left);
+        right = ResolveInvariant(memory, right);
+        if (left.IsUndefined || right.IsUndefined)
+        {
+            return false;
+        }
+
+        if (ReferenceEquals(left, right))
+        {
+            return true;
+        }
+
         if (left.Kind != right.Kind || left.Type != right.Type || left.Operation != right.Operation ||
             left.Operands.Length != right.Operands.Length)
         {
             return false;
         }
 
-        if (left.Kind is ScalarValueKind.Constant or ScalarValueKind.UserData or ScalarValueKind.ResourceTableWord)
+        if (left.Kind is ScalarValueKind.Constant or ScalarValueKind.UserData or ScalarValueKind.ResourceTableWord or ScalarValueKind.MemoryAperture)
         {
             return left.Payload == right.Payload;
         }
@@ -280,6 +302,48 @@ public static class ScalarValueEquivalence
         }
 
         return true;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<ScalarValue, StrongBox> ResolvedPhis = new();
+
+    [System.ThreadStatic]
+    private static HashSet<ScalarValue>? _resolvingPhis;
+
+    private sealed class StrongBox(ScalarValue value)
+    {
+        public readonly ScalarValue Value = value;
+    }
+
+    // The invariant value of a phi, or the phi itself when it merges different values
+    // (or while that phi is already being resolved further up the stack).
+    private static ScalarValue ResolveInvariant(MemoryAccessTable memory, ScalarValue value)
+    {
+        if (value.Kind != ScalarValueKind.Phi)
+        {
+            return value;
+        }
+
+        if (ResolvedPhis.TryGetValue(value, out var cached))
+        {
+            return cached.Value;
+        }
+
+        var resolving = _resolvingPhis ??= [];
+        if (!resolving.Add(value))
+        {
+            return value;
+        }
+
+        try
+        {
+            var resolved = ResolveInvariantPhi(memory, value) ?? value;
+            ResolvedPhis.AddOrUpdate(value, new StrongBox(resolved));
+            return resolved;
+        }
+        finally
+        {
+            resolving.Remove(value);
+        }
     }
 
     // A phi whose non-phi operands are all equivalent resolves to that value; a phi that

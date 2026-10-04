@@ -126,6 +126,18 @@ internal static unsafe partial class VulkanVideoPresenter
 
         uint IShaderPipelineHost.ComputeSubgroupSize => unchecked((uint)Volatile.Read(ref _nativeSubgroupSize));
 
+        ComputeWorkgroupAxisMapping IShaderPipelineHost.ResolveComputeWorkgroupAxisMapping(
+            uint threadsX,
+            uint threadsY,
+            uint threadsZ)
+        {
+            var physicalAxisOfLogical = Gen5SpirvTranslator.ComputeWorkgroupAxisOrder(threadsX, threadsY, threadsZ);
+            return new ComputeWorkgroupAxisMapping(
+                physicalAxisOfLogical[0],
+                physicalAxisOfLogical[1],
+                physicalAxisOfLogical[2]);
+        }
+
         bool IShaderPipelineHost.GraphicsSubgroupOperationsEnabled => GraphicsSubgroupOperationsEnabled;
 
         bool IShaderPipelineHost.BufferInt64AtomicsSupported => _supportsBufferInt64Atomics;
@@ -134,6 +146,26 @@ internal static unsafe partial class VulkanVideoPresenter
 
         bool IShaderPipelineHost.ShaderSignedZeroInfNanPreserveFloat32Supported =>
             _supportsShaderSignedZeroInfNanPreserveFloat32;
+
+        // Only a 64-invocation wave64 workgroup is translated for either host subgroup width. Every
+        // other compute translation maps a guest wave to 32-lane host subgroups, and a 64-lane host
+        // subgroup (AMD's default) left lanes 32..63 inactive: a wave64 8x8x8 group lost rows 4..7.
+        private const uint RdnaSubgroupSize = 32;
+        private bool _canRequireComputeSubgroup32;
+        private uint _maxComputeWorkgroupSubgroups;
+
+        private bool RequiresComputeSubgroup32(ComputeInputInfo input)
+        {
+            var invocations = (ulong)Math.Max(input.ThreadsX, 1) * Math.Max(input.ThreadsY, 1) * Math.Max(input.ThreadsZ, 1);
+            return _canRequireComputeSubgroup32 &&
+                   !(input.WaveSize == 64 && invocations == 64) &&
+                   invocations <= (ulong)_maxComputeWorkgroupSubgroups * RdnaSubgroupSize;
+        }
+
+        bool IShaderPipelineHost.SharedInt64AtomicsEnabled => SharedInt64AtomicsEnabled;
+        // NVIDIA's compiler rejects the elided-EXEC wave64 compute module with NVVM error 3.
+        bool IShaderPipelineHost.ExecGuardElisionEnabled => _physicalDeviceVendorId != NvidiaVendorId;
+        bool IShaderPipelineHost.PerVertexPixelInputsSupported => _supportsPerVertexPixelInputs;
 
         RenderHostLimits IShaderPipelineHost.Limits => _renderHostLimits;
 
@@ -186,7 +218,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            if (_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) ||
+            if ((_bufferCache.MayHaveGpuDirtyPages(address, sizeof(uint)) && _bufferCache.HasGpuDirtyPages(address, sizeof(uint))) ||
                 _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) ||
                 _imageCache.HasGpuModifiedImageBytes(address, sizeof(uint)))
             {
@@ -201,6 +233,19 @@ internal static unsafe partial class VulkanVideoPresenter
 
             word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
             return true;
+        }
+
+        // The same ownership rules as the two word readers, checked once for a whole range.
+        public bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean)
+        {
+            var size = (ulong)destination.Length;
+            if (_bufferCache.HasGpuDirtyPages(address, size) ||
+                (clean && (_bufferCache.HasGpuDirtyBytes(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size))))
+            {
+                return false;
+            }
+
+            return _guestMemory.TryRead(address, destination);
         }
 
         public ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId)
@@ -728,10 +773,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         PNext = _supportsProvokingVertexLast
                             ? &provokingVertex
                             : (_supportsDepthClipEnable ? &depthClip : null),
-                        // The PS5 depth block clamps after polygon offset. Kyty uses
-                        // the same host feature for every graphics pipeline; keeping
-                        // it disabled loses otherwise-valid 3D primitives whenever
-                        // guest depth clipping is disabled.
+                        // The guest depth block clamps after polygon offset. Keep this
+                        // enabled whenever the host exposes the corresponding feature.
                         DepthClampEnable = _supportsDepthClamp,
                         PolygonMode = parameters.PolygonMode,
                         CullMode = cullMode,
@@ -860,9 +903,15 @@ internal static unsafe partial class VulkanVideoPresenter
             Pipeline pipeline;
             try
             {
+                var requiredSubgroupSize = new PipelineShaderStageRequiredSubgroupSizeCreateInfo
+                {
+                    SType = StructureType.PipelineShaderStageRequiredSubgroupSizeCreateInfo,
+                    RequiredSubgroupSize = RdnaSubgroupSize,
+                };
                 var stageInfo = new PipelineShaderStageCreateInfo
                 {
                     SType = StructureType.PipelineShaderStageCreateInfo,
+                    PNext = RequiresComputeSubgroup32(description.Input) ? &requiredSubgroupSize : null,
                     Stage = ShaderStageFlags.ComputeBit,
                     Module = computeModule,
                     PName = entryPoint,
@@ -873,7 +922,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     Stage = stageInfo,
                     Layout = layout,
                 };
-                Check(_vk.CreateComputePipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out pipeline), "vkCreateComputePipelines(rendering)");
+                Check(_vk.CreateComputePipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out pipeline),
+                    $"vkCreateComputePipelines(rendering) hash=0x{description.Stage.Hash:X16}");
                 MarkPipelineCacheDirty();
                 Interlocked.Increment(ref _perfPipelineCreations);
                 SetDebugName(ObjectType.Pipeline, pipeline.Handle, $"SharpEmu compute cs=0x{description.Stage.Hash:X16}");

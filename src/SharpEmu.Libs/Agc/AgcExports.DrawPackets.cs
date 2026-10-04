@@ -184,8 +184,6 @@ public static partial class AgcExports
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var dataOffset = (uint)ctx[CpuRegister.Rsi];
         var drawModifier = ctx[CpuRegister.Rdx];
-        var emit = Interlocked.Increment(ref _indirectDrawEmitCount);
-
         if (commandBufferAddress == 0)
         {
             Interlocked.Increment(ref _indirectDrawEmitRejectCount);
@@ -224,18 +222,9 @@ public static partial class AgcExports
             return ReturnPointer(ctx, 0);
         }
 
-        if (emit <= 12 || emit % 250 == 0)
-        {
-            Console.Error.WriteLine(
-                $"[LOADER][INFO] agc.emit_indirect#{emit} buf=0x{commandBufferAddress:X16} " +
-                $"draw=0x{drawCommand:X16} off=0x{dataOffset:X} modifier=0x{drawModifier:X16} " +
-                $"packet_words: 0x{packetHeader:X8} 0x{dataOffset:X8} 0x{firstVertexRegister:X8} " +
-                $"0x{firstInstanceRegister:X8} 0x{drawInitiator:X8}");
-        }
-
         TraceAgc(
             $"agc.dcb_draw_indirect buf=0x{commandBufferAddress:X16} " +
-            $"draw=0x{drawCommand:X16} offset=0x{dataOffset:X}");
+            $"draw=0x{drawCommand:X16} offset=0x{dataOffset:X} modifier=0x{drawModifier:X}");
 
         return ReturnPointer(ctx, drawCommand);
     }
@@ -467,6 +456,5 @@ public static partial class AgcExports
     }
     #pragma warning restore SHEM006
 
-    private static long _indirectDrawEmitCount;
     private static long _indirectDrawEmitRejectCount;
 }

@@ -11,6 +11,33 @@ namespace SharpEmu.ShaderCompiler.Tests.Resources;
 public sealed class VectorCompareResourceTests
 {
     [Fact]
+    public void BitreplicateB64B32Compiles()
+    {
+        var program = Program(
+            Sop1(0, "SBitreplicateB64B32", 0, Operand(7)),
+            EndProgram(8));
+
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(Request(program, userDataCount: 0), out var shader, out var error), error);
+        Assert.NotEmpty(shader.Spirv);
+    }
+
+    [Theory]
+    [InlineData("VCmpEqU16")]
+    [InlineData("VCmpLtU16")]
+    [InlineData("VCmpGeU16")]
+    [InlineData("VCmpEqI16")]
+    [InlineData("VCmpLtI16")]
+    public void Integer16BitCompareCompilesToSpirv(string opcode)
+    {
+        var program = Program(
+            Vopc(0, opcode, Gen5Operand.Vector(0), 1),
+            EndProgram(8));
+
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(Request(program, userDataCount: 0), out var shader, out var error), error);
+        Assert.NotEmpty(shader.Spirv);
+    }
+
+    [Fact]
     public void ExecutionComparePreservesResourcePointerWithUnknownVectorInputs()
     {
         var program = Program(
@@ -53,7 +80,7 @@ public sealed class VectorCompareResourceTests
             MoveScalarRegister(28, 11, 127),
             BufferLoad(32, 8),
             EndProgram(40));
-        var plan = Extract(program, userDataCount: 0);
+        var plan = Extract(program, userDataCount: 0, waveSize: 32);
 
         Assert.True(RuntimeValueEvaluator.EvaluateDescriptorSource(plan,
             Assert.Single(plan.Info.Buffers).Source, Inputs([]), out var descriptor));

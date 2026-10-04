@@ -22,22 +22,18 @@ public sealed unsafe class SharedBackingTransferTests
         var source = mapping.Address + Segment - (ulong)data.Length;
         var destination = mapping.Address + 2 * Segment - (ulong)data.Length;
         Assert.True(mapping.Store.TryWriteBacking(source, data));
-        for (var iteration = 0; iteration < 256; iteration++)
+        var succeeded = true;
+        void Transfer(int count)
         {
-            Assert.True(copy
-                ? mapping.Store.TryCopyBacking(destination, source, (ulong)data.Length)
-                : mapping.Store.TryWriteBacking(destination, data));
+            for (var iteration = 0; iteration < count; iteration++)
+            {
+                succeeded &= copy
+                    ? mapping.Store.TryCopyBacking(destination, source, (ulong)data.Length)
+                    : mapping.Store.TryWriteBacking(destination, data);
+            }
         }
 
-        var initialAllocation = GC.GetAllocatedBytesForCurrentThread();
-        var succeeded = true;
-        for (var iteration = 0; iteration < 1024; iteration++)
-        {
-            succeeded &= copy
-                ? mapping.Store.TryCopyBacking(destination, source, (ulong)data.Length)
-                : mapping.Store.TryWriteBacking(destination, data);
-        }
-        var allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - initialAllocation;
+        var allocatedBytes = AllocationMeasurement.SteadyState(() => Transfer(256), () => Transfer(1024));
 
         Assert.True(succeeded);
         Assert.Equal(0L, allocatedBytes);

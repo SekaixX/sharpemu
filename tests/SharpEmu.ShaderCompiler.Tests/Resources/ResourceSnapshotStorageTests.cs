@@ -75,5 +75,19 @@ public sealed class ResourceSnapshotStorageTests
         next.Images[1][0] = 0;
         Assert.Equal(originalTable, first.FlattenedResourceTable);
         Assert.Equal(secondImage[0], first.Images[1][0]);
+
+        // A repeat with the same user data is served from the materialization cache; a
+        // changed descriptor word in guest memory must still reach the next snapshot.
+        var third = new ResourceSnapshot();
+        Assert.True(ResourceMaterializer.Materialize(plan, inputs, ref third, ref specialization));
+        Assert.Equal(originalTable, third.FlattenedResourceTable);
+        Assert.Equal(secondImage[0], third.Images[1][0]);
+
+        var changedImage = secondImage.ToArray();
+        changedImage[0] += 0x100;
+        ResourceTrackerTests.WriteImage(memory, 0x2020, changedImage);
+        var fourth = new ResourceSnapshot();
+        Assert.True(ResourceMaterializer.Materialize(plan, inputs, ref fourth, ref specialization));
+        Assert.Equal(changedImage[0], fourth.Images[1][0]);
     }
 }

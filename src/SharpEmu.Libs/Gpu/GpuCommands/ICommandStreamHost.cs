@@ -21,7 +21,14 @@ public readonly record struct DrawIndexedArguments(
     uint InstanceCount,
     int BaseVertex,
     uint FirstInstance,
-    DrawOffsetSource OffsetSource);
+    DrawOffsetSource OffsetSource,
+    // Nonzero when the counts are still in guest memory at this address, laid out as
+    // (indexCount, instanceCount, firstIndex, vertexOffset, firstInstance). IndexCount is
+    // then the index buffer size and IndexAddress its base.
+    ulong IndirectArgumentsAddress = 0,
+    // The guest set no index buffer size: IndexCount is only the range seen so far and
+    // must not clamp the count read from the arguments.
+    bool UnboundedIndexBuffer = false);
 
 // Arguments of a non-indexed draw as the packet stream describes them.
 public readonly record struct DrawAutoArguments(
@@ -147,6 +154,14 @@ public interface ICommandStreamHost
     void DrawAuto(ulong submitId, in DrawAutoArguments arguments);
 
     void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0);
+
+    // True when an indirect dispatch in workgroup units reads its group counts on the
+    // GPU, so the interpreter need not wait for the GPU to read them back first.
+    bool ResolvesIndirectDispatchOnGpu => false;
+
+    // True when an indexed indirect draw may be handed over with its arguments still in
+    // guest memory (DrawIndexedArguments.IndirectArgumentsAddress).
+    bool ResolvesIndirectDrawOnGpu => false;
 
     // Called when a queue reset packet clears the processor.
     void OnQueueReset(int queueId);

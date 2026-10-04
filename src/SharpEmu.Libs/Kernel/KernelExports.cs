@@ -39,8 +39,8 @@ public static class KernelExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
-    // KytyPS5 libKernel.cpp KernelGetOperationMode: *mode = 2 (PS5 base console, not Pro),
-    // *submode = 0 (none). Games poll this at high frequency.
+    // Report PS5 base-console mode rather than Pro mode, with no submode.
+    // Games poll this at high frequency.
     [SysAbiExport(
         Nid = "NH6xARDOVv8",
         ExportName = "sceKernelGetOperationMode",
@@ -61,6 +61,7 @@ public static class KernelExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -243,7 +244,8 @@ public static class KernelExports
             ctx,
             attrAddress,
             out var priority,
-            out var affinityMask);
+            out var affinityMask,
+            out var requestedStackSize);
         KernelPthreadExtendedCompatExports.RegisterThreadStart(
             threadHandle,
             name,
@@ -272,7 +274,8 @@ public static class KernelExports
                 attrAddress,
                 name,
                 priority,
-                affinityMask);
+                affinityMask,
+                requestedStackSize);
             if (!scheduler.TryStartThread(ctx, request, out var error))
             {
                 Console.Error.WriteLine(
@@ -422,9 +425,10 @@ public static class KernelExports
         ulong fmtPtr = ctx[CpuRegister.Rdi];
         string fmt = ReadCString(ctx, fmtPtr, 4096);
         string outStr = KernelMemoryCompatExports.FormatStringFromVarArgs(ctx, fmt, firstGpArgIndex: 1);
+        var byteCount = System.Text.Encoding.UTF8.GetByteCount(outStr);
         WriteGuestPrintf(outStr);
 
-        ctx[CpuRegister.Rax] = (ulong)System.Text.Encoding.UTF8.GetByteCount(outStr);
+        ctx[CpuRegister.Rax] = (ulong)byteCount;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -581,4 +585,5 @@ public static class KernelExports
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
 }

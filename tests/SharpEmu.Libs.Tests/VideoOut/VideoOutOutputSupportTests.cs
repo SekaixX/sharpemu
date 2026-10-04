@@ -3,6 +3,7 @@
 
 using System.Buffers.Binary;
 using SharpEmu.HLE;
+using SharpEmu.Libs.VideoOut;
 using Xunit;
 
 namespace SharpEmu.Libs.Tests.VideoOut;
@@ -11,6 +12,7 @@ public sealed class VideoOutOutputSupportTests
 {
     private const string OpenNid = "Up36PTk687E";
     private const string CloseNid = "uquVH4-Du78";
+    private const string AllowWqhdDetectionNid = "w7Ipp9Xl7hg";
     private const string OutputSupportNid = "Nv8c-Kb+DUM";
     private const string OutputStatusNid = "utPrVdxio-8";
     private const string ConfigureOutputNid = "w0hLuNarQxY";
@@ -22,6 +24,70 @@ public sealed class VideoOutOutputSupportTests
     private static readonly ulong InvalidOption = unchecked((ulong)(int)0x8029001A);
     private static readonly ulong MemoryFault =
         unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+
+    [Fact]
+    public void AllowWqhdDetectionAcceptsOpenGen5PortAndRejectsInvalidHandle()
+    {
+        var gen4Manager = new ModuleManager();
+        gen4Manager.RegisterExports(
+            SharpEmu.Generated.SysAbiExportRegistry.CreateExports(Generation.Gen4));
+        Assert.False(gen4Manager.TryGetExport(AllowWqhdDetectionNid, out _));
+
+        var manager = new ModuleManager();
+        manager.RegisterExports(
+            SharpEmu.Generated.SysAbiExportRegistry.CreateExports(Generation.Gen5));
+        Assert.True(manager.TryGetExport(AllowWqhdDetectionNid, out var export));
+        Assert.Equal("sceVideoOutAllowOutputResolutionWqhdDetection", export.Name);
+        Assert.Equal("libSceVideoOut", export.LibraryName);
+
+        var context = new CpuContext(new FakeCpuMemory(MemoryBase, 0x1000), Generation.Gen5);
+        Assert.True(manager.TryDispatch(OpenNid, context, out _));
+        var handle = context[CpuRegister.Rax];
+        Assert.NotEqual(0UL, handle);
+
+        try
+        {
+            context[CpuRegister.Rdi] = handle;
+            Assert.True(manager.TryDispatch(AllowWqhdDetectionNid, context, out _));
+            Assert.Equal(0UL, context[CpuRegister.Rax]);
+
+            context[CpuRegister.Rdi] = ulong.MaxValue;
+            Assert.True(manager.TryDispatch(AllowWqhdDetectionNid, context, out _));
+            Assert.Equal(InvalidHandle, context[CpuRegister.Rax]);
+        }
+        finally
+        {
+            context[CpuRegister.Rdi] = handle;
+            _ = manager.TryDispatch(CloseNid, context, out _);
+        }
+    }
+
+    [Theory]
+    [InlineData(HostHdrMode.Auto, false, true, false)]
+    [InlineData(HostHdrMode.Auto, true, false, false)]
+    [InlineData(HostHdrMode.Auto, true, true, true)]
+    [InlineData(HostHdrMode.On, false, true, true)]
+    [InlineData(HostHdrMode.On, true, true, true)]
+    [InlineData(HostHdrMode.On, true, false, false)]
+    [InlineData(HostHdrMode.Off, true, true, false)]
+    public void OutputStatusReportsHdrOnlyWhenAllowedAndSupported(
+        HostHdrMode mode, bool displayHdrEnabled, bool surfaceSupportsHdr, bool expectedHdr)
+    {
+        var supported = new HostVideoOptions { HdrMode = mode }.CanUseHdr(displayHdrEnabled, surfaceSupportsHdr);
+        Assert.Equal(expectedHdr, supported);
+
+        var bytes = Enumerable.Repeat((byte)0xA5, 0x32).ToArray();
+        VideoOutExports.WriteOutputStatus(bytes.AsSpan(1, 0x30), 3840, 2160, 120, supported);
+
+        Assert.Equal(0xA5, bytes[0]);
+        Assert.Equal(0xA5, bytes[^1]);
+        var status = bytes.AsSpan(1, 0x30);
+        Assert.Equal(2U, BinaryPrimitives.ReadUInt32LittleEndian(status));
+        Assert.Equal(expectedHdr ? 2U : 1U, BinaryPrimitives.ReadUInt32LittleEndian(status[4..]));
+        Assert.Equal(13UL, BinaryPrimitives.ReadUInt64LittleEndian(status[8..]));
+        Assert.Equal(expectedHdr ? 1UL : 0UL, BinaryPrimitives.ReadUInt64LittleEndian(status[0x10..]));
+        Assert.All(status[0x18..].ToArray(), value => Assert.Equal(0, value));
+    }
 
     [Theory]
     [InlineData(Generation.Gen4)]

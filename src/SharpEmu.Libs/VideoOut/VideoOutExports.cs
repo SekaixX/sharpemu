@@ -7,6 +7,7 @@ using SharpEmu.Logging;
 using SharpEmu.HLE.Host;
 using SharpEmu.Libs.Diagnostics;
 using SharpEmu.Libs.Gpu;
+using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Audio;
 using SharpEmu.Libs.Kernel;
 using System.Buffers;
@@ -49,6 +50,14 @@ public static partial class VideoOutExports
     private const int MaxLatencyHistoryEntries = 256;
     private const ulong SceVideoOutOutputModeDefault = 1;
     private const ulong SceVideoOutOutputMode119_88Hz = 0xF;
+    // SHARPEMU_GUEST_REFRESH_RATE=<Hz> paces the emulated display (vblanks and flips) at
+    // that rate instead of 60 Hz. A game that flips every vblank then runs faster than 60 fps;
+    // one whose logic counts frames also runs faster.
+    private static readonly uint GuestRefreshRate =
+        uint.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_GUEST_REFRESH_RATE"), out var rate) && rate is >= 30 and <= 1000
+            ? rate
+            : 60;
+
     private const ulong SceVideoOutRefreshRate59_94Hz = 3;
     private const ulong SceVideoOutRefreshRate119_88Hz = 13;
     private const ulong SceVideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
@@ -239,7 +248,7 @@ public static partial class VideoOutExports
         public int CurrentBuffer { get; set; } = -1;
         public uint OutputWidth { get; set; } = 1920;
         public uint OutputHeight { get; set; } = 1080;
-        public uint RefreshRate { get; set; } = 60;
+        public uint RefreshRate { get; set; } = GuestRefreshRate;
         public ulong OutputMode { get; set; } = SceVideoOutOutputModeDefault;
         public float Gamma { get; set; } = 1.0f;
         public Dictionary<long, long> LatencyStartPoints { get; } = new();
@@ -289,7 +298,8 @@ public static partial class VideoOutExports
         uint TilingMode,
         uint Width,
         uint Height,
-        uint PitchInPixel);
+        uint PitchInPixel,
+        ulong Option = 0);
 
     [SysAbiExport(
         Nid = "Up36PTk687E",
@@ -333,6 +343,19 @@ public static partial class VideoOutExports
             };
             return handle;
         }
+    }
+
+    [SysAbiExport(
+        Nid = "w7Ipp9Xl7hg",
+        ExportName = "sceVideoOutAllowOutputResolutionWqhdDetection",
+        Target = Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutAllowOutputResolutionWqhdDetection(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        return TryGetPort(handle, out _)
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : OrbisVideoOutErrorInvalidHandle;
     }
 
     [SysAbiExport(
@@ -509,18 +532,26 @@ public static partial class VideoOutExports
         }
 
         Span<byte> status = stackalloc byte[VideoOutOutputStatusSize];
-        status.Clear();
-        var resolutionClass = port.OutputWidth >= 3840 || port.OutputHeight >= 2160 ? 2 : 1;
-        BinaryPrimitives.WriteInt32LittleEndian(status[0x00..0x04], resolutionClass);
-        BinaryPrimitives.WriteInt32LittleEndian(status[0x04..0x08], 1);
-        // The status uses a refresh-rate code, not the frequency used for pacing.
-        var refreshRateCode = port.RefreshRate >= 119
-            ? SceVideoOutRefreshRate119_88Hz
-            : SceVideoOutRefreshRate59_94Hz;
-        BinaryPrimitives.WriteUInt64LittleEndian(status[0x08..0x10], refreshRateCode);
+        WriteOutputStatus(status, port.OutputWidth, port.OutputHeight, port.RefreshRate,
+            HostVideoHost.IsHdrOutputSupported);
         return ctx.Memory.TryWrite(statusAddress, status)
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
             : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+    }
+
+    internal static void WriteOutputStatus(Span<byte> status, uint width, uint height, uint refreshRate,
+        bool hdrOutputSupported)
+    {
+        status.Clear();
+        var resolutionClass = width >= 3840 || height >= 2160 ? 2 : 1;
+        BinaryPrimitives.WriteInt32LittleEndian(status[0x00..0x04], resolutionClass);
+        BinaryPrimitives.WriteInt32LittleEndian(status[0x04..0x08], hdrOutputSupported ? 2 : 1);
+        // The status uses a refresh-rate code, not the frequency used for pacing.
+        var refreshRateCode = refreshRate >= 119
+            ? SceVideoOutRefreshRate119_88Hz
+            : SceVideoOutRefreshRate59_94Hz;
+        BinaryPrimitives.WriteUInt64LittleEndian(status[0x08..0x10], refreshRateCode);
+        BinaryPrimitives.WriteUInt64LittleEndian(status[0x10..0x18], hdrOutputSupported ? 1UL : 0UL);
     }
 
     [SysAbiExport(
@@ -865,6 +896,28 @@ public static partial class VideoOutExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    #pragma warning disable SHEM006
+    [SysAbiExport(
+        Nid = "kP2L8t3j-aM",
+        ExportName = "VideoOutVrrStatus_kP2L8t3j_aM",
+        Target = Generation.Gen5,
+        LibraryName = "libSceVideoOutVrrStatus")]
+    public static int VideoOutVrrStatus(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(
+        Nid = "5tRaBjtdTzY",
+        ExportName = "sceVideoOutVrrPegToFixedRate",
+        Target = Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutVrrPegToFixedRate(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(
+        Nid = "T4ucGB8CsnM",
+        ExportName = "sceVideoOutVrrUnpegFromFixedRate",
+        Target = Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutVrrUnpegFromFixedRate(CpuContext ctx) => ctx.SetReturn(0);
+
     [SysAbiExport(
         Nid = "Xru92wHJRmg",
         ExportName = "sceVideoOutAddVblankEvent",
@@ -1172,7 +1225,8 @@ public static partial class VideoOutExports
                 attribute.TilingMode,
                 attribute.Width,
                 attribute.Height,
-                attribute.PitchInPixel);
+                attribute.PitchInPixel,
+                attribute.Option);
             return true;
         }
     }
@@ -1335,6 +1389,50 @@ public static partial class VideoOutExports
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "HuViW4HnrOw",
+        ExportName = "sceVideoOutSubmitChangeBufferAttribute2",
+        Target = Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutSubmitChangeBufferAttribute2(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var setIndex = unchecked((int)ctx[CpuRegister.Rsi]);
+        var attributeAddress = ctx[CpuRegister.Rdx];
+        var option = ctx[CpuRegister.Rcx];
+        lock (_stateGate)
+        {
+            if (!_ports.TryGetValue(handle, out var port)) return OrbisVideoOutErrorInvalidHandle;
+            if (attributeAddress == 0) return OrbisVideoOutErrorInvalidOption;
+            if ((uint)setIndex >= MaxDisplayBufferGroups) return OrbisVideoOutErrorInvalidIndex;
+            if (option != 0) return OrbisVideoOutErrorInvalidOption;
+            if (port.Groups[setIndex] is null) return OrbisVideoOutErrorInvalidIndex;
+            if (!TryReadBufferAttribute(ctx, attributeAddress, true, out var attribute))
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            if (attribute.Width is 0 or > 16384 || attribute.Height is 0 or > 16384 ||
+                attribute.TilingMode != 0 || (attribute.Option & ~((1UL << 3) | (1UL << 5))) != 0 ||
+                !DisplayFormatRule.TryDecode(attribute.PixelFormat, out _))
+                return OrbisVideoOutErrorInvalidValue;
+
+            // Keep buffer addresses and membership when the guest switches SDR/HDR formats.
+            port.Groups[setIndex] = new VideoOutBufferGroup { Index = setIndex, Attribute = attribute };
+            port.OutputWidth = attribute.Width;
+            port.OutputHeight = attribute.Height;
+            var guestFormat = MapPixelFormatToGuestTextureFormat(attribute.PixelFormat);
+            foreach (var slot in port.BufferSlots)
+            {
+                if (slot.GroupIndex != setIndex) continue;
+                GuestGpu.Current.RegisterKnownDisplayBuffer(slot.AddressLeft, guestFormat);
+                if (slot.AddressRight != 0)
+                    GuestGpu.Current.RegisterKnownDisplayBuffer(slot.AddressRight, guestFormat);
+            }
+
+            TraceVideoOut($"videoout.change_buffer_attribute2 handle={handle} set={setIndex} " +
+                $"fmt=0x{attribute.PixelFormat:X16} tile={attribute.TilingMode} {attribute.Width}x{attribute.Height}");
+            return 0;
+        }
     }
 
     [SysAbiExport(

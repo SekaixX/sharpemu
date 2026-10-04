@@ -142,6 +142,25 @@ public static class JsonExports
     #pragma warning restore SHEM004
 
     [SysAbiExport(
+        Nid = "i1393UBWu1U",
+        ExportName = "_ZN3sce4Json11Initializer28setGlobalSpecialFloatHandlerEPFKNS0_5ValueENS0_12FunctionTypeEdPS3_PvPbES6_",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceJson")]
+    public static int InitializerSetGlobalSpecialFloatHandler(CpuContext ctx)
+    {
+        var thisAddress = ctx[CpuRegister.Rdi];
+        if (thisAddress == 0)
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        JsonObjectHeap.GlobalSpecialFloatHandler = ctx[CpuRegister.Rsi];
+        JsonObjectHeap.GlobalSpecialFloatHandlerContext = ctx[CpuRegister.Rdx];
+        TraceJson("Initializer.setGlobalSpecialFloatHandler", thisAddress, ctx[CpuRegister.Rsi]);
+        return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
         Nid = "WSOuge5IsCg",
         ExportName = "_ZN3sce4Json14InitParameter2C1Ev",
         Target = Generation.Gen5,

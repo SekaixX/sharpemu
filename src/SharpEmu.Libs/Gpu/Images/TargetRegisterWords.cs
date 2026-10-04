@@ -109,7 +109,7 @@ public readonly record struct DisplaySurfaceWords(
 public readonly record struct ShaderImageShape(bool Volume, bool Arrayed, bool Cube, bool Storage, bool DynamicMip, TextureNumericClass NumericClass, bool OneDimensional = false, bool R128 = false, bool Multisampled = false, bool DepthCompare = false, bool Atomic = false)
 {
     public ShaderImageShape(bool volume, bool arrayed, bool storage, bool dynamicMip, TextureNumericClass numericClass)
-        : this(volume, arrayed, false, storage, dynamicMip, numericClass, false, false, false)
+        : this(volume, arrayed, false, storage, dynamicMip, numericClass, false, false, false, false, false)
     {
     }
 }

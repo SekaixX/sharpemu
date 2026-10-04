@@ -16,7 +16,7 @@ public sealed class RuntimeValueEvaluator
     private readonly IReadOnlyList<byte> _cleanFlatSlots;
     private readonly RuntimeValueEvaluator? _cleanEvaluator;
     private readonly ScalarValue? _activeMask;
-    private readonly Dictionary<ScalarValue, ulong> _cache;
+    private readonly ScalarValueCache _cache;
     private readonly List<ScalarValue> _visiting;
     private string? _failureDetail;
 
@@ -34,7 +34,7 @@ public sealed class RuntimeValueEvaluator
         IReadOnlyList<byte>? cleanFlatSlots = null,
         RuntimeValueEvaluator? cleanEvaluator = null,
         ScalarValue? activeMask = null)
-        : this(plan, inputs, cleanFlatSlots, cleanEvaluator, activeMask, [], [])
+        : this(plan, inputs, cleanFlatSlots, cleanEvaluator, activeMask, new ScalarValueCache(), [])
     {
     }
 
@@ -55,7 +55,7 @@ public sealed class RuntimeValueEvaluator
         IReadOnlyList<byte>? cleanFlatSlots,
         RuntimeValueEvaluator? cleanEvaluator,
         ScalarValue? activeMask,
-        Dictionary<ScalarValue, ulong> cache,
+        ScalarValueCache cache,
         List<ScalarValue> visiting)
     {
         _cache = cache;
@@ -136,6 +136,9 @@ public sealed class RuntimeValueEvaluator
         {
             case ScalarValueKind.Undefined:
                 return false;
+            case ScalarValueKind.MemoryAperture:
+                result = Gen5InlineConstants.DecodeAperture64((uint)value.Payload) >> 32;
+                return true;
             case ScalarValueKind.UserData:
             {
                 var register = value.UserDataRegister;
@@ -271,6 +274,13 @@ public sealed class RuntimeValueEvaluator
             var size = stride == 0 ? (ulong)(uint)records : (ulong)stride * (uint)records;
             if (aligned > size || size - aligned < sizeof(uint))
             {
+                // An unbound (empty) V# reads as zero; overrunning a bound buffer stays a failure.
+                if ((uint)records == 0)
+                {
+                    result = 0;
+                    return true;
+                }
+
                 return Refuse(
                     value,
                     $"buffer_read_out_of_range offset=0x{aligned:X} size=0x{size:X}");
@@ -446,12 +456,15 @@ public sealed class RuntimeValueEvaluator
         if (evaluateTable)
         {
             flattened = new uint[checked(plan.TableReads.Count + additionalTableWords)];
-            foreach (var read in plan.TableReads)
+            inputs.TablePhase?.Invoke(true);
+            try
             {
-                var clean = read.FlatOffset < cleanFlatSlots.Count && cleanFlatSlots[(int)read.FlatOffset] != 0;
-                var selected = clean ? cleanEvaluator : evaluator;
-                if (read.FlatOffset >= plan.TableReads.Count || !selected.Evaluate(read.Value, out var word))
+                foreach (var read in plan.TableReads)
                 {
+                    var clean = read.FlatOffset < cleanFlatSlots.Count && cleanFlatSlots[(int)read.FlatOffset] != 0;
+                    var selected = clean ? cleanEvaluator : evaluator;
+                    if (read.FlatOffset >= plan.TableReads.Count || !selected.Evaluate(read.Value, out var word))
+                    {
                     var node = read.Value;
                     failureDetail = read.FlatOffset >= plan.TableReads.Count
                         ? $"table_slot={read.FlatOffset} reason=slot_out_of_range table_count={plan.TableReads.Count}"
@@ -460,9 +473,14 @@ public sealed class RuntimeValueEvaluator
                     return Fail(
                         $"flattened slot={read.FlatOffset} clean={clean} node={node.Id} " +
                         $"kind={node.Kind} operation={node.Operation} payload=0x{node.Payload:X}");
-                }
+                    }
 
-                flattened[(int)read.FlatOffset] = word;
+                    flattened[(int)read.FlatOffset] = word;
+                }
+            }
+            finally
+            {
+                inputs.TablePhase?.Invoke(false);
             }
         }
 

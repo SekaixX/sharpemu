@@ -42,6 +42,9 @@ public static class AmprExports
     private const uint ReadFileRecordType = 0x17;
     private const uint KernelEventQueueRecordType = 2;
     private const uint WriteAddressRecordType = 3;
+    private const ulong AmmBlockSize = 0x20_0000;
+    private const int AmmUsageDirect = 0;
+    private const int AmmUsageAuto = 1;
     private static readonly ConcurrentDictionary<ulong, CommandBufferState> _commandBuffers = new();
     private static readonly ConcurrentDictionary<ulong, ulong> _commandBufferAliases = new();
     private static readonly bool _traceAmpr =
@@ -134,6 +137,84 @@ public static class AmprExports
     private static readonly Dictionary<string, LinkedListNode<CachedHostFileEntry>> _hostFileByPath =
         new(HostFsPath.Comparer);
     private static readonly LinkedList<CachedHostFileEntry> _hostFileLru = new();
+
+    [SysAbiExport(
+        Nid = "Q07J7XpvhrU",
+        ExportName = "sceAmprAmmGiveDirectMemory",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAmpr")]
+    public static int AmmGiveDirectMemory(CpuContext ctx)
+    {
+        var searchStart = unchecked((long)ctx[CpuRegister.Rdi]);
+        var searchEnd = unchecked((long)ctx[CpuRegister.Rsi]);
+        var size = ctx[CpuRegister.Rdx];
+        var alignment = ctx[CpuRegister.Rcx];
+        var usage = unchecked((int)ctx[CpuRegister.R8]);
+        var outDirectMemoryOffset = ctx[CpuRegister.R9];
+
+        if (searchStart < 0 || searchEnd <= searchStart || outDirectMemoryOffset == 0 || size == 0 ||
+            (size & (AmmBlockSize - 1)) != 0 || (alignment & (AmmBlockSize - 1)) != 0 ||
+            usage is not (AmmUsageDirect or AmmUsageAuto))
+        {
+            return SetAmprResult(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // AMM uses the same physical direct-memory pool, but requires 2 MiB blocks and
+        // memory type zero. The automatic/direct distinction affects later AMM reclamation
+        // on hardware; allocation ownership remains exclusive in SharpEmu's shared map.
+        var savedAlignment = ctx[CpuRegister.Rcx];
+        var savedUsage = ctx[CpuRegister.R8];
+        try
+        {
+            ctx[CpuRegister.Rcx] = alignment == 0 ? AmmBlockSize : alignment;
+            ctx[CpuRegister.R8] = 0;
+            var result = KernelMemoryCompatExports.KernelAllocateDirectMemory(ctx);
+            ctx[CpuRegister.Rax] = unchecked((ulong)(long)result);
+            return result;
+        }
+        finally
+        {
+            ctx[CpuRegister.Rcx] = savedAlignment;
+            ctx[CpuRegister.R8] = savedUsage;
+        }
+    }
+
+    [SysAbiExport(
+        Nid = "wkQR9+xTFKY",
+        ExportName = "sceAmprAmmGetVirtualAddressRanges",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAmpr")]
+    public static int AmmGetVirtualAddressRanges(CpuContext ctx)
+    {
+        var vaStart = ctx[CpuRegister.Rdi];
+        var vaEnd = ctx[CpuRegister.Rsi];
+        var multimapVaStart = ctx[CpuRegister.Rdx];
+        var multimapVaEnd = ctx[CpuRegister.Rcx];
+
+        // Report the address window SharpEmu actually reserves. Current AMM treats the
+        // multimap range as empty and places both of its endpoints at the end of that window.
+        if (vaStart != 0)
+        {
+            _ = ctx.TryWriteUInt64(vaStart, GuestMemoryLayout.GuestUserAddressStart);
+        }
+
+        if (vaEnd != 0)
+        {
+            _ = ctx.TryWriteUInt64(vaEnd, GuestMemoryLayout.GuestPrimaryUserAddressLimit);
+        }
+
+        if (multimapVaStart != 0)
+        {
+            _ = ctx.TryWriteUInt64(multimapVaStart, GuestMemoryLayout.GuestPrimaryUserAddressLimit);
+        }
+
+        if (multimapVaEnd != 0)
+        {
+            _ = ctx.TryWriteUInt64(multimapVaEnd, GuestMemoryLayout.GuestPrimaryUserAddressLimit);
+        }
+
+        return SetAmprResult(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
 
     [SysAbiExport(
         Nid = "8aI7R7WaOlc",
@@ -984,8 +1065,7 @@ public static class AmprExports
 
             if (!AmprFileRegistry.TryGetHostPath(fileId, out hostPath))
             {
-                // A missing id leaves the guest's streaming request pending
-                // forever; say so even when read tracing is off.
+                // An unknown id stalls the guest's stream silently, so warn even without tracing.
                 if (Interlocked.Increment(ref _unknownReadFileIdWarnings) <= 16)
                 {
                     Console.Error.WriteLine(

@@ -90,7 +90,8 @@ public sealed class KernelBackedMemoryTests
     public void ReservationLetsPendingGpuReadsFinishBeforeTakingMappingLocks(bool replaceMapping)
     {
         using var test = new BackedKernelMemory();
-        const ulong address = 0x1026C00000;
+        // A free PRT-area address: a fixed one can already be taken by the runtime's own reservations.
+        var address = SharpEmu.Libs.Tests.Memory.HostViews.HostViewTestSupport.ProbeGuestAddress(test.Host, 0x10000);
         test.Reserve(0x10000, address);
         SetPrtAperture(test, address, 0x10000);
         using var memory = new GuestGpuMemory(test.Memory);
@@ -154,7 +155,8 @@ public sealed class KernelBackedMemoryTests
     {
         using var test = new BackedKernelMemory();
         var previousPool = KernelMemoryCompatExports.SetFlexibleBackingForTests(new FlexibleBackingPool(0x4000000, 0x4000000));
-        const ulong address = 0x1026C00000;
+        // A free PRT-area address: a fixed one can already be taken by the runtime's own reservations.
+        var address = SharpEmu.Libs.Tests.Memory.HostViews.HostViewTestSupport.ProbeGuestAddress(test.Host, 0x10000);
         test.Reserve(0x10000, address);
         SetPrtAperture(test, address, 0x10000);
         using var memory = new GuestGpuMemory(test.Memory);
@@ -313,6 +315,22 @@ public sealed class KernelBackedMemoryTests
     }
 
     [Fact]
+    public void LargeVirtualReservationFallsBackToSparseGuestRange()
+    {
+        using var test = new BackedKernelMemory();
+        const ulong size = 0x8000000000;
+        test.Host.FailReserveHoleWhen = (_, requestedSize) => requestedSize >= size;
+
+        var address = test.Reserve(size);
+        Assert.NotEqual(0UL, address);
+        Assert.Equal((address, address + size), test.Query(address));
+
+        test.Allocate(0, 0x4000);
+        Assert.Equal(address, test.Map(0, 0x4000, address));
+        Assert.Equal((address, address + 0x4000), test.Query(address));
+    }
+
+    [Fact]
     public void AddressSearchUsesTheFullReservationExtent()
     {
         using var test = new BackedKernelMemory();
@@ -325,7 +343,10 @@ public sealed class KernelBackedMemoryTests
         Assert.Equal(start, (ulong)region.GetType().GetProperty("Address")!.GetValue(region)!);
         Assert.Equal(size, (ulong)region.GetType().GetProperty("Length")!.GetValue(region)!);
         test.Allocate(0, 0x10000);
-        Assert.True(test.Map(0, 0x10000) >= start + size);
+        // The search runs over the shared host address space, so a range another test
+        // frees below the reservation may be picked; only a pick inside it is wrong.
+        var mapped = test.Map(0, 0x10000);
+        Assert.True(mapped >= start + size || mapped + 0x10000 <= start);
     }
 
     [Fact]

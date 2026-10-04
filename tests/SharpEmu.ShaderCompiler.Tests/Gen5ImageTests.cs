@@ -180,6 +180,15 @@ public sealed class Gen5ImageTests
         Assert.DoesNotContain(instructions, item => item.Opcode == SpirvOp.ImageSampleExplicitLod);
     }
 
+    [Fact]
+    public void ImageGatherCompareLzUsesNativeDepthGather()
+    {
+        var instructions = ReadSpirvInstructions(
+            CompileImageOperation("ImageGather4CLz", dimension: 1, unifiedFormat: 22u));
+
+        Assert.Contains(instructions, item => item.Opcode == SpirvOp.ImageDrefGather);
+    }
+
     [Theory]
     [InlineData(22u, true)]
     [InlineData(71u, false)]
@@ -365,7 +374,7 @@ public sealed class Gen5ImageTests
             item => item.Opcode == SpirvOp.ImageGather);
 
         // OpImageGather has no legal explicit-LOD image operand in Vulkan. The
-        // lowering consumes coordinates and the component only, matching Kyty's
+        // lowering consumes coordinates and the component only, matching the
         // explicit, warned mip-zero approximation.
         Assert.Equal(5, gather.Operands.Length);
     }

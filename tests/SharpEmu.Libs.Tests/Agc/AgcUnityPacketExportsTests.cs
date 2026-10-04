@@ -21,7 +21,7 @@ public sealed class AgcUnityPacketExportsTests
     [InlineData("qzMN2XKGA4k", "sceAgcAcbCopyData")]
     [InlineData("CbQh3DKMSno", "sceAgcAcbCopyDataGetSize")]
     [InlineData("T6xuVw0KUJo", "sceAgcDebugRaiseException")]
-    [InlineData("Ikfdt-rIqCE", "sceAgcUnknownIkfdtRIqCE")]
+    [InlineData("Ikfdt-rIqCE", "sceAgcUnknownIkfdt")]
     public void UnityAgcImports_AreRegisteredInTheAgcLibrary(string nid, string expectedName)
     {
         var manager = new ModuleManager();
@@ -110,9 +110,9 @@ public sealed class AgcUnityPacketExportsTests
             [CpuRegister.Rcx] = 0x34567,
         };
 
-        Assert.Equal(0, AgcExports.PatchIndirectBuffer(ctx));
+        Assert.Equal(0, AgcExports.UnknownIkfdt(ctx));
 
-        Assert.Equal(0x4455_667Bu, ReadUInt32(memory, PacketAddress + 4));
+        Assert.Equal(0x4455_6678u, ReadUInt32(memory, PacketAddress + 4));
         Assert.Equal(3u, ReadUInt32(memory, PacketAddress + 8));
         Assert.Equal(0xE5F3_4567u, ReadUInt32(memory, PacketAddress + 12));
     }

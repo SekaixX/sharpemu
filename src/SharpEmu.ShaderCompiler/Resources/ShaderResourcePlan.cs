@@ -38,6 +38,7 @@ public sealed class ShaderResourcePlan
     public IReadOnlyList<ScalarValue> DynamicReads { get; private set; } = [];
     public IReadOnlyList<byte> CleanFlatSlots { get; private set; } = [];
     public IReadOnlyList<IndirectImageAccess> IndirectImages { get; private set; } = [];
+    public IReadOnlyList<BufferCandidateTablePlan> BufferCandidateTables { get; private set; } = [];
     public bool RequiresSpecializationMemory { get; private set; }
     public ShaderResourceInfo Info { get; private set; } = new();
 
@@ -77,7 +78,8 @@ public sealed class ShaderResourcePlan
                 access.Handle is null ? null : Rewrite(access.Handle),
                 access.SamplerHandle is null ? null : Rewrite(access.SamplerHandle),
                 access.Read is null ? null : (reads.Replacements.ContainsKey(access.Read) ? RewriteRead(access.Read) : Rewrite(access.Read)),
-                access.Offset is null ? null : Rewrite(access.Offset));
+                access.Offset is null ? null : Rewrite(access.Offset),
+                access.Active is null ? null : Rewrite(access.Active));
         }
 
         // Diagnostics observe rewritten values before descriptor validation.
@@ -86,6 +88,7 @@ public sealed class ShaderResourcePlan
         plan.DescriptorSources = tracked.Sources;
         plan.Info = tracked.Info;
         plan.IndirectImages = tracked.IndirectImages;
+        plan.BufferCandidateTables = tracked.BufferCandidateTables;
         plan.DynamicReads = plan.DynamicReads.Where(read => !tracked.IndirectReads.Contains(read)).ToList();
 
         var materialization = new List<uint>();
@@ -234,6 +237,13 @@ public sealed class ShaderResourcePlan
         }
     }
 
-    public bool ValidateRuntimeValue(ScalarValue value) =>
-        new RuntimeValueValidator(Graph, UserDataBase, UserDataCount, TableReads.Count).Validate(value);
+    public bool ValidateRuntimeValue(ScalarValue value) => ValidateRuntimeValue(value, out _);
+
+    public bool ValidateRuntimeValue(ScalarValue value, out bool controlDependent)
+    {
+        var validator = new RuntimeValueValidator(Graph, UserDataBase, UserDataCount, TableReads.Count);
+        var ok = validator.Validate(value);
+        controlDependent = validator.ControlDependent;
+        return ok;
+    }
 }

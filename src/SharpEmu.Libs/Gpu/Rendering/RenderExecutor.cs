@@ -38,7 +38,16 @@ public enum GuestIndexType : uint
 // Resolves draw and dispatch state from the register banks and records it through the host.
 public sealed partial class RenderExecutor
 {
-    private const uint PrimitiveShaderStageMask = 0x02002000;
+    // Prospero uses both the full NGG mask and compact primitive-shader masks
+    // when the task/mesh front end has already folded the upper enable bits
+    // away. Little Nightmares also emits 0x2030 for a primitive path with no
+    // geometry shader; the remaining bits describe the fixed NGG setup.
+    // GS_W32_EN (bit 22) and VS_W32_EN (bit 23) only select the wave size;
+    // graphics stages always compile as wave32, so they do not change the path.
+    private const uint VgtShaderStagesWaveSizeBits = (1u << 22) | (1u << 23);
+
+    private static bool IsPrimitiveShaderStageMask(uint stages) =>
+        (stages & ~VgtShaderStagesWaveSizeBits) is 0x02002000 or 0x00002000 or 0x00002030;
     private const uint MaxOutputPerSubgroupLimit = 0x40;
     private static readonly SharpEmuLogger GeometryLog = SharpEmuLog.For("GPU.Geometry");
     private static readonly bool LogGeometry = string.Equals(
@@ -113,7 +122,8 @@ public sealed partial class RenderExecutor
 
     private readonly record struct DrawCall(string Name, RecordedOperation Operation, uint Count, uint InstanceCount, uint FirstInstance);
 
-    private readonly record struct DrawEmission(bool Indexed, int VertexOffset, uint FirstVertex, uint FirstInstance);
+    // IndirectArgumentsAddress: the GPU reads the indexed draw's counts from guest memory there.
+    private readonly record struct DrawEmission(bool Indexed, int VertexOffset, uint FirstVertex, uint FirstInstance, ulong IndirectArgumentsAddress = 0);
 
     private readonly record struct IndexSource(
         bool Enabled,
@@ -181,6 +191,91 @@ public sealed partial class RenderExecutor
     }
 
     public void DrawIndexed(ulong submitId, RegisterBanks banks, in DrawIndexedArguments arguments)
+    {
+        if (arguments.IndirectArgumentsAddress != 0 && !CanDrawIndirectOnGpu(banks, in arguments))
+        {
+            DrawIndexedWithCpuArguments(submitId, banks, in arguments);
+            return;
+        }
+
+        DrawIndexedCore(submitId, banks, in arguments);
+    }
+
+    // The GPU reads the arguments of an indirect draw unless the draw is emulated from
+    // its counts: strips (metadata clear quads), legacy primitives, 8-bit indices and
+    // restart indices converted on the CPU.
+    private static bool CanDrawIndirectOnGpu(RegisterBanks banks, in DrawIndexedArguments arguments)
+    {
+        switch ((GuestPrimitiveType)banks.UserConfig.PrimitiveType)
+        {
+            case GuestPrimitiveType.PointList:
+            case GuestPrimitiveType.LineList:
+            case GuestPrimitiveType.LineStrip:
+            case GuestPrimitiveType.TriangleList:
+            case GuestPrimitiveType.TriangleFan:
+            case GuestPrimitiveType.Polygon:
+            case GuestPrimitiveType.RectangleList:
+                break;
+            default:
+                return false;
+        }
+
+        var index32 = (GuestIndexType)arguments.IndexTypeAndSize == GuestIndexType.Index32;
+        if (!index32 && (GuestIndexType)arguments.IndexTypeAndSize != GuestIndexType.Index16)
+        {
+            return false;
+        }
+
+        if ((banks.UserConfig.PrimitiveResetControl & 0x1) != 0)
+        {
+            var indexMask = index32 ? uint.MaxValue : 0xFFFFu;
+            if ((banks.Context.PrimitiveResetIndex & indexMask) != indexMask)
+            {
+                return false;
+            }
+        }
+
+        return (ulong)arguments.IndexCount * (index32 ? 4ul : 2ul) <= MaxIndirectIndexBufferBytes;
+    }
+
+    private const ulong MaxIndirectIndexBufferBytes = 64ul << 20;
+
+    // Reads the indirect arguments now and draws from them, as the interpreter would have.
+    private void DrawIndexedWithCpuArguments(ulong submitId, RegisterBanks banks, in DrawIndexedArguments arguments)
+    {
+        Span<byte> bytes = stackalloc byte[(int)IndexedIndirectArgumentsSize];
+        if (!_host.TryReadGuest(arguments.IndirectArgumentsAddress, bytes))
+        {
+            throw _host.Fatal($"The indirect draw arguments are unreadable: address=0x{arguments.IndirectArgumentsAddress:X16}.");
+        }
+
+        var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytes);
+        var elementSize = (GuestIndexType)arguments.IndexTypeAndSize switch
+        {
+            GuestIndexType.Index16 => 2ul,
+            GuestIndexType.Index32 => 4ul,
+            _ => 1ul,
+        };
+        var resolved = arguments with
+        {
+            IndexCount = arguments.UnboundedIndexBuffer ? words[0] : Math.Min(words[0], arguments.IndexCount),
+            InstanceCount = words[1],
+            IndexAddress = arguments.IndexAddress + (words[2] * elementSize),
+            BaseVertex = unchecked((int)words[3]),
+            FirstInstance = words[4],
+            IndirectArgumentsAddress = 0,
+            UnboundedIndexBuffer = false,
+        };
+        if (resolved.IndexCount == 0 || resolved.InstanceCount == 0)
+        {
+            _host.ResetBindings();
+            return;
+        }
+
+        DrawIndexedCore(submitId, banks, in resolved);
+    }
+
+    private void DrawIndexedCore(ulong submitId, RegisterBanks banks, in DrawIndexedArguments arguments)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawExecutor);
         if (!_host.IsRecording)
@@ -297,7 +392,23 @@ public sealed partial class RenderExecutor
             return;
         }
 
+        if (arguments.IndirectArgumentsAddress != 0 && state.ColorCount == 0 && !state.Depth.HasTarget)
+        {
+            // A targetless draw may be retained and replayed later; it needs its counts.
+            DrawIndexedWithCpuArguments(submitId, banks, in arguments);
+            return;
+        }
+
         ResolveShaderPrograms(banks, ref state);
+        if (arguments.IndirectArgumentsAddress != 0 && state.Programs.VertexInput.Mesh.IsActive)
+        {
+            // Mesh dispatch dimensions and push data are derived from the draw
+            // counts. Resolve the guest arguments before either is calculated;
+            // vkCmdDrawIndexedIndirect is not a mesh-task command.
+            DrawIndexedWithCpuArguments(submitId, banks, in arguments);
+            return;
+        }
+
         if (!ApplyProgramAdaptations(banks, in draw, ref state, new TargetlessDrawArguments(submitId, true, arguments, default)))
         {
             _host.ResetBindings();
@@ -344,7 +455,8 @@ public sealed partial class RenderExecutor
             true,
             vertexOffset,
             0,
-            indirect ? arguments.FirstInstance : ResolveInstanceOffset(state.Programs.VertexInput));
+            indirect ? arguments.FirstInstance : ResolveInstanceOffset(state.Programs.VertexInput),
+            arguments.IndirectArgumentsAddress);
         RecordDraw(submitId, banks, in draw, ref state, topology, in emission, in indexSource, primitiveRestart, setBindDebug: true, setAutoDebug: false);
         _host.ResetBindings();
     }
@@ -588,33 +700,36 @@ public sealed partial class RenderExecutor
         var vertex = banks.Shader.Vertex;
         var stages = context.ShaderStages;
         var knownOutputPrimitive = IsKnownGeometryOutputPrimitiveType(shaderInterface.GeometryOutputPrimitiveType);
-        var primitiveShaderVertexPath =
-            stages == PrimitiveShaderStageMask && vertex.ExportAddress != 0 &&
-            shaderInterface.GeometryMaxVerticesOut == 0 && knownOutputPrimitive;
         var continuationAddress = 0ul;
         var fusedRegistered = vertex.ExportAddress != 0 &&
             MergedGeometryProgramResolver.HasMergedGeometryStage(stages) &&
             _pipelines.TryGetFusedGraphicsProgram(vertex.ExportAddress, out continuationAddress);
+        var activeMergedGeometry = MergedGeometryProgramResolver.IsActive(
+            stages,
+            vertex.ExportAddress,
+            vertex.GeometryAddress,
+            fusedRegistered,
+            continuationAddress);
+        var primitiveShaderVertexPath =
+            !activeMergedGeometry &&
+            IsPrimitiveShaderStageMask(stages) && vertex.ExportAddress != 0 &&
+            (vertex.GeometryAddress == 0 ||
+             (shaderInterface.GeometryMaxVerticesOut == 0 && knownOutputPrimitive));
         var legacyFusedGeometryPath =
-            MergedGeometryProgramResolver.IsActive(
-                stages,
-                vertex.ExportAddress,
-                vertex.GeometryAddress,
-                fusedRegistered,
-                continuationAddress) &&
+            activeMergedGeometry &&
             shaderInterface.GeometryMaxVerticesOut != 0 && knownOutputPrimitive &&
             _pipelines.SupportsFusedGeometry;
-        var unsupportedStageMask = stages != 0 && stages != PrimitiveShaderStageMask && !legacyFusedGeometryPath;
+        var unsupportedMergedGeometry = activeMergedGeometry && !legacyFusedGeometryPath;
+        var unsupportedStageMask = stages != 0 && !IsPrimitiveShaderStageMask(stages) && !legacyFusedGeometryPath;
         var unsupportedGeometryStage =
             vertex.ExportAddress != 0 && vertex.GeometryAddress != 0 &&
             !primitiveShaderVertexPath && !legacyFusedGeometryPath;
-        var geometryRegisters =
-            !knownOutputPrimitive ||
-            (!legacyFusedGeometryPath &&
-                ((shaderInterface.PrimitiveShaderSubgroupControl != 0 && shaderInterface.PrimitiveShaderSubgroupControl != 1) ||
-                 shaderInterface.GeometryMaxVerticesOut != 0 ||
-                 shaderInterface.MaxOutputPerSubgroup > MaxOutputPerSubgroupLimit));
-        var unsupported = unsupportedStageMask || unsupportedGeometryStage || geometryRegisters;
+        var geometryRegisters = !primitiveShaderVertexPath && !legacyFusedGeometryPath &&
+            ((shaderInterface.PrimitiveShaderSubgroupControl != 0 && shaderInterface.PrimitiveShaderSubgroupControl != 1) ||
+             shaderInterface.GeometryMaxVerticesOut != 0 ||
+             !knownOutputPrimitive ||
+             shaderInterface.MaxOutputPerSubgroup > MaxOutputPerSubgroupLimit);
+        var unsupported = unsupportedMergedGeometry || unsupportedStageMask || unsupportedGeometryStage || geometryRegisters;
 
         if (LogLegacyFusedGeometry &&
             (MergedGeometryProgramResolver.HasMergedGeometryStage(stages) || fusedRegistered))
@@ -629,7 +744,8 @@ public sealed partial class RenderExecutor
                 $"maxVerticesOut=0x{shaderInterface.GeometryMaxVerticesOut:X8} maxOutput=0x{shaderInterface.MaxOutputPerSubgroup:X8} " +
                 $"primitiveGroup=0x{banks.UserConfig.GeometryEngineControl.PrimitiveGroupSize:X4} " +
                 $"vertexGroup=0x{banks.UserConfig.GeometryEngineControl.VertexGroupSize:X4} " +
-                $"legacyFusedPath={legacyFusedGeometryPath} unsupportedMask={unsupportedStageMask} " +
+                $"activeMerged={activeMergedGeometry} legacyFusedPath={legacyFusedGeometryPath} " +
+                $"unsupportedMerged={unsupportedMergedGeometry} unsupportedMask={unsupportedStageMask} " +
                 $"unsupportedGeometry={unsupportedGeometryStage} unsupportedRegisters={geometryRegisters}");
         }
 
@@ -645,7 +761,8 @@ public sealed partial class RenderExecutor
                 $"exportVertices=0x{shaderInterface.ExportVerticesPerSubgroup:X8} geometryPrimitives=0x{shaderInterface.GeometryPrimitivesPerSubgroup:X8} " +
                 $"instancedPrimitives=0x{shaderInterface.GeometryInstancedPrimitivesInSubgroup:X8} maxOutput=0x{shaderInterface.MaxOutputPerSubgroup:X8} " +
                 $"maxVerticesOut=0x{shaderInterface.GeometryMaxVerticesOut:X8} outputPrimitive=0x{shaderInterface.GeometryOutputPrimitiveType:X8} " +
-                $"primitiveVertexPath={primitiveShaderVertexPath} legacyFusedPath={legacyFusedGeometryPath} " +
+                $"primitiveVertexPath={primitiveShaderVertexPath} activeMerged={activeMergedGeometry} legacyFusedPath={legacyFusedGeometryPath} " +
+                $"unsupportedMerged={unsupportedMergedGeometry} " +
                 $"unsupportedMask={unsupportedStageMask} unsupportedGeometry={unsupportedGeometryStage} unsupportedRegisters={geometryRegisters}");
         }
 
@@ -656,7 +773,15 @@ public sealed partial class RenderExecutor
 
         if (Interlocked.Exchange(ref _geometryWarningShown, 1) == 0)
         {
-            Console.Error.WriteLine("Warning: the title uses unsupported graphics pipelines; some draw calls were skipped.");
+            Console.Error.WriteLine(
+                "Warning: the title uses unsupported graphics pipelines; some draw calls were skipped. " +
+                $"stages=0x{stages:X8} subgroup=0x{shaderInterface.PrimitiveShaderSubgroupControl:X8} " +
+                $"maxOutput=0x{shaderInterface.MaxOutputPerSubgroup:X8} " +
+                $"maxVerticesOut=0x{shaderInterface.GeometryMaxVerticesOut:X8} " +
+                $"outputPrimitive=0x{shaderInterface.GeometryOutputPrimitiveType:X8} " +
+                $"export=0x{vertex.ExportAddress:X16} geometry=0x{vertex.GeometryAddress:X16} " +
+                $"unsupportedMerged={unsupportedMergedGeometry} unsupportedMask={unsupportedStageMask} unsupportedGeometry={unsupportedGeometryStage} " +
+                $"unsupportedRegisters={geometryRegisters}.");
         }
 
         // The dedicated geometry trace must retain rejected draws even after
@@ -814,7 +939,8 @@ public sealed partial class RenderExecutor
             banks.UserConfig,
             targetExportMapping,
             boundColorSlots,
-            state.PixelActive);
+            state.PixelActive,
+            state.Depth.HasTarget);
     }
 
     // A guest can leave stale render-target registers enabled while its pixel program exports

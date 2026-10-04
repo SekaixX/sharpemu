@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.ShaderCompiler;
+using SharpEmu.ShaderCompiler.Resources;
 
 namespace SharpEmu.ShaderCompiler.Vulkan;
 
@@ -11,7 +12,10 @@ public static partial class Gen5SpirvTranslator
     {
         private bool UsesScratch() =>
             _request.Program.Instructions.Any(static instruction =>
-                instruction.Control is Gen5ScratchMemoryControl);
+                instruction.Control is Gen5ScratchMemoryControl ||
+                instruction.Opcode.StartsWith("Scratch", StringComparison.Ordinal)) ||
+            _request.Memory.Entries.Any(static memory =>
+                memory.AddressSpace is FlatAddressSpace.Private or FlatAddressSpace.SharedOrPrivate);
 
         private void DeclareScratch()
         {
@@ -110,7 +114,7 @@ public static partial class Gen5SpirvTranslator
                 {
                     if (isSubdwordStore)
                     {
-                        StoreScratchBytes(
+                        StoreBoundedScratchBytes(
                             address,
                             LoadV(control.SourceVectorRegister),
                             byteCount,
@@ -120,7 +124,7 @@ public static partial class Gen5SpirvTranslator
 
                     for (uint component = 0; component < control.DwordCount; component++)
                     {
-                        StoreScratchBytes(
+                        StoreBoundedScratchBytes(
                             AddScratchByteOffset(address, component * sizeof(uint)),
                             LoadV(control.SourceVectorRegister + component),
                             sizeof(uint),
@@ -190,7 +194,7 @@ public static partial class Gen5SpirvTranslator
                 UInt(_scratchByteCount - byteCount));
         }
 
-        private uint ScratchPointer(uint byteAddress, uint valid)
+        private uint BoundedScratchPointer(uint byteAddress, uint valid)
         {
             // Select a known-valid address before AccessChain. This keeps even
             // speculative host evaluation inside the at-least-one-dword array.
@@ -216,7 +220,7 @@ public static partial class Gen5SpirvTranslator
                 var byteAddress = AddScratchByteOffset(address, index);
                 var word = Load(
                     _uintType,
-                    ScratchPointer(byteAddress, valid));
+                    BoundedScratchPointer(byteAddress, valid));
                 var wordShift = ShiftLeftLogical(
                     BitwiseAnd(byteAddress, UInt(3)),
                     UInt(3));
@@ -272,7 +276,7 @@ public static partial class Gen5SpirvTranslator
                     half);
         }
 
-        private void StoreScratchBytes(
+        private void StoreBoundedScratchBytes(
             uint address,
             uint value,
             uint byteCount,
@@ -284,7 +288,7 @@ public static partial class Gen5SpirvTranslator
                 for (uint index = 0; index < byteCount; index++)
                 {
                     var byteAddress = AddScratchByteOffset(address, index);
-                    var pointer = ScratchPointer(
+                    var pointer = BoundedScratchPointer(
                         byteAddress,
                         _module.ConstantBool(true));
                     var word = Load(_uintType, pointer);

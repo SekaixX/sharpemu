@@ -10,8 +10,10 @@ namespace SharpEmu.Libs.Tests.Loader;
 /// <summary>
 /// The forward span search anchors at the faulting instruction, so it gives up
 /// whenever the next instruction is a branch target, touches RSP, or changes
-/// control flow. The enclosing search takes its bytes from before the faulting
-/// instruction and must never let the RSP shift cover an RSP-relative access.
+/// control flow. These are the three shapes that actually occur around the
+/// faulting sites of a red-zone function in a shipped title; the enclosing
+/// search has to take its bytes from before the faulting instruction instead,
+/// and must never let the RSP shift cover an RSP-relative access.
 /// </summary>
 public sealed class GuestRedZoneEnclosingSpanTests
 {
@@ -37,6 +39,7 @@ public sealed class GuestRedZoneEnclosingSpanTests
 
         Assert.Equal(Base + 2, address);
         Assert.Equal(8, length);
+        // The span ends exactly at the branch target, which is never rewritten.
         Assert.Equal(Base + 10, address + (ulong)length);
         Assert.Equal(1, coreStart);
         Assert.Equal(1, coreCount);
@@ -62,6 +65,8 @@ public sealed class GuestRedZoneEnclosingSpanTests
 
         Assert.Equal(Base + 2, address);
         Assert.Equal(8, length);
+        // coreStart == 1 is what keeps the shift off the [rsp-0x10] load: shifting
+        // it would move the access 128 bytes and silently read the wrong slot.
         Assert.Equal(1, coreStart);
         Assert.Equal(1, coreCount);
     }
@@ -84,6 +89,8 @@ public sealed class GuestRedZoneEnclosingSpanTests
 
         Assert.Equal(Base, address);
         Assert.Equal(6, length);
+        // A stolen instruction that can fault too has to sit inside the shift,
+        // otherwise it recreates the very corruption this pass prevents.
         Assert.Equal(0, coreStart);
         Assert.Equal(2, coreCount);
     }

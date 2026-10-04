@@ -25,15 +25,16 @@ public sealed class RuntimeEvaluationScratchTests
     {
         var scratch = RuntimeEvaluationScratch.Rent();
         var value = ScalarValue.UserData(0);
-        scratch.Values.Add(value, 42);
+        scratch.Values[value] = 42;
         scratch.Visiting.Add(value);
-        var capacity = scratch.Values.EnsureCapacity(0);
+        var capacity = scratch.Values.Capacity;
         scratch.Dispose();
         using var reused = RuntimeEvaluationScratch.Rent();
         Assert.Same(scratch, reused);
-        Assert.Empty(reused.Values);
+        Assert.Equal(0, reused.Values.Count);
+        Assert.False(reused.Values.TryGetValue(value, out _));
         Assert.Empty(reused.Visiting);
-        Assert.Equal(capacity, reused.Values.EnsureCapacity(0));
+        Assert.Equal(capacity, reused.Values.Capacity);
         using var nested = RuntimeEvaluationScratch.Rent();
         Assert.NotSame(reused, nested);
     }

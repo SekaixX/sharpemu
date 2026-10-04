@@ -228,11 +228,7 @@ public sealed class CommandStreamQueue
     // been interpreted. This is intentionally not a native-GPU retirement fence.
     public IdleOutcome Done()
     {
-        var outcome = IdleOutcome.Completed;
-        if (_processingThread != Thread.CurrentThread)
-        {
-            outcome = WaitForIdle();
-        }
+        var outcome = _processingThread == Thread.CurrentThread ? IdleOutcome.Completed : WaitForIdle();
 
         lock (_gate)
         {

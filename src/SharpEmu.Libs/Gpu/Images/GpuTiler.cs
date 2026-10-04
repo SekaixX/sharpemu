@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Numerics;
 using System.Runtime.InteropServices;
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Scheduling;
@@ -146,6 +147,21 @@ public sealed unsafe class GpuTiler : IDisposable
         DestroyPipeline(_d32ToD16);
         DestroyPipeline(_swapBgra16);
         _pools.Dispose();
+        lock (_scratchGate)
+        {
+            _scratchDisposed = true;
+            foreach (var pooled in _scratchPool.Values)
+            {
+                foreach (var buffer in pooled)
+                {
+                    buffer.Dispose();
+                }
+            }
+
+            _scratchPool.Clear();
+            _scratchPooledBytes = 0;
+        }
+
         vk.DestroyPipelineLayout(_device.Device, _pipelineLayout, null);
         vk.DestroyDescriptorSetLayout(_device.Device, _descriptorLayout, null);
         _pipelineLayout = default;
@@ -170,19 +186,68 @@ public sealed unsafe class GpuTiler : IDisposable
 
     private ulong StorageAlignment => Math.Max(_device.MinStorageBufferOffsetAlignment, 4);
 
-    // The scratch stays alive through the current tick; a completion action frees it.
-    private GpuBuffer AllocateScratch(ulong size)
+    // Image uploads and downloads that tile or swap need a scratch every time, several
+    // per frame; creating and allocating a Vulkan buffer each time cost ~4 ms per frame.
+    // Scratches are pooled by power-of-two capacity and return to the pool when their tick
+    // completes, so the GPU is done with them before anyone else records into them.
+    private const int ScratchMinimumShift = 16;
+    private const int ScratchBuffersPerSize = 8;
+    private const ulong ScratchPoolBudget = 512UL << 20;
+    private readonly object _scratchGate = new();
+    private readonly Dictionary<int, Stack<GpuBuffer>> _scratchPool = new();
+    private ulong _scratchPooledBytes;
+
+    // The scratch stays alive through the current tick; the caller sees exactly `size` bytes.
+    private TilerBufferSpan AllocateScratch(ulong size)
     {
         if (size == 0)
         {
             throw SubmissionScheduler.Fatal("The tiler scratch size is zero.");
         }
 
-        var buffer = new GpuBuffer(_device, _scheduler, GpuBufferUsage.DeviceLocal, 0,
-            BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit, size);
-        _scheduler.QueueCompletionAction(buffer.Dispose);
-        return buffer;
+        var shift = Math.Max(ScratchMinimumShift, 64 - BitOperations.LeadingZeroCount(size - 1));
+        GpuBuffer? buffer = null;
+        lock (_scratchGate)
+        {
+            if (_scratchPool.TryGetValue(shift, out var pooled) && pooled.TryPop(out var reused))
+            {
+                buffer = reused;
+                _scratchPooledBytes -= buffer.Size;
+            }
+        }
+
+        buffer ??= new GpuBuffer(_device, _scheduler, GpuBufferUsage.DeviceLocal, 0,
+            BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit,
+            shift >= 63 ? size : 1UL << shift);
+        _scheduler.QueueCompletionAction(() => ReturnScratch(shift, buffer));
+        return new TilerBufferSpan(buffer.Handle, 0, size);
     }
+
+    private void ReturnScratch(int shift, GpuBuffer buffer)
+    {
+        lock (_scratchGate)
+        {
+            if (!_scratchDisposed && _scratchPooledBytes + buffer.Size <= ScratchPoolBudget)
+            {
+                if (!_scratchPool.TryGetValue(shift, out var pooled))
+                {
+                    pooled = new Stack<GpuBuffer>();
+                    _scratchPool[shift] = pooled;
+                }
+
+                if (pooled.Count < ScratchBuffersPerSize)
+                {
+                    pooled.Push(buffer);
+                    _scratchPooledBytes += buffer.Size;
+                    return;
+                }
+            }
+        }
+
+        buffer.Dispose();
+    }
+
+    private bool _scratchDisposed;
 
     private Pipeline CreateComputePipeline(byte[] spirv, string operation)
     {
@@ -537,8 +602,8 @@ public sealed unsafe class GpuTiler : IDisposable
         var dispatches = new List<TransferDispatch>();
         Prepare(false, tiledCapacity, linearCapacity, transfers, sourceBase, 0, dispatches);
         var scratch = AllocateScratch((linearCapacity + 3) & ~3UL);
-        Record(false, tiled, tiledOffset, tiledCapacity, scratch.Handle, 0, scratch.Size, dispatches, true);
-        return new TilerBufferSpan(scratch.Handle, 0, linearCapacity);
+        Record(false, tiled, tiledOffset, tiledCapacity, scratch.Buffer, 0, scratch.Size, dispatches, true);
+        return new TilerBufferSpan(scratch.Buffer, 0, linearCapacity);
     }
 
     public void Tile(VkBuffer linear, ulong linearOffset, ulong linearCapacity, VkBuffer tiled, ulong tiledOffset, ulong tiledCapacity, ReadOnlySpan<TileTransfer> transfers)
@@ -562,8 +627,8 @@ public sealed unsafe class GpuTiler : IDisposable
         var dispatches = new List<TransferDispatch>();
         Prepare(true, tiledCapacity, linearCapacity, transfers, 0, targetBase, dispatches);
         var linear = AllocateScratch((linearCapacity + 3) & ~3UL);
-        image.DownloadToBuffer(regions, linear.Handle, 0, linear.Size);
-        var source = new TilerBufferSpan(linear.Handle, 0, linear.Size);
+        image.DownloadToBuffer(regions, linear.Buffer, 0, linear.Size);
+        var source = linear;
         if (swap == ColorChannelSwap.SwapBgra16)
         {
             source = SwapBgra16(source);
@@ -572,11 +637,7 @@ public sealed unsafe class GpuTiler : IDisposable
         Record(true, source.Buffer, source.Offset, linearCapacity, tiled, tiledOffset, tiledCapacity, dispatches, false);
     }
 
-    public TilerBufferSpan GetScratchBuffer(ulong size)
-    {
-        var scratch = AllocateScratch((size + 3) & ~3UL);
-        return new TilerBufferSpan(scratch.Handle, 0, scratch.Size);
-    }
+    public TilerBufferSpan GetScratchBuffer(ulong size) => AllocateScratch((size + 3) & ~3UL);
 
     private StorageBinding BindStorage(TilerBufferSpan buffer, ulong size)
     {
@@ -784,8 +845,7 @@ public sealed unsafe class GpuTiler : IDisposable
             throw SubmissionScheduler.Fatal($"The BGRA16 swap input size is invalid: size={input.Size}.");
         }
 
-        var output = AllocateScratch(input.Size);
-        var result = new TilerBufferSpan(output.Handle, 0, output.Size);
+        var result = AllocateScratch(input.Size);
         SwapBgra16(input, result, (uint)(input.Size / 8));
         return result;
     }

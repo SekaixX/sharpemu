@@ -6,10 +6,18 @@ using System.Runtime.InteropServices;
 using Iced.Intel;
 using SharpEmu.Core.Loader;
 using SharpEmu.Core.Memory;
+using SharpEmu.HLE;
 using Xunit;
 
 namespace SharpEmu.Libs.Tests.Loader;
 
+[CollectionDefinition(GuestRedZonePatcherCollection.Name, DisableParallelization = true)]
+public sealed class GuestRedZonePatcherCollection
+{
+    public const string Name = "GuestRedZonePatcher";
+}
+
+[Collection(GuestRedZonePatcherCollection.Name)]
 public sealed class GuestRedZonePatcherTests
 {
     [Theory]
@@ -68,7 +76,13 @@ public sealed class GuestRedZonePatcherTests
 
         using var memory = new PhysicalVirtualMemory();
         const ulong imageSize = 0x10000;
-        var imageBase = memory.AllocateAt(0, imageSize);
+        // Put the image at the start of a large free hole so the trampoline range beside it
+        // is free too: the runtime's heaps around an arbitrary address can leave none in reach.
+        const ulong holeSize = 0x4000000;
+        var hole = (ulong)HostMemory.Alloc(null, (nuint)holeSize, HostMemory.MEM_RESERVE, HostMemory.PAGE_NOACCESS);
+        Assert.NotEqual(0UL, hole);
+        Assert.True(HostMemory.Free((void*)hole, 0, HostMemory.MEM_RELEASE));
+        var imageBase = memory.AllocateAt(hole, imageSize);
         const ulong expected = 0x1122_3344_5566_7788;
         // Save a value in the red zone before the memory read.
         // Read the saved value after the memory read and return it.
@@ -351,6 +365,138 @@ public sealed class GuestRedZonePatcherTests
         Assert.Equal(1, result.CandidateSites);
         Assert.Equal(1, result.PatchedSites);
         Assert.Equal(2, result.IndirectBranchRefusals);
+    }
+
+    // Demon's Souls FUN_800ad8fe0: a four-byte compare followed by JZ had no room
+    // for the jump, so a fault there let Windows overwrite the saved red-zone pointer.
+    [Theory]
+    [InlineData(1u, 0x1122_3344_5566_7788UL)]
+    [InlineData(0u, 0UL)]
+    public unsafe void PatchesShortAccessFollowedByConditionalBranch(uint value, ulong expected)
+    {
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+            return;
+
+        var argument = OperatingSystem.IsWindows() ? (byte)0x79 : (byte)0x7F;
+        byte[] function =
+        [
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, value
+            0x48, 0x89, 0x44, 0x24, 0xF8,                               // mov [rsp-8], rax
+            0x83, argument, 0x40, 0x00,                                 // cmp dword [arg+0x40], 0
+            0x74, 0x06,                                                 // jz zero
+            0x48, 0x8B, 0x44, 0x24, 0xF8,                               // mov rax, [rsp-8]
+            0xC3,                                                       // ret
+            0x31, 0xC0,                                                 // zero: xor eax, eax
+            0xC3,                                                       // ret
+        ];
+
+        using var image = PatchedImage.Create(function, [(0x40, value)]);
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+        {
+            Assert.Equal(1, image.Result.PatchedSites);
+            Assert.Equal(0xE9, image.ReadByte(15));
+        }
+
+        Assert.Equal(expected, ((delegate* unmanaged<ulong, ulong>)image.Base)(image.Base));
+    }
+
+    // Demon's Souls FUN_800ad8fe0: spans never start before the faulting access,
+    // so a two-byte AND whose successor is a branch target stays unpatched.
+    [Fact]
+    public unsafe void LeavesShortAccessBeforeBranchTargetUnpatched()
+    {
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+            return;
+
+        var argument = OperatingSystem.IsWindows() ? (byte)0x91 : (byte)0x97;
+        byte[] function =
+        [
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, value
+            0x48, 0x89, 0x44, 0x24, 0xF8,                               // mov [rsp-8], rax
+            0x48, 0x8D, argument, 0x00, 0x20, 0x00, 0x00,               // lea rdx, [arg+0x2000]
+            0xB8, 0xFE, 0xFF, 0xFF, 0xFF,                               // mov eax, 0xFFFFFFFE
+            0x21, 0x02,                                                 // and [rdx], eax
+            0x48, 0x8B, 0x44, 0x24, 0xF8,                               // target: mov rax, [rsp-8]
+            0xC3,                                                       // ret
+            0xEB, 0xF8,                                                 // jmp target
+        ];
+
+        using var image = PatchedImage.Create(function, [(0x2000, 7u)]);
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+        {
+            Assert.Equal(0, image.Result.CandidateSites);
+            Assert.Equal(1, image.Result.BranchTargetRefusals);
+            Assert.Equal(0xB8, image.ReadByte(22));
+        }
+
+        Assert.Equal(0x1122_3344_5566_7788UL, ((delegate* unmanaged<ulong, ulong>)image.Base)(image.Base));
+        Assert.Equal(6u, image.ReadUInt32(0x2000));
+    }
+
+    private sealed unsafe class PatchedImage : IDisposable
+    {
+        private const ulong ImageSize = 0x10000;
+        private readonly PhysicalVirtualMemory _memory;
+
+        private PatchedImage(PhysicalVirtualMemory memory, ulong imageBase, GuestRedZonePatcher.PatchResult result)
+        {
+            _memory = memory;
+            Base = imageBase;
+            Result = result;
+        }
+
+        public ulong Base { get; }
+
+        public GuestRedZonePatcher.PatchResult Result { get; }
+
+        public static PatchedImage Create(byte[] function, (ulong Offset, uint Value)[] data)
+        {
+            var memory = new PhysicalVirtualMemory();
+            const ulong holeSize = 0x4000000;
+            var hole = (ulong)HostMemory.Alloc(null, (nuint)holeSize, HostMemory.MEM_RESERVE, HostMemory.PAGE_NOACCESS);
+            Assert.NotEqual(0UL, hole);
+            Assert.True(HostMemory.Free((void*)hole, 0, HostMemory.MEM_RELEASE));
+            var imageBase = memory.AllocateAt(hole, ImageSize);
+            Assert.True(memory.TryWrite(imageBase, function));
+            Span<byte> word = stackalloc byte[sizeof(uint)];
+            foreach (var (offset, value) in data)
+            {
+                BinaryPrimitives.WriteUInt32LittleEndian(word, value);
+                Assert.True(memory.TryWrite(imageBase + offset, word));
+            }
+
+            var exceptionFrameHeader = new byte[32];
+            exceptionFrameHeader[0] = 1;
+            exceptionFrameHeader[2] = 3;
+            BinaryPrimitives.WriteUInt32LittleEndian(exceptionFrameHeader.AsSpan(12), 1);
+            BinaryPrimitives.WriteUInt64LittleEndian(exceptionFrameHeader.AsSpan(16), imageBase);
+            Assert.True(memory.TryWrite(imageBase + 0x1000, exceptionFrameHeader));
+            ProgramHeader[] headers =
+            [
+                CreateProgramHeader(ProgramHeaderType.Load, ProgramHeaderFlags.Read | ProgramHeaderFlags.Execute,
+                    0, (ulong)function.Length),
+                CreateProgramHeader(ProgramHeaderType.GnuEhFrame, ProgramHeaderFlags.Read, 0x1000, (ulong)exceptionFrameHeader.Length),
+            ];
+
+            var result = GuestRedZonePatcher.Patch(memory, memory, headers, imageBase, ImageSize);
+            return new PatchedImage(memory, imageBase, result);
+        }
+
+        public byte ReadByte(ulong offset)
+        {
+            Span<byte> value = stackalloc byte[1];
+            Assert.True(_memory.TryRead(Base + offset, value));
+            return value[0];
+        }
+
+        public uint ReadUInt32(ulong offset)
+        {
+            Span<byte> value = stackalloc byte[sizeof(uint)];
+            Assert.True(_memory.TryRead(Base + offset, value));
+            return BinaryPrimitives.ReadUInt32LittleEndian(value);
+        }
+
+        public void Dispose() => _memory.Dispose();
     }
 
     private static ProgramHeader CreateProgramHeader(

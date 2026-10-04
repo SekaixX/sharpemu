@@ -29,6 +29,7 @@ public static class PadExports
     private const int ControllerInformationSize = 0x1C;
     private const int DeviceClassExtendedInformationSize = 0x14;
     private const int PadDataSize = 0x78;
+    private const float StandardGravity = 9.80665f;
     private const int PadHistoryCapacity = 64;
 
     private static readonly object PadHandleGate = new();
@@ -42,8 +43,24 @@ public static class PadExports
     private static int _padHistoryStart;
     private static int _padHistoryCount;
     private static bool _hasCurrentPadState;
+    // Handle zero is accepted only until the guest opens its first real pad.
+    // Afterwards it must not alias the primary controller or create phantom pads.
+    private static int _padOpened;
+    private static readonly long InputSampleIntervalTicks = Math.Max(1, Stopwatch.Frequency / 1000);
+    private static long _hostInputEpoch;
+
+    [ThreadStatic]
+    private static long _lastInputSampleTicks;
+
+    [ThreadStatic]
+    private static PadState _cachedInputState;
+
+    [ThreadStatic]
+    private static long _cachedInputEpoch;
     private static bool _initialized;
-    private static int _motionSensorEnabled;
+    // Motion data is reported until a title turns it off: Astro Bot reads it for
+    // shake/tilt without ever importing scePadSetMotionSensorState.
+    private static int _motionSensorEnabled = 1;
     private static int _controlsAnnouncementLogged;
     private static readonly bool LogPadInput =
         string.Equals(
@@ -80,8 +97,13 @@ public static class PadExports
         HostWindowInput.StateChanged += CaptureHostInputTransition;
     }
 
-    internal static void ResetForTests()
+    internal static void ResetRuntimeState()
     {
+        // A runtime can be relaunched in this process on different worker
+        // threads. Invalidate every thread's short-lived input cache even
+        // though only this thread's ThreadStatic fields can be cleared here.
+        Interlocked.Increment(ref _hostInputEpoch);
+
         lock (PadHandleGate)
         {
             PadHandleByKey.Clear();
@@ -89,8 +111,12 @@ public static class PadExports
             _nextPadHandle = 1;
         }
 
+        Volatile.Write(ref _padOpened, 0);
         Volatile.Write(ref _angularVelocityDeadbandEnabled, 0);
-        Volatile.Write(ref _motionSensorEnabled, 0);
+        Volatile.Write(ref _motionSensorEnabled, 1);
+        _lastInputSampleTicks = 0;
+        _cachedInputState = default;
+        _cachedInputEpoch = 0;
         _initialized = false;
 
         lock (PadStateGate)
@@ -102,6 +128,10 @@ public static class PadExports
             _hasCurrentPadState = false;
         }
     }
+
+    internal static void ResetForTests() => ResetRuntimeState();
+
+    internal static void ResetOpenedPadForTests() => ResetForTests();
 
     [SysAbiExport(
         Nid = "hv1luiJrqQM",
@@ -223,6 +253,7 @@ public static class PadExports
             var handle = _nextPadHandle++;
             PadHandleByKey.Add(key, handle);
             PadKeyByHandle.Add(handle, key);
+            Volatile.Write(ref _padOpened, 1);
             return ctx.SetReturn(handle);
         }
     }
@@ -278,6 +309,11 @@ public static class PadExports
 
     private static bool IsOpenPadHandle(int handle)
     {
+        if (handle == 0 && Volatile.Read(ref _padOpened) == 0)
+        {
+            return true;
+        }
+
         lock (PadHandleGate)
         {
             return PadKeyByHandle.ContainsKey(handle);
@@ -421,45 +457,20 @@ public static class PadExports
     }
 
     [SysAbiExport(
+        Nid = "PZSoY8j0Pko",
+        ExportName = "scePadGetFeatureReport",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadGetFeatureReport(CpuContext ctx) =>
+        ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(
         Nid = "hGbf2QTBmqc",
         ExportName = "scePadGetExtControllerInformation",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libScePad")]
-    public static int PadGetExtControllerInformation(CpuContext ctx)
-    {
-        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
-        var informationAddress = ctx[CpuRegister.Rsi];
-        if (!IsOpenPadHandle(handle))
-        {
-            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
-        }
-
-        if (informationAddress == 0)
-        {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-        }
-
-        // Base ScePadControllerInformation + device-class/connection fields: report a connected
-        // DualSense so the guest's open -> get-ext-info -> close probe loop resolves.
-        Span<byte> information = stackalloc byte[0x40];
-        information.Clear();
-        BinaryPrimitives.WriteSingleLittleEndian(information[0x00..], 44.86f);
-        BinaryPrimitives.WriteUInt16LittleEndian(information[0x04..], 1920);
-        BinaryPrimitives.WriteUInt16LittleEndian(information[0x06..], 943);
-        information[0x08] = 30;
-        information[0x09] = 30;
-        information[0x0A] = StandardPortType;
-        information[0x0B] = 1;   // connected count
-        information[0x0C] = 1;   // connected
-        BinaryPrimitives.WriteInt32LittleEndian(information[0x10..], 0);
-        information[0x1C] = 0;   // deviceClass: 0 = standard controller / DualSense
-        information[0x1D] = 1;   // connected (ext)
-        information[0x1E] = 0;   // connectionType: local
-
-        return ctx.Memory.TryWrite(informationAddress, information)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
+    public static int PadGetExtControllerInformation(CpuContext ctx) =>
+        ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
 
     [SysAbiExport(
         Nid = "AcslpN1jHR8",
@@ -991,9 +1002,10 @@ public static class PadExports
         BinaryPrimitives.WriteSingleLittleEndian(data[0x18..], 1.0f);
         if (Volatile.Read(ref _motionSensorEnabled) != 0 && input.Motion.Available)
         {
-            BinaryPrimitives.WriteSingleLittleEndian(data[0x1C..], input.Motion.AccelerationX);
-            BinaryPrimitives.WriteSingleLittleEndian(data[0x20..], input.Motion.AccelerationY);
-            BinaryPrimitives.WriteSingleLittleEndian(data[0x24..], input.Motion.AccelerationZ);
+            // Host acceleration is m/s^2 (SDL); ScePadData.acceleration is in G.
+            BinaryPrimitives.WriteSingleLittleEndian(data[0x1C..], input.Motion.AccelerationX / StandardGravity);
+            BinaryPrimitives.WriteSingleLittleEndian(data[0x20..], input.Motion.AccelerationY / StandardGravity);
+            BinaryPrimitives.WriteSingleLittleEndian(data[0x24..], input.Motion.AccelerationZ / StandardGravity);
             BinaryPrimitives.WriteSingleLittleEndian(data[0x28..], input.Motion.AngularVelocityX);
             BinaryPrimitives.WriteSingleLittleEndian(data[0x2C..], input.Motion.AngularVelocityY);
             BinaryPrimitives.WriteSingleLittleEndian(data[0x30..], input.Motion.AngularVelocityZ);
@@ -1007,34 +1019,53 @@ public static class PadExports
 
     private static void CaptureHostInputTransition()
     {
+        // StateChanged also covers focus loss (and its pressed-key clear).
+        // Invalidate first so another thread cannot reuse a pre-transition
+        // sample while this thread captures the transition for the history.
+        Interlocked.Increment(ref _hostInputEpoch);
         CaptureCurrentInputState(recordTransition: true);
     }
 
     private static PadState CaptureCurrentInputState(bool recordTransition = false)
     {
-        var sampled = ReadHostInputState();
-        lock (PadStateGate)
+        while (true)
         {
-            if (!_hasCurrentPadState)
+            // Host notifications represent real edges and must bypass the short
+            // polling cache so rapid press/release sequences remain observable.
+            var sampled = ReadHostInputState(
+                forceSample: recordTransition,
+                out var sampledEpoch);
+            lock (PadStateGate)
             {
-                _currentPadState = sampled;
-                _hasCurrentPadState = true;
-                if (recordTransition)
+                // A notification can arrive after the cache lookup/sample but
+                // before this lock. Never commit that stale state over the
+                // transition captured by the notifying thread.
+                if (sampledEpoch != Volatile.Read(ref _hostInputEpoch))
                 {
+                    continue;
+                }
+
+                if (!_hasCurrentPadState)
+                {
+                    _currentPadState = sampled;
+                    _hasCurrentPadState = true;
+                    if (recordTransition)
+                    {
+                        EnqueuePadStateNoLock(sampled);
+                    }
+                }
+                else if (recordTransition || !HasSameInput(_currentPadState, sampled))
+                {
+                    _currentPadState = sampled;
                     EnqueuePadStateNoLock(sampled);
                 }
-            }
-            else if (recordTransition || !HasSameInput(_currentPadState, sampled))
-            {
-                _currentPadState = sampled;
-                EnqueuePadStateNoLock(sampled);
-            }
-            else
-            {
-                _currentPadState = sampled with { Timestamp = _currentPadState.Timestamp };
-            }
+                else
+                {
+                    _currentPadState = sampled with { Timestamp = _currentPadState.Timestamp };
+                }
 
-            return _currentPadState;
+                return _currentPadState;
+            }
         }
     }
 
@@ -1064,8 +1095,21 @@ public static class PadExports
         left.Connection == right.Connection &&
         left.Touch == right.Touch;
 
-    private static PadState ReadHostInputState()
+    private static PadState ReadHostInputState(
+        bool forceSample,
+        out long sampledEpoch)
     {
+        var now = Stopwatch.GetTimestamp();
+        var hostInputEpoch = Volatile.Read(ref _hostInputEpoch);
+        if (!forceSample &&
+            _cachedInputEpoch == hostInputEpoch &&
+            _lastInputSampleTicks != 0 &&
+            now - _lastInputSampleTicks < InputSampleIntervalTicks)
+        {
+            sampledEpoch = hostInputEpoch;
+            return _cachedInputState;
+        }
+
         var input = HostPlatform.Current.Input;
         var acceptsKeyboardInput = input.IsHostWindowFocused();
         var buttons = acceptsKeyboardInput ? ReadKeyboardButtons(input) : 0;
@@ -1119,7 +1163,7 @@ public static class PadExports
             l2,
             r2);
 
-        return new PadState(
+        _cachedInputState = new PadState(
             Connected: true,
             Buttons: buttons,
             LeftX: leftX,
@@ -1133,6 +1177,10 @@ public static class PadExports
             Motion: motion,
             Touch: touch,
             Timestamp: KernelRuntimeCompatExports.ReadProcessTimeMicroseconds());
+        _lastInputSampleTicks = now;
+        _cachedInputEpoch = hostInputEpoch;
+        sampledEpoch = hostInputEpoch;
+        return _cachedInputState;
     }
 
     private static void LogInputTransition(

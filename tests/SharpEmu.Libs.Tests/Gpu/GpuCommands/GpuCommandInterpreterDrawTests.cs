@@ -127,6 +127,61 @@ public sealed class GpuCommandInterpreterDrawTests
     }
 
     [Fact]
+    public void IndexedIndirectDraws_LeaveArgumentsOnTheGpuWhenTheHostCan()
+    {
+        var runner = new StreamRunner();
+        runner.Host.ResolvesIndirectDrawOnGpu = true;
+        runner.Host.WriteWords(Arguments + 16, new uint[] { 50, 2, 4, 7, 1 });
+
+        runner.Run(
+            SetBase(Arguments, dispatch: false),
+            StreamRunner.Packet(PacketOpcode.IndexBase, StreamRunner.Low(Indices), StreamRunner.High(Indices)),
+            StreamRunner.Packet(PacketOpcode.IndexType, 0),
+            StreamRunner.Packet(PacketOpcode.IndexBufferSize, 40),
+            StreamRunner.Packet(PacketOpcode.DrawIndexIndirect, 16, 0, 0, 0x22));
+
+        var indexed = Assert.Single(runner.Host.IndexedDraws);
+        Assert.Equal((40u, Indices, Arguments + 16, DrawOffsetSource.IndirectArguments),
+            (indexed.IndexCount, indexed.IndexAddress, indexed.IndirectArgumentsAddress, indexed.OffsetSource));
+        Assert.DoesNotContain(runner.Host.GuestReads, address => address >= Arguments + 16 && address < Arguments + 36);
+
+        // A later draw that inherits the instance count reads it then.
+        runner.Run(StreamRunner.Packet(PacketOpcode.DrawIndexAuto, 5, 0));
+        Assert.Equal(2u, runner.Host.AutoDraws[0].InstanceCount);
+
+        // 8-bit indices are expanded on the CPU, so their counts are read at once.
+        runner.Run(
+            StreamRunner.Packet(PacketOpcode.IndexType, 2),
+            StreamRunner.Packet(PacketOpcode.DrawIndexIndirect, 16, 0, 0, 0x22));
+        Assert.Equal(0ul, runner.Host.IndexedDraws[1].IndirectArgumentsAddress);
+        Assert.Equal(40u, runner.Host.IndexedDraws[1].IndexCount);
+    }
+
+    [Fact]
+    public void UnsizedIndexedIndirectDraws_LearnTheIndexRangeBeforeUsingTheGpu()
+    {
+        var runner = new StreamRunner();
+        runner.Host.ResolvesIndirectDrawOnGpu = true;
+        runner.Host.WriteWords(Arguments + 16, new uint[] { 3, 1, 2, 0, 0 });
+        var draw = new[]
+        {
+            SetBase(Arguments, dispatch: false),
+            StreamRunner.Packet(PacketOpcode.IndexBase, StreamRunner.Low(Indices), StreamRunner.High(Indices)),
+            StreamRunner.Packet(PacketOpcode.IndexType, 0),
+            StreamRunner.Packet(PacketOpcode.DrawIndexIndirect, 16, 0, 0, 0x22),
+        };
+
+        runner.Run(draw);
+        runner.Run(draw);
+
+        Assert.Equal(2, runner.Host.IndexedDraws.Count);
+        Assert.Equal((3u, Indices + 4, 0ul), (runner.Host.IndexedDraws[0].IndexCount, runner.Host.IndexedDraws[0].IndexAddress, runner.Host.IndexedDraws[0].IndirectArgumentsAddress));
+        var learned = runner.Host.IndexedDraws[1];
+        Assert.Equal((Arguments + 16, Indices, true), (learned.IndirectArgumentsAddress, learned.IndexAddress, learned.UnboundedIndexBuffer));
+        Assert.Equal((uint)(((Indices + 10 + 0x3FFF) & ~0x3FFFul) - Indices) / 2, learned.IndexCount);
+    }
+
+    [Fact]
     public void IndirectMulti_LoopsOverTheStrideAndTheCountAddress()
     {
         var runner = new StreamRunner();
@@ -155,10 +210,35 @@ public sealed class GpuCommandInterpreterDrawTests
             StreamRunner.Packet(PacketOpcode.DispatchIndirect, 0, 0x41),
             StreamRunner.Packet(PacketOpcode.DispatchIndirect, StreamRunner.Low(Arguments), StreamRunner.High(Arguments), 0x43));
 
-        Assert.Equal(new[] { "dispatch 0 1 2 3 41", "dispatch 0 4 5 6 41", "dispatch 0 4 5 6 43" }, runner.Host.Calls);
+        Assert.Equal(new[] { "dispatch 0 1 2 3 41", $"dispatch 0 4 5 6 41 @{Arguments:X}", $"dispatch 0 4 5 6 43 @{Arguments:X}" }, runner.Host.Calls);
         Assert.Equal(new[] { Arguments, Arguments }, runner.Host.IndirectDispatchArguments);
         Assert.Contains("indirect dispatch arguments base is zero", new StreamRunner().RunExpectingFatal(StreamRunner.Packet(PacketOpcode.DispatchIndirect, 0, 0x41)).Message);
         Assert.Contains("set-base packet is not supported", runner.RunExpectingFatal(StreamRunner.Packet(PacketOpcode.SetBase, 2, 0, 0)).Message);
+    }
+
+    // A host that dispatches indirectly on the GPU gets the arguments address without the
+    // counts, so the interpreter never waits for a GPU readback of them. Thread-unit
+    // dispatches (initiator bit 5) still read them to convert threads into groups.
+    [Fact]
+    public void IndirectDispatches_LeaveWorkgroupCountsOnTheGpuWhenTheHostCan()
+    {
+        var runner = new StreamRunner();
+        runner.Host.ResolvesIndirectDispatchOnGpu = true;
+        runner.Host.WriteWords(Arguments, new uint[] { 4, 5, 6 });
+
+        runner.Run(
+            SetBase(Arguments, dispatch: true),
+            StreamRunner.Packet(PacketOpcode.DispatchIndirect, 0, 0x41),
+            StreamRunner.Packet(PacketOpcode.DispatchIndirect, StreamRunner.Low(Arguments), StreamRunner.High(Arguments), 0x41));
+
+        Assert.Equal(new[] { $"dispatch 0 0 0 0 41 @{Arguments:X}", $"dispatch 0 0 0 0 41 @{Arguments:X}" }, runner.Host.Calls);
+        Assert.DoesNotContain(Arguments, runner.Host.GuestReads);
+
+        runner.Host.Calls.Clear();
+        runner.Run(
+            SetBase(Arguments, dispatch: true),
+            StreamRunner.Packet(PacketOpcode.DispatchIndirect, 0, 0x61));
+        Assert.Equal(new[] { $"dispatch 0 4 5 6 61 @{Arguments:X}" }, runner.Host.Calls);
     }
 
     [Fact]
