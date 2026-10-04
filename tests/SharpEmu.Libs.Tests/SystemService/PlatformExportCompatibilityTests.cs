@@ -9,6 +9,7 @@ using Xunit;
 
 namespace SharpEmu.Libs.Tests.SystemService;
 
+[Collection("ImeState")]
 public sealed class PlatformExportCompatibilityTests
 {
     private const ulong MemoryBase = 0x1_0000_0000;

@@ -42,6 +42,7 @@ public sealed class ImportLoopGuardBoundaryTests
     [InlineData("iGjsr1WAtI0")]
     [InlineData("mqdNorrB+gI")]
     [InlineData("sIlRvQqsN2Y")]
+    [InlineData("Zxa0VhQVTsk")]
     [InlineData("yH17Q6NWtVg")]
     public void ProgressBoundary_ClearsExpiredHistory(string nid)
     {

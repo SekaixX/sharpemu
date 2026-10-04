@@ -200,10 +200,17 @@ public static partial class Gen5SpirvTranslator
         // storage as canonical uint 0/1 and convert at the Load/Store boundary.
         private readonly HashSet<uint> _flagVariables = [];
         private uint _runtimeBufferBiases;
+        // One Private variable per register the program touches, declared on first use. A whole
+        // register-file array is kept only for the VGPRs of a program that indexes them at run time
+        // (V_MOVREL*): MoltenVK lowers a 512-entry private array to thread memory, and every
+        // register access of every invocation then spills through it.
+        private readonly Dictionary<uint, uint> _scalarRegisterVariables = new();
+        private readonly Dictionary<uint, uint> _vectorRegisterVariables = new();
         private uint _scalarRegisters;
         private uint _vectorRegisters;
         private uint _vectorRegistersLow;
         private uint _vectorRegistersHigh;
+        private (uint First, uint Last) _dynamicVectorRange;
         private uint _packedHalfRegisters;
         private uint _packedHalfRegistersLow;
         private uint _packedHalfRegistersHigh;
@@ -264,8 +271,6 @@ public static partial class Gen5SpirvTranslator
         private uint _vertexIndexInput;
         private uint _instanceIndexInput;
         private uint _fragCoordInput;
-        private uint _frontFacingInput;
-        private uint _layerInput;
         private uint _localInvocationIdInput;
         private uint _localInvocationIndexInput;
         private uint _workGroupIdInput;
@@ -374,8 +379,15 @@ public static partial class Gen5SpirvTranslator
                 var blocks = BuildBasicBlocks(
                     _request.Program.Instructions,
                     splitAfterBarrier: hasBarriers);
-                _functionScopeState =
+                // The fallback when the full structurer declines: blocks in
+                // program order behind a next-block guard, with natural loops
+                // emitted as structured loops.
+                var structuredForward =
                     StructuredForwardBlocks &&
+                    blocks.Count != 0 &&
+                    TryBuildLoopRegions(blocks, out _loopLatchByHeader);
+                _functionScopeState =
+                    structuredForward &&
                     !hasBarriers &&
                     !_pairWave64 &&
                     !UsesWave64Exchange() &&
@@ -383,8 +395,7 @@ public static partial class Gen5SpirvTranslator
                     !_request.Program.Instructions.Any(static instruction =>
                         IsIndirectControlFlow(instruction.Opcode) ||
                         instruction.Opcode is "SSubvectorLoopBegin" or "SSubvectorLoopEnd") &&
-                    blocks.Count != 0 &&
-                    TryBuildLoopRegions(blocks, out _loopLatchByHeader);
+                    blocks.Count != 0;
                 DeclareModule();
                 if (blocks.Count == 0)
                 {
@@ -439,6 +450,26 @@ public static partial class Gen5SpirvTranslator
                     {
                         return false;
                     }
+                }
+                else if (!hasBarriers &&
+                         StructuredControlFlow &&
+                         TryStructureRange(blocks, 0, blocks.Count, blocks.Count, emit: false, out _))
+                {
+                    // As the dispatcher does before its first block: an
+                    // out-of-bounds invocation runs nothing.
+                    var runLabel = _module.AllocateId();
+                    var doneLabel = _module.AllocateId();
+                    var isActive = Load(_boolType, _programActive);
+                    _module.AddStatement(SpirvOp.SelectionMerge, doneLabel, 0);
+                    _module.AddStatement(SpirvOp.BranchConditional, isActive, runLabel, doneLabel);
+                    _module.AddLabel(runLabel);
+                    if (!TryStructureRange(blocks, 0, blocks.Count, blocks.Count, emit: true, out error))
+                    {
+                        return false;
+                    }
+
+                    _module.AddStatement(SpirvOp.Branch, doneLabel);
+                    _module.AddLabel(doneLabel);
                 }
                 else
                 {
@@ -849,175 +880,192 @@ public static partial class Gen5SpirvTranslator
             _functionUintPointer = _module.TypePointer(registerStorage, _uintType);
             _functionVec2Pointer = _module.TypePointer(registerStorage, _vec2Type);
 
+            if (_request.Program.Instructions.Any(static instruction =>
+                    instruction.Opcode.StartsWith("VMovrel", StringComparison.Ordinal)))
+            {
+                // Resolve relative accesses over only the registers the program
+                // can reach, avoiding a full private array on ordinary waves.
+                _dynamicVectorRange = DynamicVectorRange(_request.Program);
+            }
+
             if (!_functionScopeState)
             {
+                uint Flag(bool initialValue)
+                {
+                    var variable = _module.AddGlobalVariable(
+                        _privateUintPointer,
+                        SpirvStorageClass.Private,
+                        UInt(initialValue ? 1u : 0u));
+                    _flagVariables.Add(variable);
+                    return variable;
+                }
 
-            uint Flag(bool initialValue)
-            {
-                var variable = _module.AddGlobalVariable(
-                    _privateUintPointer,
-                    SpirvStorageClass.Private,
-                    UInt(initialValue ? 1u : 0u));
-                _flagVariables.Add(variable);
-                return variable;
-            }
+                IEnumerable<FixedLaneReadBinding> fixedLaneBindings =
+                    _request.FixedLaneWaveSize == _request.WaveSize
+                        ? _request.FixedLaneReads.Values
+                        : Array.Empty<FixedLaneReadBinding>();
+                foreach (var binding in fixedLaneBindings
+                             .Distinct()
+                             .OrderBy(static binding => binding.Register)
+                             .ThenBy(static binding => binding.Lane))
+                {
+                    var shadow = _module.AddGlobalVariable(
+                        _privateUintPointer,
+                        SpirvStorageClass.Private,
+                        _module.Constant(_uintType, 0));
+                    _fixedLaneShadows[(binding.Register, binding.Lane)] = shadow;
+                    _interfaces.Add(shadow);
+                    _module.AddName(shadow, $"fixedLane_v{binding.Register}_{binding.Lane}");
+                }
 
-            IEnumerable<FixedLaneReadBinding> fixedLaneBindings =
-                _request.FixedLaneWaveSize == _request.WaveSize
-                ? _request.FixedLaneReads.Values
-                : Array.Empty<FixedLaneReadBinding>();
-            foreach (var binding in fixedLaneBindings
-                         .Distinct()
-                         .OrderBy(static binding => binding.Register)
-                         .ThenBy(static binding => binding.Lane))
-            {
-                var shadow = _module.AddGlobalVariable(
+                // Paired Wave64 needs an independently addressable VGPR bank
+                // for each physical subgroup. Other shaders use upstream's
+                // one-variable-per-register representation.
+                if (_pairWave64)
+                {
+                    var privateVectorArrayPointer =
+                        _module.TypePointer(SpirvStorageClass.Private, _vectorArrayType);
+                    _vectorRegisters = _module.AddGlobalVariable(
+                        privateVectorArrayPointer,
+                        SpirvStorageClass.Private,
+                        _module.ConstantNull(_vectorArrayType));
+                    _vectorRegistersLow = _vectorRegisters;
+                    _vectorRegistersHigh = _module.AddGlobalVariable(
+                        privateVectorArrayPointer,
+                        SpirvStorageClass.Private,
+                        _module.ConstantNull(_vectorArrayType));
+                }
+
+                _scc = Flag(false);
+                _vcc = Flag(false);
+                _vccLow = _vcc;
+                if (_pairWave64)
+                {
+                    _vccHigh = Flag(false);
+                }
+
+                _exec = Flag(true);
+                _execLow = _exec;
+                if (_pairWave64)
+                {
+                    _execHigh = Flag(true);
+                }
+
+                _reachedPixelExport = Flag(false);
+                if (_usesPixelValidMask)
+                {
+                    _pixelValidMaskActive = Flag(true);
+                }
+
+                _programCounter = _module.AddGlobalVariable(
                     _privateUintPointer,
                     SpirvStorageClass.Private,
                     _module.Constant(_uintType, 0));
-                _fixedLaneShadows[(binding.Register, binding.Lane)] = shadow;
-                _interfaces.Add(shadow);
-                _module.AddName(
-                    shadow,
-                    $"fixedLane_v{binding.Register}_{binding.Lane}");
-            }
+                _programActive = Flag(true);
+                if (UsesWave64Exchange())
+                {
+                    _wave64ExchangeParity = _module.AddGlobalVariable(
+                        _privateUintPointer,
+                        SpirvStorageClass.Private,
+                        UInt(0));
+                    _interfaces.Add(_wave64ExchangeParity);
+                    _module.AddName(_wave64ExchangeParity, "wave64ExchangeParity");
+                }
 
-            var scalarArrayType = _scalarArrayType;
-            var vectorArrayType = _vectorArrayType;
-            var privateScalarArrayPointer =
-                _module.TypePointer(SpirvStorageClass.Private, scalarArrayType);
-            var privateVectorArrayPointer =
-                _module.TypePointer(SpirvStorageClass.Private, vectorArrayType);
-            _scalarRegisters = _module.AddGlobalVariable(
-                privateScalarArrayPointer,
-                SpirvStorageClass.Private,
-                _module.ConstantNull(scalarArrayType));
-            _vectorRegisters = _module.AddGlobalVariable(
-                privateVectorArrayPointer,
-                SpirvStorageClass.Private,
-                _module.ConstantNull(vectorArrayType));
-            _vectorRegistersLow = _vectorRegisters;
-            if (_pairWave64)
-            {
-                _vectorRegistersHigh = _module.AddGlobalVariable(
-                    privateVectorArrayPointer,
-                    SpirvStorageClass.Private,
-                    _module.ConstantNull(vectorArrayType));
-            }
-            _scc = Flag(false);
-            _vcc = Flag(false);
-            _vccLow = _vcc;
-            if (_pairWave64)
-            {
-                _vccHigh = Flag(false);
-            }
-            _exec = Flag(true);
-            _execLow = _exec;
-            if (_pairWave64)
-            {
-                _execHigh = Flag(true);
-            }
-            _reachedPixelExport = Flag(false);
-            if (_usesPixelValidMask)
-            {
-                _pixelValidMaskActive = Flag(true);
-            }
-            _programCounter = _module.AddGlobalVariable(
-                _privateUintPointer,
-                SpirvStorageClass.Private,
-                _module.Constant(_uintType, 0));
-            _programActive = Flag(true);
-            if (UsesWave64Exchange())
-            {
-                _wave64ExchangeParity = _module.AddGlobalVariable(
-                    _privateUintPointer,
-                    SpirvStorageClass.Private,
-                    _module.Constant(_uintType, 0));
-                _module.AddName(
-                    _wave64ExchangeParity,
-                    "wave64ExchangeParity");
-                _interfaces.Add(_wave64ExchangeParity);
-            }
-            if (_usesBarrierPhases)
-            {
-                _programBarrierWait = Flag(false);
-                var activeWaveArray = _module.TypeArray(
-                    _uintType,
-                    _guestWaveCount);
-                _barrierPhaseActiveWavePointer = _module.TypePointer(
-                    SpirvStorageClass.Workgroup,
-                    _uintType);
-                _barrierPhaseActiveWaves = _module.AddGlobalVariable(
-                    _module.TypePointer(
-                        SpirvStorageClass.Workgroup,
-                        activeWaveArray),
-                    SpirvStorageClass.Workgroup);
-            }
-            if (_maxDispatcherSteps > 0)
-            {
-                _dispatcherStepGuard = _module.AddGlobalVariable(
-                    _privateUintPointer,
-                    SpirvStorageClass.Private,
-                    _module.Constant(_uintType, 0));
-                _interfaces.Add(_dispatcherStepGuard);
-                _module.AddName(
-                    _dispatcherStepGuard,
-                    $"dispatcherStepGuardLimit{_maxDispatcherSteps}");
-            }
-            if (_maxDispatcherBackedges > 0)
-            {
-                _dispatcherBackedgeGuard = _module.AddGlobalVariable(
-                    _privateUintPointer,
-                    SpirvStorageClass.Private,
-                    _module.Constant(_uintType, 0));
-                _interfaces.Add(_dispatcherBackedgeGuard);
-                _module.AddName(
-                    _dispatcherBackedgeGuard,
-                    $"dispatcherBackedgeGuardLimit{_maxDispatcherBackedges}");
-            }
-            if (_maxDispatcherSteps > 0 || _maxDispatcherBackedges > 0)
-            {
-                _dispatcherGuardHit = Flag(false);
-                _interfaces.Add(_dispatcherGuardHit);
-                _module.AddName(_dispatcherGuardHit, "dispatcherGuardHit");
-            }
+                if (_usesBarrierPhases)
+                {
+                    _programBarrierWait = Flag(false);
+                    var activeWaveArray = _module.TypeArray(_uintType, _guestWaveCount);
+                    _barrierPhaseActiveWavePointer =
+                        _module.TypePointer(SpirvStorageClass.Workgroup, _uintType);
+                    _barrierPhaseActiveWaves = _module.AddGlobalVariable(
+                        _module.TypePointer(SpirvStorageClass.Workgroup, activeWaveArray),
+                        SpirvStorageClass.Workgroup);
+                }
 
-            _interfaces.Add(_scalarRegisters);
-            _interfaces.Add(_vectorRegisters);
-            _interfaces.Add(_scc);
-            _interfaces.Add(_vcc);
-            _interfaces.Add(_exec);
-            if (_pairWave64)
-            {
-                _interfaces.Add(_vectorRegistersHigh);
-                _interfaces.Add(_vccHigh);
-                _interfaces.Add(_execHigh);
-            }
-            _interfaces.Add(_reachedPixelExport);
-            if (_pixelValidMaskActive != 0)
-            {
-                _interfaces.Add(_pixelValidMaskActive);
-                _module.AddName(_pixelValidMaskActive, "pixelValidMaskActive");
-            }
-            _interfaces.Add(_programCounter);
-            _interfaces.Add(_programActive);
-            if (_usesBarrierPhases)
-            {
-                _interfaces.Add(_programBarrierWait);
-                _interfaces.Add(_barrierPhaseActiveWaves);
-                _module.AddName(_programBarrierWait, "programBarrierWait");
-                _module.AddName(
-                    _barrierPhaseActiveWaves,
-                    "barrierPhaseActiveWaves");
-            }
-            _module.AddName(_scalarRegisters, "sgpr");
-            _module.AddName(_vectorRegisters, "vgpr");
-            if (_pairWave64)
-            {
-                _module.AddName(_vectorRegistersHigh, "vgprHigh");
-                _module.AddName(_vccHigh, "vccHigh");
-                _module.AddName(_execHigh, "execHigh");
-            }
+                if (_maxDispatcherSteps > 0)
+                {
+                    _dispatcherStepGuard = _module.AddGlobalVariable(
+                        _privateUintPointer,
+                        SpirvStorageClass.Private,
+                        UInt(0));
+                    _iterationGuard = _module.AddGlobalVariable(
+                        _privateUintPointer,
+                        SpirvStorageClass.Private,
+                        UInt(0));
+                    _interfaces.Add(_dispatcherStepGuard);
+                    _interfaces.Add(_iterationGuard);
+                    _module.AddName(
+                        _dispatcherStepGuard,
+                        $"dispatcherStepGuardLimit{_maxDispatcherSteps}");
+                    _module.AddName(_iterationGuard, "pcGuard");
+                }
+
+                if (_maxDispatcherBackedges > 0)
+                {
+                    _dispatcherBackedgeGuard = _module.AddGlobalVariable(
+                        _privateUintPointer,
+                        SpirvStorageClass.Private,
+                        UInt(0));
+                    _interfaces.Add(_dispatcherBackedgeGuard);
+                    _module.AddName(
+                        _dispatcherBackedgeGuard,
+                        $"dispatcherBackedgeGuardLimit{_maxDispatcherBackedges}");
+                }
+
+                if (_maxDispatcherSteps > 0 || _maxDispatcherBackedges > 0)
+                {
+                    _dispatcherGuardHit = Flag(false);
+                    _interfaces.Add(_dispatcherGuardHit);
+                    _module.AddName(_dispatcherGuardHit, "dispatcherGuardHit");
+                }
+
+                foreach (var slot in FindLaneSpillSlots())
+                {
+                    var variable = _module.AddGlobalVariable(
+                        _privateUintPointer,
+                        SpirvStorageClass.Private,
+                        UInt(0));
+                    _interfaces.Add(variable);
+                    _module.AddName(variable, $"v{slot.Register}_lane{slot.Lane}");
+                    _laneSpillSlots.Add(slot, variable);
+                }
+
+                if (_vectorRegisters != 0)
+                {
+                    _interfaces.Add(_vectorRegisters);
+                    _module.AddName(_vectorRegisters, "vgpr");
+                }
+
+                _interfaces.Add(_scc);
+                _interfaces.Add(_vcc);
+                _interfaces.Add(_exec);
+                if (_pairWave64)
+                {
+                    _interfaces.Add(_vectorRegistersHigh);
+                    _interfaces.Add(_vccHigh);
+                    _interfaces.Add(_execHigh);
+                    _module.AddName(_vectorRegistersHigh, "vgprHigh");
+                    _module.AddName(_vccHigh, "vccHigh");
+                    _module.AddName(_execHigh, "execHigh");
+                }
+
+                _interfaces.Add(_reachedPixelExport);
+                if (_pixelValidMaskActive != 0)
+                {
+                    _interfaces.Add(_pixelValidMaskActive);
+                    _module.AddName(_pixelValidMaskActive, "pixelValidMaskActive");
+                }
+
+                _interfaces.Add(_programCounter);
+                _interfaces.Add(_programActive);
+                if (_usesBarrierPhases)
+                {
+                    _interfaces.Add(_programBarrierWait);
+                    _interfaces.Add(_barrierPhaseActiveWaves);
+                    _module.AddName(_programBarrierWait, "programBarrierWait");
+                    _module.AddName(_barrierPhaseActiveWaves, "barrierPhaseActiveWaves");
+                }
             }
             {
                 DeclareLayoutBindings();
@@ -1106,11 +1154,12 @@ public static partial class Gen5SpirvTranslator
         private List<(uint Register, uint Lane)> FindLaneSpillSlots()
         {
             var slots = new List<(uint Register, uint Lane)>();
-            if (UsesSubgroupOperations())
+            if (_emulateWave64)
             {
                 return slots;
             }
 
+            var ownsLaneZero = !UsesSubgroupOperations();
             var readRegisters = _request.Program.Instructions
                 .Where(static instruction =>
                     instruction.Opcode == "VReadlaneB32" &&
@@ -1124,7 +1173,7 @@ public static partial class Gen5SpirvTranslator
                     TryGetVectorDestination(instruction, out var register) &&
                     readRegisters.Contains(register) &&
                     TryGetConstantLane(instruction, out var lane) &&
-                    lane != 0 &&
+                    (lane != 0 || !ownsLaneZero) &&
                     !slots.Contains((register, lane)))
                 {
                     slots.Add((register, lane));
@@ -1156,8 +1205,32 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            lane = value & (_waveLaneCount - 1);
+            lane = value & LaneSelectMask;
             return true;
+        }
+
+        private uint LaneSelectMask =>
+            _stage == Gen5SpirvStage.Compute ? _waveLaneCount - 1 : 63u;
+
+        private uint ReadLaneSpillSlot(
+            Gen5ShaderInstruction instruction,
+            uint selectedLane,
+            uint value)
+        {
+            if (instruction.Sources[0].Kind != Gen5OperandKind.VectorRegister)
+            {
+                return value;
+            }
+
+            var register = instruction.Sources[0].Value;
+            if (TryGetConstantLane(instruction, out var lane))
+            {
+                return _laneSpillSlots.TryGetValue((register, lane), out var slot)
+                    ? Load(_uintType, slot)
+                    : value;
+            }
+
+            return SelectLaneSpillSlot(register, selectedLane, value);
         }
 
         private uint SelectLaneSpillSlot(
@@ -1580,44 +1653,7 @@ public static partial class Gen5SpirvTranslator
                     SpirvDecoration.BuiltIn,
                     (uint)SpirvBuiltIn.FragCoord);
                 _interfaces.Add(_fragCoordInput);
-
-                if (((_pixelInputAddress & _pixelInputEnable) & (1u << 12)) != 0)
-                {
-                    _frontFacingInput = _module.AddGlobalVariable(
-                        _module.TypePointer(
-                            SpirvStorageClass.Input,
-                            _boolType),
-                        SpirvStorageClass.Input);
-                    _module.AddName(_frontFacingInput, "gl_FrontFacing");
-                    _module.AddDecoration(
-                        _frontFacingInput,
-                        SpirvDecoration.BuiltIn,
-                        (uint)SpirvBuiltIn.FrontFacing);
-                    _interfaces.Add(_frontFacingInput);
-                }
-
-                if (((_pixelInputAddress & _pixelInputEnable) & (1u << 13)) != 0)
-                {
-                    // Packed ANCILLARY carries the rasterized layer in bits
-                    // 16..26. Declare Layer only for shaders which request the
-                    // slot so ordinary pixel programs retain their old
-                    // interface and cache shape.
-                    _module.AddCapability(SpirvCapability.ShaderLayer);
-                    _layerInput = _module.AddGlobalVariable(
-                        _module.TypePointer(
-                            SpirvStorageClass.Input,
-                            _intType),
-                        SpirvStorageClass.Input);
-                    _module.AddName(_layerInput, "gl_Layer");
-                    _module.AddDecoration(
-                        _layerInput,
-                        SpirvDecoration.BuiltIn,
-                        (uint)SpirvBuiltIn.Layer);
-                    _module.AddDecoration(
-                        _layerInput,
-                        SpirvDecoration.Flat);
-                    _interfaces.Add(_layerInput);
-                }
+                DeclarePixelSystemInputs();
 
                 var declaredPixelOutputs =
                     Environment.GetEnvironmentVariable(
@@ -1642,7 +1678,7 @@ public static partial class Gen5SpirvTranslator
                         SpirvDecoration.Location,
                         binding.HostLocation);
                     _pixelOutputs.Add(
-                        binding.GuestSlot,
+                        binding.ExportTarget,
                         new SpirvPixelOutput(
                             variable,
                             outputType,
@@ -2044,71 +2080,11 @@ public static partial class Gen5SpirvTranslator
             EmitPixelPositionInput(11, 3, fragCoord, ref vgpr); // POS_W_FLOAT
 
             // FRONT_FACE, ANCILLARY, SAMPLE_COVERAGE and POS_FIXED_PT follow
-            // position inputs. Preserve their compact register allocation;
-            // the first two are populated from Vulkan built-ins below.
-            EmitPixelFrontFaceInput(ref vgpr);
-            EmitPixelAncillaryInput(ref vgpr);
-            AdvancePixelInput(14, 1, ref vgpr);
-            AdvancePixelInput(15, 1, ref vgpr);
-        }
-
-        private void EmitPixelFrontFaceInput(ref uint vgpr)
-        {
-            const int bit = 12;
-            var mask = 1u << bit;
-            if ((_pixelInputAddress & mask) == 0)
-            {
-                return;
-            }
-
-            if ((_pixelInputEnable & mask) != 0 && _frontFacingInput != 0)
-            {
-                var frontFacing = Load(_boolType, _frontFacingInput);
-                // GCN exposes FRONT_FACE as +1.0f for front-facing fragments
-                // and -1.0f for back-facing fragments, stored as raw VGPR bits.
-                var value = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    frontFacing,
-                    UInt(0x3f800000u),
-                    UInt(0xbf800000u));
-                StoreV(vgpr, value, guardWithExec: false);
-            }
-
-            vgpr++;
-        }
-
-        private void EmitPixelAncillaryInput(ref uint vgpr)
-        {
-            const int bit = 13;
-            var mask = 1u << bit;
-            if ((_pixelInputAddress & mask) == 0)
-            {
-                return;
-            }
-
-            if ((_pixelInputEnable & mask) != 0 && _layerInput != 0)
-            {
-                var layer = Bitcast(
-                    _uintType,
-                    Load(_intType, _layerInput));
-                var boundedLayer = _module.AddInstruction(
-                    SpirvOp.BitwiseAnd,
-                    _uintType,
-                    layer,
-                    UInt(0x7ff));
-                var packedAncillary = _module.AddInstruction(
-                    SpirvOp.ShiftLeftLogical,
-                    _uintType,
-                    boundedLayer,
-                    UInt(16));
-                StoreV(
-                    vgpr,
-                    packedAncillary,
-                    guardWithExec: false);
-            }
-
-            vgpr++;
+            // position inputs.
+            EmitPixelSystemInput(12, _frontFacingInput == 0 ? 0 : LoadFrontFaceInput(), ref vgpr);
+            EmitPixelSystemInput(13, _ancillaryLayerInput == 0 ? 0 : LoadAncillaryInput(), ref vgpr);
+            EmitPixelSystemInput(14, _sampleMaskInput == 0 ? 0 : LoadSampleCoverageInput(), ref vgpr);
+            EmitPixelSystemInput(15, (_pixelInputAddress & _pixelInputEnable & 0x8000u) == 0 ? 0 : LoadFixedPointPositionInput(fragCoord), ref vgpr);
         }
 
         private void AdvancePixelInput(int bit, uint dwordCount, ref uint vgpr)
@@ -2151,6 +2127,11 @@ public static partial class Gen5SpirvTranslator
                     _floatType,
                     fragCoord,
                     component);
+                if (component == 3)
+                {
+                    value = _module.AddInstruction(SpirvOp.FDiv, _floatType, Float(1f), value);
+                }
+
                 StoreV(vgpr, Bitcast(_uintType, value), guardWithExec: false);
             }
 
@@ -2241,6 +2222,38 @@ public static partial class Gen5SpirvTranslator
             bool deferBarrier,
             out string error)
         {
+            if (!TryEmitBlockBody(
+                    blocks,
+                    blockIndex,
+                    acyclicPath,
+                    deferBarrier,
+                    out error))
+            {
+                return false;
+            }
+
+            return TryEmitBlockTerminator(blocks, blockIndex, out error);
+        }
+
+        // Every instruction of a block except its terminating branch or s_endpgm.
+        private bool TryEmitBlockBody(
+            IReadOnlyList<ShaderBlock> blocks,
+            int blockIndex,
+            out string error) =>
+            TryEmitBlockBody(
+                blocks,
+                blockIndex,
+                acyclicPath: false,
+                deferBarrier: false,
+                out error);
+
+        private bool TryEmitBlockBody(
+            IReadOnlyList<ShaderBlock> blocks,
+            int blockIndex,
+            bool acyclicPath,
+            bool deferBarrier,
+            out string error)
+        {
             error = string.Empty;
             var block = blocks[blockIndex];
             _fixedLaneValues.Clear();
@@ -2318,6 +2331,17 @@ public static partial class Gen5SpirvTranslator
             }
 
             if (synchronizeSharedMemory && sharedMemoryPhase != SharedMemoryPhase.None) EmitWave64Barrier();
+            return true;
+        }
+
+        // Stores the next dispatcher block (or ends the program) for a block's terminator.
+        private bool TryEmitBlockTerminator(
+            IReadOnlyList<ShaderBlock> blocks,
+            int blockIndex,
+            out string error)
+        {
+            error = string.Empty;
+            var block = blocks[blockIndex];
             var terminator = _request.Program.Instructions[block.EndIndex - 1];
             if (terminator.Opcode == "SEndpgm")
             {
@@ -2643,6 +2667,316 @@ public static partial class Gen5SpirvTranslator
             Environment.GetEnvironmentVariable("SHARPEMU_STRUCTURED_FORWARD_BLOCKS"),
             "0",
             StringComparison.Ordinal);
+
+        // Forward-only, properly nested control flow is emitted as structured selections instead of
+        // the PC-dispatch loop: a loop around a switch keeps every register live across iterations,
+        // blocks cannot be optimized together, and the Metal compiler spills. SHARPEMU_STRUCTURED_CF=0
+        // keeps the dispatcher for every program.
+        private static readonly bool StructuredControlFlow =
+            Environment.GetEnvironmentVariable("SHARPEMU_STRUCTURED_CF") != "0";
+
+        private static bool IsStructuredCondition(string opcode) => opcode is
+            "SCbranchScc0" or "SCbranchScc1" or "SCbranchVccz" or "SCbranchVccnz" or
+            "SCbranchExecz" or "SCbranchExecnz" or
+            "SCbranchCdbgsys" or "SCbranchCdbguser" or "SCbranchCdbgsysOrUser" or "SCbranchCdbgsysAndUser";
+
+        // The block a branch continues at, or blocks.Count for a branch past the last instruction.
+        private bool TryResolveBranchBlock(IReadOnlyList<ShaderBlock> blocks, Gen5ShaderInstruction branch, out int target)
+        {
+            target = -1;
+            if (!TryGetBranchTargetPc(branch, out var targetPc))
+            {
+                return false;
+            }
+
+            if (IsExitBranchTarget(_request.Program.Instructions, targetPc))
+            {
+                target = blocks.Count;
+                return true;
+            }
+
+            return TryFindBlock(blocks, targetPc, out target);
+        }
+
+        // Emits (or, without emit, only checks) blocks [begin, end). A branch from the range's last
+        // block to leave falls through to the range end. Inside a loop body, latch is the block
+        // whose backward branch the caller emits as the loop's continue, and a branch to end would
+        // leave the loop, which a structured body cannot express.
+        private bool TryStructureRange(
+            IReadOnlyList<ShaderBlock> blocks,
+            int begin,
+            int end,
+            int leave,
+            bool emit,
+            out string error,
+            int latch = -1)
+        {
+            error = string.Empty;
+            var instructions = _request.Program.Instructions;
+            var index = begin;
+            while (index < end)
+            {
+                // A loop body starts at its own header, which must not open the loop again.
+                if (!(latch >= 0 && index == begin) && index != latch &&
+                    TryFindLoopLatch(blocks, index, end, out var loopLatch))
+                {
+                    if (!TryStructureLoop(blocks, index, loopLatch, emit, out error))
+                    {
+                        return false;
+                    }
+
+                    index = loopLatch + 1;
+                    continue;
+                }
+
+                if (emit && !TryEmitBlockBody(blocks, index, out error))
+                {
+                    error = $"block=0x{blocks[index].StartPc:X}: {error}";
+                    return false;
+                }
+
+                if (index == latch)
+                {
+                    return true;
+                }
+
+                var terminator = instructions[blocks[index].EndIndex - 1];
+                var next = index + 1;
+                if (terminator.Opcode == "SEndpgm")
+                {
+                    if (next != blocks.Count)
+                    {
+                        error = "s_endpgm before the last block";
+                        return false;
+                    }
+
+                    if (emit)
+                    {
+                        Store(_programActive, _module.ConstantBool(false));
+                    }
+
+                    index = next;
+                    continue;
+                }
+
+                if (terminator.Opcode == "SBranch")
+                {
+                    if (!TryResolveBranchBlock(blocks, terminator, out var branchTarget) ||
+                        !(branchTarget == next || (next == end && branchTarget == leave)))
+                    {
+                        error = $"unstructured s_branch at 0x{terminator.Pc:X}";
+                        return false;
+                    }
+
+                    index = next;
+                    continue;
+                }
+
+                if (!terminator.Opcode.StartsWith("SCbranch", StringComparison.Ordinal))
+                {
+                    index = next;
+                    continue;
+                }
+
+                if (!IsStructuredCondition(terminator.Opcode) ||
+                    !TryResolveBranchBlock(blocks, terminator, out var target) || target <= index)
+                {
+                    error = $"unstructured {terminator.Opcode} at 0x{terminator.Pc:X}";
+                    return false;
+                }
+
+                // if (taken) break; -- only out of the innermost loop, to the block after its latch.
+                if (_structuredLoopExit >= 0 && target == _structuredLoopExit)
+                {
+                    if (emit)
+                    {
+                        TryGetBranchCondition(terminator.Opcode, out var leaveLoop);
+                        var breakLabel = _module.AllocateId();
+                        var stayLabel = _module.AllocateId();
+                        _module.AddStatement(SpirvOp.SelectionMerge, stayLabel, 0);
+                        _module.AddStatement(SpirvOp.BranchConditional, leaveLoop, breakLabel, stayLabel);
+                        _module.AddLabel(breakLabel);
+                        _module.AddStatement(SpirvOp.Branch, _structuredLoopMerge);
+                        _module.AddLabel(stayLabel);
+                    }
+
+                    index = next;
+                    continue;
+                }
+
+                if (target > end || (latch >= 0 && target == end))
+                {
+                    error = $"unstructured {terminator.Opcode} at 0x{terminator.Pc:X}";
+                    return false;
+                }
+
+                if (target == next)
+                {
+                    index = next;
+                    continue;
+                }
+
+                // if/else: the skipped range ends with an s_branch over the taken range.
+                var thenLast = instructions[blocks[target - 1].EndIndex - 1];
+                if (target < blocks.Count && target - 1 > index && thenLast.Opcode == "SBranch" &&
+                    TryResolveBranchBlock(blocks, thenLast, out var joinTarget) && joinTarget > target && joinTarget <= end &&
+                    !(latch >= 0 && joinTarget == end))
+                {
+                    if (!emit)
+                    {
+                        if (!TryStructureRange(blocks, next, target, joinTarget, emit: false, out error) ||
+                            !TryStructureRange(blocks, target, joinTarget, joinTarget, emit: false, out error))
+                        {
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        TryGetBranchCondition(terminator.Opcode, out var taken);
+                        var thenLabel = _module.AllocateId();
+                        var elseLabel = _module.AllocateId();
+                        var joinLabel = _module.AllocateId();
+                        _module.AddStatement(SpirvOp.SelectionMerge, joinLabel, 0);
+                        _module.AddStatement(SpirvOp.BranchConditional, taken, elseLabel, thenLabel);
+                        _module.AddLabel(thenLabel);
+                        if (!TryStructureRange(blocks, next, target, joinTarget, emit: true, out error))
+                        {
+                            return false;
+                        }
+
+                        _module.AddStatement(SpirvOp.Branch, joinLabel);
+                        _module.AddLabel(elseLabel);
+                        if (!TryStructureRange(blocks, target, joinTarget, joinTarget, emit: true, out error))
+                        {
+                            return false;
+                        }
+
+                        _module.AddStatement(SpirvOp.Branch, joinLabel);
+                        _module.AddLabel(joinLabel);
+                    }
+
+                    index = joinTarget;
+                    continue;
+                }
+
+                // if (!taken) { skipped range }
+                if (!emit)
+                {
+                    if (!TryStructureRange(blocks, next, target, target, emit: false, out error))
+                    {
+                        return false;
+                    }
+                }
+                else
+                {
+                    TryGetBranchCondition(terminator.Opcode, out var taken);
+                    var bodyLabel = _module.AllocateId();
+                    var mergeLabel = _module.AllocateId();
+                    _module.AddStatement(SpirvOp.SelectionMerge, mergeLabel, 0);
+                    _module.AddStatement(SpirvOp.BranchConditional, taken, mergeLabel, bodyLabel);
+                    _module.AddLabel(bodyLabel);
+                    if (!TryStructureRange(blocks, next, target, target, emit: true, out error))
+                    {
+                        return false;
+                    }
+
+                    _module.AddStatement(SpirvOp.Branch, mergeLabel);
+                    _module.AddLabel(mergeLabel);
+                }
+
+                index = target;
+            }
+
+            return true;
+        }
+
+        // The innermost structured loop's exit block and merge label, for its breaks; -1 outside loops.
+        private int _structuredLoopExit = -1;
+        private uint _structuredLoopMerge;
+
+        // The last block in [header, end) that branches back to header, unconditionally or on a
+        // wave-uniform condition.
+        private bool TryFindLoopLatch(IReadOnlyList<ShaderBlock> blocks, int header, int end, out int latch)
+        {
+            latch = -1;
+            var instructions = _request.Program.Instructions;
+            for (var index = end - 1; index >= header; index--)
+            {
+                var terminator = instructions[blocks[index].EndIndex - 1];
+                if ((IsStructuredCondition(terminator.Opcode) || terminator.Opcode == "SBranch") &&
+                    TryResolveBranchBlock(blocks, terminator, out var target) && target == header)
+                {
+                    latch = index;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // do { blocks [header, latch] } while (latch condition), bounded by the same step guard as
+        // the dispatcher so a guest loop that never ends cannot wedge the GPU queue.
+        private bool TryStructureLoop(IReadOnlyList<ShaderBlock> blocks, int header, int latch, bool emit, out string error)
+        {
+            var outerExit = _structuredLoopExit;
+            var outerMerge = _structuredLoopMerge;
+            try
+            {
+                return TryStructureLoopCore(blocks, header, latch, emit, out error);
+            }
+            finally
+            {
+                _structuredLoopExit = outerExit;
+                _structuredLoopMerge = outerMerge;
+            }
+        }
+
+        private bool TryStructureLoopCore(IReadOnlyList<ShaderBlock> blocks, int header, int latch, bool emit, out string error)
+        {
+            _structuredLoopExit = latch + 1;
+            if (!emit)
+            {
+                _structuredLoopMerge = 0;
+                return TryStructureRange(blocks, header, latch + 1, latch + 1, emit: false, out error, latch);
+            }
+
+            var headerLabel = _module.AllocateId();
+            var bodyLabel = _module.AllocateId();
+            var continueLabel = _module.AllocateId();
+            var mergeLabel = _module.AllocateId();
+            _structuredLoopMerge = mergeLabel;
+            _module.AddStatement(SpirvOp.Branch, headerLabel);
+            _module.AddLabel(headerLabel);
+            _module.AddStatement(SpirvOp.LoopMerge, mergeLabel, continueLabel, 0);
+            _module.AddStatement(SpirvOp.Branch, bodyLabel);
+            _module.AddLabel(bodyLabel);
+            if (!TryStructureRange(blocks, header, latch + 1, latch + 1, emit: true, out error, latch))
+            {
+                return false;
+            }
+
+            _module.AddStatement(SpirvOp.Branch, continueLabel);
+            _module.AddLabel(continueLabel);
+            var terminator = _request.Program.Instructions[blocks[latch].EndIndex - 1];
+            var again = _module.ConstantBool(true);
+            if (terminator.Opcode != "SBranch")
+            {
+                TryGetBranchCondition(terminator.Opcode, out again);
+            }
+
+            if (_maxDispatcherSteps > 0)
+            {
+                var steps = IAdd(Load(_uintType, _iterationGuard), UInt(1));
+                Store(_iterationGuard, steps);
+                var withinLimit = _module.AddInstruction(SpirvOp.ULessThan, _boolType, steps, UInt((uint)_maxDispatcherSteps));
+                again = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, again, withinLimit);
+            }
+
+            _module.AddStatement(SpirvOp.BranchConditional, again, headerLabel, mergeLabel);
+            _module.AddLabel(mergeLabel);
+            return true;
+        }
+
 
         private Dictionary<int, int> _loopLatchByHeader = [];
 
@@ -5434,6 +5768,13 @@ public static partial class Gen5SpirvTranslator
         private (uint DataFormat, uint NumberFormat) DecodeGfx10BufferFormat(
             uint unifiedFormat)
         {
+            // A specialized descriptor makes the format a translation-time constant.
+            if (_module.TryGetConstantValue(unifiedFormat, out var knownFormat) && knownFormat < 128)
+            {
+                Gfx10UnifiedFormat.TryDecode(knownFormat, out var knownDataFormat, out var knownNumberFormat);
+                return (UInt(knownDataFormat), UInt(knownNumberFormat));
+            }
+
             // The descriptor is loaded at execution time, so format decoding
             // must remain dynamic too. Generate one module-level lookup table
             // from the same authoritative decoder used by descriptor
@@ -8890,12 +9231,37 @@ public static partial class Gen5SpirvTranslator
                 length);
         }
 
-        private uint ScalarPointer(uint register) =>
-            _module.AddInstruction(
-                SpirvOp.AccessChain,
-                _functionUintPointer,
-                _scalarRegisters,
-                UInt(register));
+        private uint ScalarPointer(uint register)
+        {
+            if (register >= ScalarRegisterCount)
+            {
+                throw new InvalidOperationException($"Scalar register s{register} is outside the register file.");
+            }
+
+            if (_scalarRegisters != 0)
+            {
+                return _module.AddInstruction(
+                    SpirvOp.AccessChain,
+                    _functionUintPointer,
+                    _scalarRegisters,
+                    UInt(register));
+            }
+
+            return RegisterVariable(_scalarRegisterVariables, register, "s");
+        }
+
+        private uint RegisterVariable(Dictionary<uint, uint> variables, uint register, string prefix)
+        {
+            if (!variables.TryGetValue(register, out var variable))
+            {
+                variable = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, _module.ConstantNull(_uintType));
+                _interfaces.Add(variable);
+                _module.AddName(variable, $"{prefix}{register}");
+                variables.Add(register, variable);
+            }
+
+            return variable;
+        }
 
         private void SelectLaneHalf(int half)
         {
@@ -8925,70 +9291,86 @@ public static partial class Gen5SpirvTranslator
                 _runtimeBufferBiases,
                 UInt(checked((uint)binding)));
 
-        private uint VectorPointer(uint register) =>
-            _module.AddInstruction(
-                SpirvOp.AccessChain,
-                _functionUintPointer,
-                _vectorRegisters,
-                UInt(register));
+        private uint VectorPointer(uint register)
+        {
+            if (_vectorRegisters != 0)
+            {
+                return _module.AddInstruction(
+                    SpirvOp.AccessChain,
+                    _functionUintPointer,
+                    _vectorRegisters,
+                    UInt(register));
+            }
+
+            if (register >= VectorRegisterCount)
+            {
+                throw new InvalidOperationException($"Vector register v{register} is outside the register file.");
+            }
+
+            return RegisterVariable(_vectorRegisterVariables, register, "v");
+        }
 
         // The V_MOVREL* opcodes address the VGPR file with a register number that
-        // is only known at run time (encoded number + M0). Keep the access chain
-        // in range and make an out-of-range read return zero instead of wrapping
-        // onto an unrelated VGPR.
-        private uint DynamicVectorPointer(uint registerIndex) =>
-            _module.AddInstruction(
-                SpirvOp.AccessChain,
-                _functionUintPointer,
-                _vectorRegisters,
-                registerIndex);
+        // is only known at run time (encoded number + M0), so the access chain
+        // takes a computed index instead of a constant. The index is masked to
+        // the array bounds: SPIR-V leaves an out-of-range Private access chain
+        // undefined, and a mask costs nothing next to the surrounding load.
+        // Every register a relative access can reach: from the lowest V_MOVREL* base to past the
+        // highest register the program names (a multi-dword result may extend beyond its listed
+        // first register). An index outside it reads zero and writes nothing.
+        private static (uint First, uint Last) DynamicVectorRange(Gen5ShaderProgram program)
+        {
+            var first = VectorRegisterCount - 1;
+            var last = 0u;
+            foreach (var instruction in program.Instructions)
+            {
+                foreach (var operand in instruction.Sources.Concat(instruction.Destinations))
+                {
+                    if (operand.Kind == Gen5OperandKind.VectorRegister)
+                    {
+                        last = Math.Max(last, operand.Value);
+                        if (instruction.Opcode.StartsWith("VMovrel", StringComparison.Ordinal))
+                        {
+                            first = Math.Min(first, operand.Value);
+                        }
+                    }
+                }
+            }
+
+            last = Math.Min(last + 8, VectorRegisterCount - 1);
+            return (Math.Min(first, last), last);
+        }
 
         private uint LoadVDynamic(uint registerIndex)
         {
-            var inRange = _module.AddInstruction(
-                SpirvOp.ULessThan,
-                _boolType,
-                registerIndex,
-                UInt(VectorRegisterCount));
-            var safeIndex = _module.AddInstruction(
-                SpirvOp.Select,
-                _uintType,
-                inRange,
-                registerIndex,
-                UInt(0));
-            var value = Load(_uintType, DynamicVectorPointer(safeIndex));
-            return _module.AddInstruction(
-                SpirvOp.Select,
-                _uintType,
-                inRange,
-                value,
-                UInt(0));
+            var result = UInt(0);
+            for (var register = _dynamicVectorRange.First; register <= _dynamicVectorRange.Last; register++)
+            {
+                result = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, registerIndex, UInt(register)),
+                    Load(_uintType, VectorPointer(register)),
+                    result);
+            }
+
+            return result;
         }
 
         private void StoreVDynamic(uint registerIndex, uint value)
         {
-            var inRange = _module.AddInstruction(
-                SpirvOp.ULessThan,
-                _boolType,
-                registerIndex,
-                UInt(VectorRegisterCount));
-            var safeIndex = _module.AddInstruction(
-                SpirvOp.Select,
-                _uintType,
-                inRange,
-                registerIndex,
-                UInt(0));
-            var pointer = DynamicVectorPointer(safeIndex);
-            var active = _execKnownFull
-                ? inRange
-                : LogicalAnd(Load(_boolType, _exec), inRange);
-            value = _module.AddInstruction(
-                SpirvOp.Select,
-                _uintType,
-                active,
-                value,
-                Load(_uintType, pointer));
-            Store(pointer, value);
+            // With EXEC known to be all ones the write needs no EXEC test.
+            var exec = _execKnownFull ? 0 : Load(_boolType, _exec);
+            for (var register = _dynamicVectorRange.First; register <= _dynamicVectorRange.Last; register++)
+            {
+                var pointer = VectorPointer(register);
+                var selected = _module.AddInstruction(SpirvOp.IEqual, _boolType, registerIndex, UInt(register));
+                if (exec != 0)
+                {
+                    selected = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, exec, selected);
+                }
+                Store(pointer, _module.AddInstruction(SpirvOp.Select, _uintType, selected, value, Load(_uintType, pointer)));
+            }
         }
 
         private uint PackedHalfPointer(uint register) =>
@@ -9046,11 +9428,25 @@ public static partial class Gen5SpirvTranslator
             Store(ScalarPointer(register), value);
             if (register is 106 or 107)
             {
-                RefreshWavePredicate(_vccLow, _vccHigh, LoadS64(106));
+                if (_pairWave64)
+                {
+                    RefreshWavePredicate(_vccLow, _vccHigh, LoadS64(106));
+                }
+                else if (_waveLaneCount != 32 || register == 106)
+                {
+                    Store(_vcc, IsLaneSetInMaskRegisters(106));
+                }
             }
             else if (register is 126 or 127)
             {
-                RefreshWavePredicate(_execLow, _execHigh, LoadS64(126));
+                if (_pairWave64)
+                {
+                    RefreshWavePredicate(_execLow, _execHigh, LoadS64(126));
+                }
+                else if (_waveLaneCount != 32 || register == 126)
+                {
+                    Store(_exec, IsLaneSetInMaskRegisters(126));
+                }
             }
         }
 
@@ -9070,6 +9466,22 @@ public static partial class Gen5SpirvTranslator
             SelectLaneHalf(savedHalf);
         }
 
+        // In wave32 a lane mask is its low register alone (VCC_HI and EXEC_HI are ordinary SGPRs),
+        // so the lane's bit is tested on one dword instead of a composed 64-bit mask.
+        private uint IsLaneSetInMaskRegisters(uint lowRegister)
+        {
+            if (_waveLaneCount != 32)
+            {
+                return IsWaveMaskActive(LoadS64(lowRegister));
+            }
+
+            var laneBit = _subgroupInvocationIdInput == 0
+                ? UInt(1)
+                : ShiftLeftLogical(UInt(1), GuestWaveLane());
+            return IsNotZero(BitwiseAnd(LoadS(lowRegister), laneBit));
+        }
+
+        // SHARPEMU_EXEC_GUARD_ELISION=0 guards every vector register write with EXEC again.
         private static readonly bool ExecGuardElision = !string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_EXEC_GUARD_ELISION"),
             "0",
@@ -9903,9 +10315,14 @@ public static partial class Gen5SpirvTranslator
             _module.AddLabel(mergeLabel);
         }
 
+        // Only instructions that address LDS memory need the array. ds_swizzle/ds_bpermute move data
+        // between lanes and GDS instructions use the global data share, so a graphics stage using
+        // just those must not get an 8 KiB zero-initialized per-invocation array: Metal pays for it
+        // in compile time (seconds for a large pixel shader) and in private memory per pixel.
         private bool UsesLds() =>
-            _request.Program.Instructions.Any(instruction =>
-                instruction.Control is Gen5DataShareControl) ||
+            _request.Program.Instructions.Any(static instruction =>
+                instruction.Control is Gen5DataShareControl { Gds: false } &&
+                instruction.Opcode is not ("DsSwizzleB32" or "DsBpermuteB32")) ||
             _request.Memory.Entries.Any(static memory =>
                 memory.AddressSpace is FlatAddressSpace.Shared or FlatAddressSpace.SharedOrPrivate);
 

@@ -22,6 +22,10 @@ public sealed class ResourceRuntimeInputs
     // wrapper can tell the words only the table reads from those the descriptors depend on.
     public Action<bool>? TablePhase { get; init; }
 
+    public ResidentGuestBytesReader? ReadResidentMemory { get; init; }
+
+    public bool ReadsClean { get; init; }
+
     public ResourceRuntimeInputs WithReader(GuestWordReader? reader) => new()
     {
         UserData = UserData,
@@ -30,6 +34,8 @@ public sealed class ResourceRuntimeInputs
         ReadCleanMemory = ReadCleanMemory,
         ComputeState = ComputeState,
         TablePhase = TablePhase,
+        ReadResidentMemory = ReadResidentMemory,
+        ReadsClean = ReadsClean || ReferenceEquals(reader, ReadCleanMemory),
     };
 }
 

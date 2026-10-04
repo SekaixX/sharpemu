@@ -195,6 +195,12 @@ public interface IRenderHost
 
     void EndRendering();
 
+    // Whether a texture bound for the draw being prepared reads the depth attachment's subresources.
+    bool SamplesDepthAttachment(in DepthAttachmentState depth) => true;
+
+    // The next draw stores to buffers or storage images; called before its BeginRendering.
+    void PrepareMemoryWritingDraw() { }
+
     void BindPipeline(PipelineBindPoint bindPoint, in PipelineHandle pipeline);
 
     void Draw(uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance);
@@ -237,6 +243,10 @@ public interface IRenderHost
     bool TryClearImageFromBuffer(ulong address, ulong size, uint packedClear);
 
     bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue);
+
+    bool TryFillDccMetadata(ulong address, ulong size, uint fillValue);
+
+    bool TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words);
 
     Exception Fatal(string message);
 }

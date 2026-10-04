@@ -124,8 +124,15 @@ public static partial class Gen5SpirvTranslator
                 {
                     var oldValue = LoadV(destination);
                     var sourceValue = GetRawSource(instruction, 0);
-                    var selectedLane = BitwiseAnd(GetRawSource(instruction, 1), UInt(_waveLaneCount - 1));
-                    if (_laneSpillSlots.Count != 0)
+                    var selectedLane = BitwiseAnd(GetRawSource(instruction, 1), UInt(LaneSelectMask));
+                    if (TryGetConstantLane(instruction, out var constantLane))
+                    {
+                        if (_laneSpillSlots.TryGetValue((destination, constantLane), out var slot))
+                        {
+                            Store(slot, sourceValue);
+                        }
+                    }
+                    else if (_laneSpillSlots.Count != 0)
                     {
                         foreach (var ((slotRegister, slotLane), variable) in _laneSpillSlots)
                         {
@@ -185,8 +192,8 @@ public static partial class Gen5SpirvTranslator
                         SpirvOp.Select,
                         _uintType,
                         condition,
-                        GetRawSource(instruction, 1),
-                        GetRawSource(instruction, 0));
+                        GetSignModifiedSource(instruction, 1),
+                        GetSignModifiedSource(instruction, 0));
                     break;
                 }
                 case "VCvtU32F32":
@@ -259,7 +266,7 @@ public static partial class Gen5SpirvTranslator
                     var source = GetFloatSource(instruction, 0);
                     if (instruction.Opcode == "VCvtRpiI32F32")
                     {
-                        source = Ext(9, _floatType, source);
+                        source = Ext(8, _floatType, _module.AddInstruction(SpirvOp.FAdd, _floatType, source, Float(0.5f)));
                     }
                     else if (instruction.Opcode == "VCvtFlrI32F32")
                     {
@@ -833,9 +840,9 @@ public static partial class Gen5SpirvTranslator
                     var c = GetFloat16Source(instruction, 2);
                     var value = instruction.Opcode switch
                     {
-                        "VMin3F16" => Ext(37, _floatType, Ext(37, _floatType, a, b), c),
-                        "VMax3F16" => Ext(40, _floatType, Ext(40, _floatType, a, b), c),
-                        _ => Ext(40, _floatType, Ext(37, _floatType, a, b), Ext(37, _floatType, Ext(40, _floatType, a, b), c)),
+                        "VMin3F16" => NanIgnoringMinMax(37, NanIgnoringMinMax(37, a, b), c),
+                        "VMax3F16" => NanIgnoringMinMax(40, NanIgnoringMinMax(40, a, b), c),
+                        _ => EmitFloatMedian(a, b, c),
                     };
                     result = EmitFloat16Result(instruction, destination, value);
                     break;
@@ -2955,6 +2962,13 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
 
+                // RDNA2 ISA: S_ADDK_I32 writes SCC = signed overflow, exactly like
+                // S_ADD_I32. S_MOVK_I32 and S_MULK_I32 leave SCC alone.
+                if (instruction.Opcode == "SAddkI32")
+                {
+                    Store(_scc, SignedAddOverflow(current, UInt(immediate), value));
+                }
+
                 StoreS(destination, value);
                 return true;
             }
@@ -4304,6 +4318,24 @@ public static partial class Gen5SpirvTranslator
             return value;
         }
 
+        private uint GetSignModifiedSource(Gen5ShaderInstruction instruction, int sourceIndex)
+        {
+            var value = GetRawSource(instruction, sourceIndex);
+            if (instruction.Control is not Gen5Vop3Control control)
+            {
+                return value;
+            }
+
+            if ((control.AbsoluteMask & (1u << sourceIndex)) != 0)
+            {
+                value = BitwiseAnd(value, UInt(0x7FFFFFFFu));
+            }
+
+            return (control.NegateMask & (1u << sourceIndex)) != 0
+                ? BitwiseXor(value, UInt(0x80000000u))
+                : value;
+        }
+
         private uint ApplyDpp8Source(Gen5Dpp8Control control, uint value)
         {
             var lane = GuestWaveLane();
@@ -4865,7 +4897,7 @@ public static partial class Gen5SpirvTranslator
             };
             if (clamp)
             {
-                doubleValue = Ext(43, type, doubleValue, Double(0.0), Double(1.0));
+                doubleValue = Ext(81, type, doubleValue, Double(0.0), Double(1.0));
             }
 
             var bits = Bitcast(_ulongType, doubleValue);
@@ -4899,9 +4931,8 @@ public static partial class Gen5SpirvTranslator
             EmitFloat16Result(
                 instruction,
                 destination,
-                Ext(
+                NanIgnoringMinMax(
                     operation,
-                    _floatType,
                     GetFloat16Source(instruction, 0),
                     GetFloat16Source(instruction, 1)));
 
@@ -4986,6 +5017,93 @@ public static partial class Gen5SpirvTranslator
             var mantissa = BitwiseAnd(absolute, UInt(0x007F_FFFF));
             var nan = LogicalAnd(Equal(exponent, 0x7F80_0000), IsNotZero(mantissa));
             return (bits, nan, Equal(absolute, 0));
+        }
+
+        // v_min_f32 and v_max_f32 return the other operand when one is NaN. GLSL FMin and FMax
+        // leave that undefined, and Metal's fast math returns the NaN.
+        private uint EmitFloatExtBinary(
+            Gen5ShaderInstruction instruction,
+            uint operation) =>
+            EmitFloatResult(
+                instruction,
+                NanIgnoringMinMax(
+                    operation,
+                    GetFloatSource(instruction, 0),
+                    GetFloatSource(instruction, 1)));
+
+        private uint EmitFloatMedian(uint a, uint b, uint c)
+        {
+            var low = NanIgnoringMinMax(37, a, b);
+            var high = NanIgnoringMinMax(40, a, b);
+            var median = NanIgnoringMinMax(40, low, NanIgnoringMinMax(37, high, c));
+            var anyNan = _module.AddInstruction(
+                SpirvOp.LogicalOr,
+                _boolType,
+                IsNanBits(a),
+                _module.AddInstruction(SpirvOp.LogicalOr, _boolType, IsNanBits(b), IsNanBits(c)));
+            return _module.AddInstruction(SpirvOp.Select, _floatType, anyNan, NanIgnoringMinMax(37, low, c), median);
+        }
+
+        private uint EmitFloatTernaryExt(
+            Gen5ShaderInstruction instruction,
+            uint operation)
+        {
+            var first = NanIgnoringMinMax(
+                operation,
+                GetFloatSource(instruction, 0),
+                GetFloatSource(instruction, 1));
+            return EmitFloatResult(
+                instruction,
+                NanIgnoringMinMax(operation, first, GetFloatSource(instruction, 2)));
+        }
+
+        private uint NanIgnoringMinMax(uint operation, uint left, uint right)
+        {
+            var result = Ext(operation, _floatType, left, right);
+            result = _module.AddInstruction(SpirvOp.Select, _floatType, IsNanBits(right), left, result);
+            return _module.AddInstruction(SpirvOp.Select, _floatType, IsNanBits(left), right, result);
+        }
+
+        // NaN tested on the bits, which fast math cannot assume away.
+        private uint IsNanBits(uint value) =>
+            _module.AddInstruction(
+                SpirvOp.UGreaterThan,
+                _boolType,
+                BitwiseAnd(Bitcast(_uintType, value), UInt(0x7FFF_FFFF)),
+                UInt(0x7F80_0000));
+
+        // v_cvt_u32_f32 and v_cvt_i32_f32 saturate and convert NaN to zero; SPIR-V leaves
+        // out-of-range conversions undefined.
+        private uint ConvertFloatToUnsignedSaturated(uint value)
+        {
+            var bits = Bitcast(_uintType, value);
+            var converted = _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, value);
+            converted = _module.AddInstruction(
+                SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, bits, UInt(0x4F80_0000)),
+                UInt(uint.MaxValue),
+                converted);
+            // Negative values, including negative NaN, have the sign bit set.
+            converted = _module.AddInstruction(
+                SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, bits, UInt(0x8000_0000)),
+                UInt(0),
+                converted);
+            return _module.AddInstruction(SpirvOp.Select, _uintType, IsNanBits(value), UInt(0), converted);
+        }
+
+        private uint ConvertFloatToSignedSaturated(uint value)
+        {
+            var bits = Bitcast(_uintType, value);
+            var magnitude = BitwiseAnd(bits, UInt(0x7FFF_FFFF));
+            var converted = Bitcast(_uintType, _module.AddInstruction(SpirvOp.ConvertFToS, _intType, value));
+            var negative = _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, bits, UInt(0x8000_0000));
+            converted = _module.AddInstruction(
+                SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, magnitude, UInt(0x4F00_0000)),
+                _module.AddInstruction(SpirvOp.Select, _uintType, negative, UInt(0x8000_0000), UInt(0x7FFF_FFFF)),
+                converted);
+            return _module.AddInstruction(SpirvOp.Select, _uintType, IsNanBits(value), UInt(0), converted);
         }
 
         private uint EmitIntegerBinary(
@@ -5454,7 +5572,7 @@ public static partial class Gen5SpirvTranslator
 
             var selectedLane = BitwiseAnd(
                 GetRawSource(instruction, 1),
-                UInt(_waveLaneCount - 1));
+                UInt(LaneSelectMask));
 
             if (_pairWave64 && _emittingPairedInstruction)
             {
@@ -5508,7 +5626,7 @@ public static partial class Gen5SpirvTranslator
                     destination,
                     BroadcastWave64Lane(sourceValue, selectedLane));
             }
-            else if (_subgroupInvocationIdInput != 0)
+            else if (_subgroupInvocationIdInput != 0 && _stage == Gen5SpirvStage.Compute)
             {
                 var broadcast = _module.AddInstruction(
                     SpirvOp.GroupNonUniformBroadcast,
@@ -5516,18 +5634,13 @@ public static partial class Gen5SpirvTranslator
                     UInt(3),
                     sourceValue,
                     selectedLane);
-                StoreS(destination, broadcast);
+                StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, broadcast));
             }
             else
             {
                 // Fallback: no subgroup ops, read current lane's value, or the
                 // spill slot that V_WRITELANE filled for the selected lane.
-                if (instruction.Sources[0].Kind == Gen5OperandKind.VectorRegister)
-                {
-                    sourceValue = SelectLaneSpillSlot(instruction.Sources[0].Value, selectedLane, sourceValue);
-                }
-
-                StoreS(destination, sourceValue);
+                StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, sourceValue));
             }
 
             return true;
@@ -5727,7 +5840,7 @@ public static partial class Gen5SpirvTranslator
             };
             if (control?.Clamp == true)
             {
-                value = Ext(43, _floatType, value, Float(0), Float(1));
+                value = Ext(81, _floatType, value, Float(0), Float(1));
             }
 
             var half = EmitFloatToHalf(Bitcast(_uintType, value));
@@ -5768,7 +5881,7 @@ public static partial class Gen5SpirvTranslator
             };
             if (clamp)
             {
-                value = Ext(43, _floatType, value, Float(0), Float(1));
+                value = Ext(81, _floatType, value, Float(0), Float(1));
             }
 
             return Bitcast(_uintType, value);

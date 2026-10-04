@@ -39,6 +39,8 @@ public readonly record struct TargetViewRange(uint BaseLayer, uint LayerCount, u
 
 public static partial class ImageRequestBuilders
 {
+    private static long _normalizedSliceRanges;
+
     public static uint SampleCount(uint encodedLog2) => encodedLog2 <= 3 ? 1u << (int)encodedLog2 : 0;
 
     private static bool DccAlphaOnMsb(in ColorTargetWords words)
@@ -148,6 +150,16 @@ public static partial class ImageRequestBuilders
         var lastLayer = volume
             ? Math.Min(words.SliceMax, Math.Max(depth >> (int)words.MipLevel, 1) - 1)
             : words.SliceMax;
+        if (volume && lastLayer != words.SliceMax)
+        {
+            var normalized = Interlocked.Increment(ref _normalizedSliceRanges);
+            if (normalized <= 8 || (normalized & (normalized - 1)) == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] normalized a 3D color-target slice range to last={lastLayer} depth={depth} count={normalized}");
+            }
+        }
+
         if (!TargetViewRange.TryResolve(words.SliceStart, lastLayer, drawLayerOffset, out var view))
         {
             throw SubmissionScheduler.Fatal($"The render-target view is invalid: base={words.SliceStart} last={words.SliceMax} drawOffset={drawLayerOffset}.");
@@ -300,9 +312,16 @@ public static partial class ImageRequestBuilders
 
         var viewExtent = new Extent2D(Math.Max(width >> (int)words.MipLevel, 1), Math.Max(height >> (int)words.MipLevel, 1));
         var viewDepth = Math.Max(depth >> (int)words.MipLevel, 1);
-        if (volume && (view.BaseLayer >= viewDepth || view.LayerCount > viewDepth - view.BaseLayer))
+        if (volume && view.BaseLayer < viewDepth && view.LayerCount > viewDepth - view.BaseLayer)
         {
-            throw SubmissionScheduler.Fatal($"The 3D render-target view exceeds the mip depth: base={view.BaseLayer} count={view.LayerCount} depth={viewDepth} mip={words.MipLevel}.");
+            // Titles bind a whole volume with the last slice set to its depth, one past the end;
+            // the color block stops at the last slice of the mip.
+            view = view with { LayerCount = viewDepth - view.BaseLayer, ImageLayers = viewDepth };
+        }
+
+        if (volume && view.BaseLayer >= viewDepth)
+        {
+            throw SubmissionScheduler.Fatal($"The 3D render-target view starts past the mip depth: base={view.BaseLayer} count={view.LayerCount} depth={viewDepth} mip={words.MipLevel}.");
         }
 
         var description = ImageDescription.Create();

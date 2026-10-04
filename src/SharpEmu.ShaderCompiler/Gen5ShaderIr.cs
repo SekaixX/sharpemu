@@ -147,6 +147,17 @@ public readonly record struct Gen5PixelOutputBinding(
         : this(guestSlot, hostLocation, kind, componentMapping, 0)
     {
     }
+
+    private readonly uint? _exportTarget;
+
+    // The EXP MRT target that feeds this slot. It differs from the slot when the pixel
+    // program skips targets, because the hardware packs color exports into the slots
+    // that CB_SHADER_MASK enables.
+    public uint ExportTarget
+    {
+        get => _exportTarget ?? GuestSlot;
+        init => _exportTarget = value;
+    }
 }
 
 public readonly record struct Gen5ComputeSystemRegisters(
@@ -385,10 +396,27 @@ public sealed record Gen5ShaderInstruction(
     // Control flow uses the compact logical Pc. A fused continuation can live at
     // any guest address, so S_GETPC keeps its physical offset from the entry base
     // separately instead of stretching the uint CFG address space to fit it.
-    public ulong? GuestProgramCounterOffset { get; init; }
+    private ulong? _guestProgramCounterOffset;
+
+    public ulong? GuestProgramCounterOffset
+    {
+        get => _guestProgramCounterOffset;
+        init => _guestProgramCounterOffset = value;
+    }
+
+    // Upstream's name for the same physical offset. Keep both initializers so
+    // cached graphs and fused-program callers from either side retain one source
+    // of truth.
+    public ulong? AddressOffset
+    {
+        get => _guestProgramCounterOffset;
+        init => _guestProgramCounterOffset = value;
+    }
+
+    public ulong ProgramOffset => _guestProgramCounterOffset ?? Pc;
 
     public ulong NextGuestProgramCounterOffset => unchecked(
-        (GuestProgramCounterOffset ?? Pc) + (ulong)Words.Count * sizeof(uint));
+        ProgramOffset + (ulong)Words.Count * sizeof(uint));
 }
 
 public sealed record Gen5ShaderProgram(

@@ -36,6 +36,11 @@ public sealed partial class GpuCommandInterpreter
             throw _host.Fatal($"The wait compare function is unknown: function={compareFunction} address=0x{address:X16}.");
         }
 
+        if (!satisfied && TryReadOwnWrite(address, is64Bit, out var ownValue))
+        {
+            _ = WaitOperation.TryCompare(ownValue, reference, mask, compareFunction, out satisfied);
+        }
+
         if (!satisfied)
         {
             if (LogGpuWaits)
@@ -51,20 +56,16 @@ public sealed partial class GpuCommandInterpreter
         }
     }
 
+    // The wait bit is PredicationZPassWaitOp: 0 (kWaitForQueryResults) stalls the command
+    // processor until the results arrive, 1 (kDoNotPredicateIfQueryResultsNotReady) never
+    // stalls and leaves the tagged packets unpredicated while the results are outstanding.
     internal void SetPredication(uint condition, uint operation, uint waitOperation, ulong address)
     {
-        // Operation 3 reads a single GPU-produced boolean label.  When the
-        // packet requests a wait, retire prior GPU work before reading it.
-        // Keep the newer operation-1 occlusion-counter behavior unchanged.
-        if (operation == 3 && waitOperation != 0)
-        {
-            _host.FlushAndWait();
-        }
-
         ulong value;
         switch (operation)
         {
             case 0:
+                // Clearing predication reads no memory, so no GPU result can be outstanding.
                 PredicateSkip = false;
                 return;
             case 1:
@@ -106,6 +107,15 @@ public sealed partial class GpuCommandInterpreter
                     throw _host.Fatal("The predication address is zero.");
                 }
 
+                if (waitOperation != 0)
+                {
+                    // The results are outstanding while work is queued behind this packet, and
+                    // the game asked for the packets to run unpredicated in that case.
+                    PredicateSkip = false;
+                    return;
+                }
+
+                _host.FlushAndWait();
                 value = ReadQword(address);
                 break;
             }

@@ -184,102 +184,22 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         // Overlap resolution can rebase the native view. DCC metadata, however, is laid out
         // from the base layer in the guest request, so retain it before resolving the image.
         var metadataBaseLayer = request.View.BaseLayer;
-        ResourceSlotIdentifier result;
+        var result = LookUpImage(ref request, exactFormat);
+
+        if (request.Role is ImageRole.Texture or ImageRole.StorageImage)
         {
-            using var held = _lock.Hold();
-            result = ResourceSlotIdentifier.Invalid;
-            var candidates = FindImagesInRange(request.Description.Data.Address, request.Description.Data.Size, pageOverlap: false);
-            foreach (var imageIdentifier in candidates)
+            ulong metadataAddress;
+            ulong sliceSize;
+            using (var held = _lock.Hold())
             {
-                if (HasSameBacking(_slots[imageIdentifier].Description, request.Description, exactFormat))
-                {
-                    result = imageIdentifier;
-                }
+                ref readonly var description = ref _slots[result].Description;
+                metadataAddress = description.Metadata.Range.Address;
+                sliceSize = description.DccSliceSize;
             }
 
-            var viewMip = -1;
-            var viewLayer = -1;
-            if (!result.IsValid)
+            if (sliceSize != 0)
             {
-                foreach (var candidate in candidates)
-                {
-                    viewMip = -1;
-                    viewLayer = -1;
-                    var mergedDescription = result.IsValid ? _slots[result].Description : request.Description;
-                    var overlap = ResolveOverlap(mergedDescription, request.Role, candidate, result);
-                    if (overlap.Image.IsValid)
-                    {
-                        result = overlap.Image;
-                        viewMip = overlap.Mip;
-                        viewLayer = overlap.Layer;
-                    }
-                }
-            }
-
-            if (result.IsValid)
-            {
-                var resolved = _slots[result];
-                if (exactFormat && resolved.Description.PixelFormat != request.Description.PixelFormat)
-                {
-                    result = ResourceSlotIdentifier.Invalid;
-                }
-                else if (resolved.Description.Resources < request.Description.Resources)
-                {
-                    ReleaseImage(result);
-                    result = ResourceSlotIdentifier.Invalid;
-                }
-                else if (!resolved.SupportsViewType(request.View) &&
-                         resolved.Description.Extent.Height == 1 && resolved.Description.Extent.Depth == 1 &&
-                         ((resolved.Backing.ImageType == ImageType.Type1D &&
-                           request.View.Type is ImageViewType.Type2D or ImageViewType.Type2DArray) ||
-                          (resolved.Backing.ImageType == ImageType.Type2D &&
-                           request.View.Type is ImageViewType.Type1D or ImageViewType.Type1DArray)))
-                {
-                    // Keep all cached subresources when an overlap needs a different dimensional type.
-                    var replacement = resolved.Description;
-                    replacement.Type = request.View.Type is ImageViewType.Type1D or ImageViewType.Type1DArray
-                        ? GuestImageType.Color1D : GuestImageType.Color2D;
-                    result = GrowImage(replacement, result);
-                }
-                else if (request.Role == ImageRole.StorageImage && viewMip < 0 && viewLayer < 0 &&
-                         resolved.Description.IsBlock && !request.Description.IsBlock &&
-                         (resolved.Backing.Usage & ImageUsageFlags.StorageBit) == 0)
-                {
-                    result = ReplaceCompressedForStorage(request.Description, result);
-                }
-            }
-
-            if (!result.IsValid)
-            {
-                result = InsertImage(request.Description);
-                var inserted = _slots[result];
-                if (_bufferCache.HasGpuDirtyBytes(inserted.Description.Data.Address, inserted.Description.Data.Size))
-                {
-                    inserted.MarkBufferModified();
-                }
-            }
-
-            var image = _slots[result];
-
-            if (viewMip >= 0)
-            {
-                request.View = request.View with { BaseLevel = (uint)viewMip };
-            }
-
-            if (viewLayer >= 0)
-            {
-                request.View = request.View with { BaseLayer = (uint)viewLayer };
-            }
-
-            image.LastAccessTick = _scheduler.CurrentTick;
-            TouchImage(image);
-            if (TextureTraceEnabled)
-            {
-                TraceTexture(
-                    "find",
-                    image,
-                    request,
-                    $"slot={result.Index}:{result.Generation} exactFormat={exactFormat} imageHandle=0x{image.Backing.Handle.Handle:X16}");
+                SynchronizeGuestDccMetadata(metadataAddress, sliceSize, request.View.BaseLayer, request.View.LayerCount);
             }
         }
 
@@ -297,6 +217,119 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
                 throw SubmissionScheduler.Fatal(
                     $"A compressed display surface can only be read from clean native GPU contents: address=0x{image.Description.Data.Address:X16} bufferModified={image.IsBufferModified} cpuDirty={image.IsCpuDirty} gpuModified={image.IsGpuModified}.");
             }
+        }
+
+        return result;
+    }
+
+    private ResourceSlotIdentifier LookUpImage(ref ImageRequest request, bool exactFormat)
+    {
+        using var held = _lock.Hold();
+        if (TryReuseLookup(ref request, exactFormat, out var reused))
+        {
+            return reused;
+        }
+
+        var original = request;
+        var generation = _lookupGeneration;
+        var result = ResourceSlotIdentifier.Invalid;
+        var candidates = FindImagesInRange(request.Description.Data.Address, request.Description.Data.Size, pageOverlap: false);
+        foreach (var imageIdentifier in candidates)
+        {
+            if (HasSameBacking(_slots[imageIdentifier].Description, request.Description, exactFormat))
+            {
+                result = imageIdentifier;
+            }
+        }
+
+        var sameBacking = result.IsValid;
+        var viewMip = -1;
+        var viewLayer = -1;
+        if (!result.IsValid)
+        {
+            foreach (var candidate in candidates)
+            {
+                viewMip = -1;
+                viewLayer = -1;
+                var mergedDescription = result.IsValid ? _slots[result].Description : request.Description;
+                var overlap = ResolveOverlap(mergedDescription, request.Role, candidate, result);
+                if (overlap.Image.IsValid)
+                {
+                    result = overlap.Image;
+                    viewMip = overlap.Mip;
+                    viewLayer = overlap.Layer;
+                }
+            }
+        }
+
+        if (result.IsValid)
+        {
+            var resolved = _slots[result];
+            if (exactFormat && resolved.Description.PixelFormat != request.Description.PixelFormat)
+            {
+                result = ResourceSlotIdentifier.Invalid;
+            }
+            else if (resolved.Description.Resources < request.Description.Resources)
+            {
+                ReleaseImage(result);
+                result = ResourceSlotIdentifier.Invalid;
+            }
+            else if (!resolved.SupportsViewType(request.View) &&
+                     resolved.Description.Extent.Height == 1 && resolved.Description.Extent.Depth == 1 &&
+                     ((resolved.Backing.ImageType == ImageType.Type1D &&
+                       request.View.Type is ImageViewType.Type2D or ImageViewType.Type2DArray) ||
+                      (resolved.Backing.ImageType == ImageType.Type2D &&
+                       request.View.Type is ImageViewType.Type1D or ImageViewType.Type1DArray)))
+            {
+                // Keep all cached subresources when an overlap needs a different dimensional type.
+                var replacement = resolved.Description;
+                replacement.Type = request.View.Type is ImageViewType.Type1D or ImageViewType.Type1DArray
+                    ? GuestImageType.Color1D : GuestImageType.Color2D;
+                result = GrowImage(replacement, result);
+            }
+            else if (request.Role == ImageRole.StorageImage && viewMip < 0 && viewLayer < 0 &&
+                     resolved.Description.IsBlock && !request.Description.IsBlock &&
+                     (resolved.Backing.Usage & ImageUsageFlags.StorageBit) == 0)
+            {
+                result = ReplaceCompressedForStorage(request.Description, result);
+            }
+        }
+
+        if (!result.IsValid)
+        {
+            result = InsertImage(request.Description);
+            var inserted = _slots[result];
+            if (_bufferCache.HasGpuDirtyBytes(inserted.Description.Data.Address, inserted.Description.Data.Size))
+            {
+                inserted.MarkBufferModified();
+            }
+        }
+
+        var image = _slots[result];
+        if (viewMip >= 0)
+        {
+            request.View = request.View with { BaseLevel = (uint)viewMip };
+        }
+
+        if (viewLayer >= 0)
+        {
+            request.View = request.View with { BaseLayer = (uint)viewLayer };
+        }
+
+        image.LastAccessTick = _scheduler.CurrentTick;
+        TouchImage(image);
+        if (TextureTraceEnabled)
+        {
+            TraceTexture(
+                "find",
+                image,
+                request,
+                $"slot={result.Index}:{result.Generation} exactFormat={exactFormat} imageHandle=0x{image.Backing.Handle.Handle:X16}");
+        }
+
+        if (sameBacking && generation == _lookupGeneration)
+        {
+            RememberLookup(original, exactFormat, request.View, result);
         }
 
         return result;
@@ -354,6 +387,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             }
 
             RefreshFromGuest(imageIdentifier, request);
+            MergeMipTailBlock(image);
         }
 
         switch (request.Role)
@@ -408,6 +442,28 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         image.MarkGpuModified();
         image.Uses.RenderTarget = true;
         RefreshFromGuest(imageIdentifier, request);
+        // DCC lives in its own allocation; it is registered at bind time, keeping a pending fill.
+        if (request.Description.Metadata.Kind == MetadataKind.Dcc)
+        {
+            image.Description.Metadata = request.Description.Metadata;
+            var address = request.Description.Metadata.Range.Address;
+            if (!_surfaceMetadata.TryGetValue(address, out var metadata))
+            {
+                metadata = new SurfaceMetadata { Kind = SurfaceMetadataKind.Dcc };
+                _surfaceMetadata.Add(address, metadata);
+            }
+            else if (metadata.Kind == SurfaceMetadataKind.PendingDcc)
+            {
+                metadata.Kind = SurfaceMetadataKind.Dcc;
+            }
+            else if (metadata.Kind != SurfaceMetadataKind.Dcc)
+            {
+                throw SubmissionScheduler.Fatal($"A color target reuses metadata that is not DCC: address=0x{address:X16} kind={metadata.Kind}.");
+            }
+
+            metadata.Size = Math.Max(metadata.Size, request.Description.DccSliceSize * request.Description.TransferLayers);
+        }
+
         TakeGpuOwnership(image);
         ScheduleReadback(imageIdentifier, image);
         var view = image.GetOrCreateView(request.View);
@@ -471,6 +527,69 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         TakeGpuOwnership(image);
         return image.GetOrCreateView(request.View);
+    }
+
+    // GFX10 packs the mips smaller than half a swizzle block into one block at the start of the chain.
+    // A title can write that block through a single-level view the size of the block (Unity's
+    // screen-space reflection blur writes mips 3 and up that way), which the cache keeps as its own
+    // image; copy each tail mip out of it before the chain is read.
+    private void MergeMipTailBlock(CachedImage chain)
+    {
+        ref var description = ref chain.Description;
+        if (description.Resources.Levels <= 1 || description.IsBlock || description.IsDepth || description.Samples > 1 ||
+            description.Resources.Layers != 1 || description.IsVolume ||
+            !Agc.GnmTiling.TryGetBlockElementDimensions((uint)description.TileMode, (int)description.BytesPerBlock, out var blockWidth, out var blockHeight))
+        {
+            return;
+        }
+
+        foreach (var candidateIdentifier in FindImagesInRange(description.Data.Address, 1, pageOverlap: false))
+        {
+            var block = _slots[candidateIdentifier];
+            ref var blockDescription = ref block.Description;
+            if (ReferenceEquals(block, chain) || blockDescription.Data.Address != description.Data.Address ||
+                blockDescription.Resources.Levels != 1 || blockDescription.Resources.Layers != 1 ||
+                blockDescription.Extent.Width != (uint)blockWidth || blockDescription.Extent.Height != (uint)blockHeight ||
+                blockDescription.BytesPerBlock != description.BytesPerBlock || blockDescription.TileMode != description.TileMode ||
+                !block.IsGpuModified || !block.Backing.Exists || block.GpuWriteSequence <= chain.MergedTailSequence)
+            {
+                continue;
+            }
+
+            if (!Agc.GnmTiling.TryGetMipChainPlacement(
+                    (uint)description.TileMode,
+                    (int)description.Extent.Width,
+                    (int)description.Extent.Height,
+                    (int)description.BytesPerBlock,
+                    description.Resources.Levels,
+                    out var placements,
+                    out _))
+            {
+                return;
+            }
+
+            for (var mip = 0; mip < placements.Length && mip < chain.Backing.MipLevels; mip++)
+            {
+                var placement = placements[mip];
+                if (!placement.InMipTail ||
+                    placement.TailElementX + placement.ElementsWide > blockWidth ||
+                    placement.TailElementY + placement.ElementsHigh > blockHeight)
+                {
+                    continue;
+                }
+
+                chain.CopyRegionFrom(
+                    block,
+                    (uint)placement.TailElementX,
+                    (uint)placement.TailElementY,
+                    (uint)mip,
+                    (uint)placement.ElementsWide,
+                    (uint)placement.ElementsHigh);
+            }
+
+            chain.MergedTailSequence = block.GpuWriteSequence;
+            return;
+        }
     }
 
     private void RefreshStencilPlane(ResourceSlotIdentifier depthIdentifier, CachedImage depth, bool stencilCompressed)

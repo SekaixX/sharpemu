@@ -20,7 +20,7 @@ internal sealed class FakeCompiledShader(ShaderCompileRequest request, byte[]? s
 
     public byte[] Spirv => spirv ?? [];
 
-    public byte[] Payload => [];
+    public byte[] Payload => Spirv;
 
     public string PayloadFileExtension => "fake";
 }
@@ -40,14 +40,30 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
 
     public uint MaxPushDescriptors => 32;
 
-    public bool ComputeWave64Supported => true;
+    public bool ComputeWave64Supported => ComputeSubgroupSize >= 64;
 
-    public uint ComputeSubgroupSize => 64;
+    public uint ComputeSubgroupSize { get; set; } = 64;
+
+    public ComputeWorkgroupAxisMapping WorkgroupAxisMapping { get; set; } = ComputeWorkgroupAxisMapping.Identity;
+
+    public ComputeWorkgroupAxisMapping ResolveComputeWorkgroupAxisMapping(uint threadsX, uint threadsY, uint threadsZ) =>
+        WorkgroupAxisMapping;
 
     public bool GraphicsSubgroupOperationsEnabled => true;
 
-    public bool SharedInt64AtomicsEnabled => false;
+    public bool BufferInt64AtomicsSupported { get; set; }
+
     public bool ShaderFloat64Supported { get; set; }
+
+    public bool ShaderSignedZeroInfNanPreserveFloat32Supported { get; set; }
+
+    public bool ShaderDeviceClockSupported { get; set; }
+
+    public uint ShaderDeviceClockShift { get; set; }
+
+    public bool SharedInt64AtomicsEnabled => false;
+
+    public ShaderPrewarmList? ShaderPrewarm { get; set; }
 
     public RenderHostLimits Limits => new(16384, 16384, 16384, 16384);
 
@@ -109,6 +125,23 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
         ComputePipelines.Add(description);
         var handle = _nextHandle++;
         return new PipelineHandle(handle, handle, UsesPushDescriptors: true);
+    }
+
+    // How many times each program reports "still compiling" before it is handed over,
+    // standing in for the host shader compiler running on a worker thread.
+    public Dictionary<ulong, int> PendingComputeCompiles { get; } = new();
+
+    public bool TryCreateComputePipeline(ComputePipelineDescription description, out PipelineHandle handle)
+    {
+        handle = default;
+        if (PendingComputeCompiles.TryGetValue(description.Program.Id, out var remaining) && remaining > 0)
+        {
+            PendingComputeCompiles[description.Program.Id] = remaining - 1;
+            return false;
+        }
+
+        handle = CreateComputePipeline(description);
+        return true;
     }
 }
 
@@ -291,9 +324,22 @@ internal sealed class PipelineTestGuest
         return new ShaderSource(registered, hash, userData, userDataBase, stage);
     }
 
-    public static StageCompileOptions ComputeOptions(uint threadsX = 64) => new()
+    public static StageCompileOptions ComputeOptions(
+        uint threadsX = 64,
+        uint hostSubgroupSize = 64,
+        ComputeWorkgroupAxisMapping? workgroupAxisMapping = null) => new()
     {
-        ComputeInfo = new ComputeInputInfo { ThreadsX = threadsX, ThreadsY = 1, ThreadsZ = 1, WaveSize = 32, GroupIdX = true, ThreadIdCount = 1 },
+        ComputeInfo = new ComputeInputInfo
+        {
+            ThreadsX = threadsX,
+            ThreadsY = 1,
+            ThreadsZ = 1,
+            WaveSize = 32,
+            GroupIdX = true,
+            ThreadIdCount = 1,
+            HostSubgroupSize = hostSubgroupSize,
+            WorkgroupAxisMapping = workgroupAxisMapping ?? ComputeWorkgroupAxisMapping.Identity,
+        },
     };
 
     // The four words of a raw buffer descriptor with the given format and record count.

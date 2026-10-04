@@ -130,6 +130,23 @@ public static partial class KernelMemoryCompatExports
         BackingOffset = region.IsDirect || region.IsFlexible ? region.BackingOffset + start - region.Address : 0,
     };
 
+    // Empty or reserved-only address space that no GPU-registered span reaches.
+    private static bool IsUntouchedByGpu(ulong address, ulong size)
+    {
+        if (size == 0 || ulong.MaxValue - address < size)
+            return false;
+        lock (_memoryGate)
+        {
+            foreach (var region in GetMappingSlices(address, size))
+            {
+                if (!region.IsReserved)
+                    return false;
+            }
+        }
+
+        return !GuestGpuMemoryHook.OverlapsRegistered(address, size);
+    }
+
     private static MappedRegion[] GetMappingSlices(ulong address, ulong size, bool clip = true)
     {
         var lowerIndex = 0;
@@ -279,7 +296,7 @@ public static partial class KernelMemoryCompatExports
         {
             if (!space.TryHoldRange(address, size))
                 return false;
-            GuestGpuMemoryHook.NoteUnmapped(address, size);
+            UnregisterFreeRange(address, size);
             return true;
         }
         if (!TryUnmapViews(space, regions))
@@ -298,6 +315,19 @@ public static partial class KernelMemoryCompatExports
             if (region.IsDirect)
                 ReclaimUnaliasedAutomaticRangeLocked(region.DirectStart, region.Length);
         return true;
+    }
+
+    // Free and reserved ranges are never registered with the GPU, and unregistering hands the GPU
+    // worker a request to wait for. A direct transaction holds the mapping lock that GPU reads take,
+    // so waiting there would deadlock; it relies on this range having nothing to unregister.
+    private static void UnregisterFreeRange(ulong address, ulong size)
+    {
+        if (!GuestGpuMemoryHook.OverlapsRegistered(address, size))
+            return;
+        if (_directMappingTransaction)
+            throw new InvalidOperationException(
+                $"A free guest range is still registered with the GPU: address=0x{address:X16} size=0x{size:X}.");
+        GuestGpuMemoryHook.NoteUnmapped(address, size);
     }
 
     private static bool TrySelectBackingAddress(IGuestBackedSpace space, ulong requested, ulong length,
@@ -434,7 +464,7 @@ public static partial class KernelMemoryCompatExports
             if (overlap.Length == 0 || (reuseReservation && address == requested &&
                 MappingsCoverRange(GetMappingSlices(address, length), address, length) && overlap.All(region => region.IsReserved)))
             {
-                GuestGpuMemoryHook.NoteUnmapped(address, length);
+                UnregisterFreeRange(address, length);
                 return true;
             }
 
@@ -448,7 +478,6 @@ public static partial class KernelMemoryCompatExports
 
             desired = overlapEnd;
         }
-
         address = 0;
         return false;
     }
@@ -489,18 +518,58 @@ public static partial class KernelMemoryCompatExports
     }
 
     internal static int ReserveBackingRange(CpuContext ctx, ulong pointer, ulong length, ulong flags, ulong alignment)
-        => RunMappingTransaction(() => ReserveBackingRangeCore(ctx, pointer, length, flags, alignment));
+        => RunMappingTransaction(
+            () => ReserveBackingRangeCore(ctx, pointer, length, flags, alignment),
+            () => (flags & OrbisKernelMapFixed) == 0 ||
+                (ctx.TryReadUInt64(pointer, out var requested) && IsUntouchedByGpu(requested, length)));
 
-    private static int RunMappingTransaction(Func<int> transaction)
+    // A batch wraps its entries in one transaction, so the entries must not hand off again.
+    [ThreadStatic]
+    private static bool _insideMappingTransaction;
+
+    // Set while a transaction runs on the guest thread instead of the GPU worker.
+    [ThreadStatic]
+    private static bool _directMappingTransaction;
+
+    private static int RunMappingTransaction(Func<int> transaction, Func<bool>? onlyAddsOutsideGpuMemory = null)
     {
         // GPU handoff must precede locks needed by image and buffer reads.
         if (Monitor.IsEntered(_memoryGate))
             throw new InvalidOperationException("Cannot start a mapping transaction while holding the mapping lock.");
-        if (GuestGpuMemoryHook.Current is not { } memory)
+        if (_insideMappingTransaction || GuestGpuMemoryHook.Current is not { } memory)
             return transaction();
 
+        // A transaction that only places new mappings in address space the GPU has never been given
+        // (kernel-chosen placements, or empty/reserved ranges outside every registered span) cannot
+        // race a GPU read and unregisters nothing. It runs here instead of queueing behind the GPU
+        // worker, which during loading is busy compiling pipelines: Demon's Souls spent seconds per
+        // reservation waiting for a queue slot while the change itself took a millisecond.
+        if (onlyAddsOutsideGpuMemory?.Invoke() == true)
+        {
+            _insideMappingTransaction = _directMappingTransaction = true;
+            try
+            {
+                return transaction();
+            }
+            finally
+            {
+                _insideMappingTransaction = _directMappingTransaction = false;
+            }
+        }
+
         var result = MemoryFault;
-        memory.RunMappingChange(() => result = transaction());
+        memory.RunMappingChange(() =>
+        {
+            _insideMappingTransaction = true;
+            try
+            {
+                result = transaction();
+            }
+            finally
+            {
+                _insideMappingTransaction = false;
+            }
+        });
         return result;
     }
 

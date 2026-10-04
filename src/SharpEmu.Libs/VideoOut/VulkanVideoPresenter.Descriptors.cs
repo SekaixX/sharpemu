@@ -124,62 +124,17 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private readonly record struct BufferView(VkBuffer Buffer, ulong Offset, ulong Range);
 
-        // Resource counts are fixed by a compiled shader layout and repeat across draws. Keep a
-        // small exact-length cache so existing array-length validation remains meaningful while
-        // the render hot path stops creating five temporary arrays for every shader stage.
-        private sealed class ExactLengthArrayPool<T>
+        private sealed class DescriptorScratch
         {
-            private const int MaxRetainedPerLength = 4;
-            private const int MaxRetainedLengths = 64;
-            private readonly Dictionary<int, Stack<T[]>> _available = [];
-
-            public T[] Rent(int length)
-            {
-                if (length == 0)
-                {
-                    return [];
-                }
-
-                if (!_available.TryGetValue(length, out var arrays))
-                {
-                    if (_available.Count >= MaxRetainedLengths)
-                    {
-                        return new T[length];
-                    }
-
-                    arrays = new Stack<T[]>(MaxRetainedPerLength);
-                    _available.Add(length, arrays);
-                }
-
-                return arrays.TryPop(out var array) ? array : new T[length];
-            }
-
-            public void Return(T[] array)
-            {
-                if (array.Length == 0)
-                {
-                    return;
-                }
-
-                array.AsSpan().Clear();
-                if (!_available.TryGetValue(array.Length, out var arrays))
-                {
-                    // This array was deliberately not retained when the length cap was reached.
-                    return;
-                }
-
-                if (arrays.Count < MaxRetainedPerLength)
-                {
-                    arrays.Push(array);
-                }
-            }
+            public readonly RenderScratchPool<TextureResource> Images = new();
+            public readonly RenderScratchPool<Sampler> Samplers = new();
+            public readonly RenderScratchPool<uint> ShaderData = new();
+            public readonly RenderScratchPool<BufferView> Buffers = new();
+            public readonly RenderScratchPool<(BufferDescriptorWords Descriptor, ResourceSlotIdentifier Buffer)> Sources = new();
         }
 
-        private readonly ExactLengthArrayPool<TextureResource> _stageTextureArrays = new();
-        private readonly ExactLengthArrayPool<Sampler> _stageSamplerArrays = new();
-        private readonly ExactLengthArrayPool<uint> _stageShaderDataArrays = new();
-        private readonly ExactLengthArrayPool<BufferView> _stageBufferViewArrays = new();
-        private readonly ExactLengthArrayPool<(BufferDescriptorWords Descriptor, ResourceSlotIdentifier Buffer)> _stageBufferSourceArrays = new();
+        private DescriptorScratch? _descriptorScratch;
+        private DescriptorScratch Scratch => _descriptorScratch ??= new();
 
         // The host descriptors of one stage in the order its binding layout names them.
         private sealed class StageDescriptors
@@ -325,7 +280,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 Address = descriptor.BaseAddress,
                 ImageIdentifier = imageIdentifier,
                 Request = request,
-                Resolution = resolution,
                 IsStorage = storage,
                 DestinationSelect = words[3] & 0xFFFu,
                 Width = descriptor.Width,
@@ -442,7 +396,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var descriptors = prepared.Descriptors;
-            descriptors.Images = _stageTextureArrays.Rent(info.Images.Count);
+            descriptors.Images = Scratch.Images.Rent(info.Images.Count);
             var movieCandidates = _hostMovieFramePixels is null ? null : MovieCandidates(resources, snapshot);
             var hostMovie = movieCandidates is null ? HostMovieTextureBindings.None : FindHostMovieTextureBindings(movieCandidates);
             for (var index = 0; index < info.Images.Count; index++)
@@ -454,14 +408,14 @@ internal static unsafe partial class VulkanVideoPresenter
                         : ResolveImageBinding(info.Images[index], snapshot.Images[index], program, index);
             }
 
-            descriptors.Samplers = _stageSamplerArrays.Rent(info.Samplers.Count);
+            descriptors.Samplers = Scratch.Samplers.Rent(info.Samplers.Count);
             for (var index = 0; index < info.Samplers.Count; index++)
             {
                 descriptors.Samplers[index] = ResolveSampler(info.Samplers[index], snapshot.Samplers[index], program, index, stage,
                     SamplesIntegerViews(info, descriptors.Images, index));
             }
 
-            var shaderData = _stageShaderDataArrays.Rent(checked((int)layout.ShaderDataDwordCount));
+            var shaderData = Scratch.ShaderData.Rent(checked((int)layout.ShaderDataDwordCount));
             prepared.ShaderData = shaderData;
             for (var index = 0; index < layout.UserDataRegisters.Count; index++)
             {
@@ -546,7 +500,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var program = prepared.Program;
             var snapshot = prepared.Stage.Resources;
-            var sources = _stageBufferSourceArrays.Rent(prepared.Resources.Info.Buffers.Count);
+            var sources = Scratch.Sources.Rent(prepared.Resources.Info.Buffers.Count);
             prepared.BufferSources = sources;
             for (var index = 0; index < sources.Length; index++)
             {
@@ -592,8 +546,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             using var profileScope = BufferUploadProfile.BeginSweep(vertexProgramHash, pixelProgramHash, computeProgramHash);
             var memory = GuestGpuMemoryHook.Current ?? throw SubmissionScheduler.Fatal("A device-address program needs the guest GPU memory registry.");
-            var spans = new List<GuestSpan>();
-            memory.ForEachSpan((address, size) => spans.Add(new GuestSpan(address, size)));
+            var spans = DeviceAddressSpans(memory);
             var traceAddress = GuestGpuMemoryHook.TraceAddress;
             if (traceAddress != 0)
             {
@@ -610,7 +563,29 @@ internal static unsafe partial class VulkanVideoPresenter
             if (traceAddress != 0 && !memory.Covers(traceAddress, 1))
                 GuestGpuMemoryHook.Trace(traceAddress, 1,
                     $"device-address-mapping-check readable={_guestMemory.CanRead(traceAddress, 1)} backed={_guestBacking.IsBackedView(traceAddress)}");
-            _bufferCache.PrepareBda(spans);
+            _bufferCache.PrepareBda(spans, _bdaSpanMapping);
+        }
+
+        private List<GuestSpan>? _bdaSpans;
+        private GuestGpuMemory? _bdaSpanMemory;
+        private long _bdaSpanVersion = -1;
+        private ulong _bdaSpanMapping;
+
+        private List<GuestSpan> DeviceAddressSpans(GuestGpuMemory memory)
+        {
+            var version = memory.SpanVersion;
+            if (_bdaSpans is { } cached && ReferenceEquals(_bdaSpanMemory, memory) && _bdaSpanVersion == version)
+            {
+                return cached;
+            }
+
+            var spans = new List<GuestSpan>();
+            memory.ForEachSpan((address, size) => spans.Add(new GuestSpan(address, size)));
+            _bdaSpans = spans;
+            _bdaSpanMemory = memory;
+            _bdaSpanVersion = version;
+            _bdaSpanMapping = GuestBufferCache.MappingKey(spans);
+            return spans;
         }
 
         public void BindResources(IPreparedBindings prepared)
@@ -620,6 +595,28 @@ internal static unsafe partial class VulkanVideoPresenter
             BindBuffers(stage);
             ObtainDeviceAddressRanges(stage);
             BindImages(stage);
+            _preparedTextures.Add(stage.Textures);
+        }
+
+        // Textures bound for the draw being prepared; cleared when its preparation closes.
+        private readonly List<TextureResource[]> _preparedTextures = new();
+
+        bool IRenderHost.SamplesDepthAttachment(in DepthAttachmentState depth)
+        {
+            var image = _imageCache.GetImage(depth.Image);
+            var attachmentView = depth.Target.Target.Request.View;
+            foreach (var textures in _preparedTextures)
+            {
+                foreach (var texture in textures)
+                {
+                    if (!texture.IsHostMovie && ReferenceEquals(texture.CachedImage, image) && ViewsOverlap(texture.Request.View, attachmentView))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         }
 
         private BufferView NullStorageBuffer() => new(_bufferCache.GetBuffer(GuestBufferCache.NullBufferId).Handle, 0, NullStorageBufferBytes);
@@ -725,8 +722,13 @@ internal static unsafe partial class VulkanVideoPresenter
 
             // Reset only packed buffer offsets; dispatch limits follow them in shader data.
             Array.Clear(shaderData, (int)layout.MemoryOffsetDword, (int)((layout.MemoryOffsetCount + 3) / 4));
-            var views = _stageBufferViewArrays.Rent(info.Buffers.Count);
-            prepared.Descriptors.Buffers = views;
+            var views = prepared.Descriptors.Buffers;
+            if (views.Length != info.Buffers.Count)
+            {
+                Scratch.Buffers.Return(views);
+                views = Scratch.Buffers.Rent(info.Buffers.Count);
+                prepared.Descriptors.Buffers = views;
+            }
             for (var index = 0; index < views.Length; index++)
             {
                 var (descriptor, bufferIdentifier) = prepared.BufferSources[index];
@@ -912,11 +914,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
-            _stageTextureArrays.Return(stage.Descriptors.Images);
-            _stageSamplerArrays.Return(stage.Descriptors.Samplers);
-            _stageBufferViewArrays.Return(stage.Descriptors.Buffers);
-            _stageBufferSourceArrays.Return(stage.BufferSources);
-            _stageShaderDataArrays.Return(stage.ShaderData);
+            Scratch.Images.Return(stage.Descriptors.Images);
+            Scratch.Samplers.Return(stage.Descriptors.Samplers);
+            Scratch.Buffers.Return(stage.Descriptors.Buffers);
+            Scratch.Sources.Return(stage.BufferSources);
+            Scratch.ShaderData.Return(stage.ShaderData);
             stage.Descriptors.Images = [];
             stage.Descriptors.Samplers = [];
             stage.Descriptors.Buffers = [];
@@ -1072,7 +1074,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         {
                             foreach (var resource in binding.Resources)
                             {
-                                imageInfos[imageIndex++] = ImageInfo(descriptors.Images[(int)resource], occurrences[resource]++, program, (int)resource);
+                                imageInfos[imageIndex++] = ImageInfo(descriptors.Images[(int)resource], occurrences[(int)resource]++, program, (int)resource);
                             }
                         }
                         else

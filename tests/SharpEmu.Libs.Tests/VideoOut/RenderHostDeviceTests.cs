@@ -37,6 +37,9 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
 
     private readonly HeadlessVulkan? _vulkan;
 
+    private static bool DefersGlobalBarriers =>
+        (bool)PresenterUnderTest.PresenterType.GetField("DeferGlobalBarriers", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.GetValue(null)!;
+
     [Fact]
     public void GlobalBarrierEndsDynamicRendering()
     {
@@ -46,9 +49,32 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
         presenter.Run(() =>
         {
             var state = new RenderingState { Width = 1, Height = 1, Layers = 1, Samples = 1 };
+            presenter.RenderHost.PrepareMemoryWritingDraw();
             presenter.RenderHost.BeginRendering(in state);
             ((ICommandStreamHost)presenter.Instance).EmitGlobalBarrier();
             Assert.False(presenter.GetField<bool>("_renderingActive"));
+        });
+        presenter.Harness.Finish();
+        presenter.Harness.Shutdown();
+    }
+
+    [Fact]
+    public void GlobalBarrierInAnAttachmentOnlyScopeWaitsForTheScopeToEnd()
+    {
+        if (!Ready()) return;
+        using var presenter = new PresenterUnderTest(_vulkan!);
+        presenter.LoadRenderingCommands();
+        presenter.Run(() =>
+        {
+            var state = new RenderingState { Width = 1, Height = 1, Layers = 1, Samples = 1 };
+            presenter.RenderHost.BeginRendering(in state);
+            ((ICommandStreamHost)presenter.Instance).EmitGlobalBarrier();
+            Assert.Equal(DefersGlobalBarriers, presenter.GetField<bool>("_renderingActive"));
+            Assert.Equal(DefersGlobalBarriers, presenter.GetField<bool>("_globalBarrierAfterRendering"));
+
+            presenter.RenderHost.PrepareMemoryWritingDraw();
+            Assert.False(presenter.GetField<bool>("_renderingActive"));
+            Assert.False(presenter.GetField<bool>("_globalBarrierAfterRendering"));
         });
         presenter.Harness.Finish();
         presenter.Harness.Shutdown();

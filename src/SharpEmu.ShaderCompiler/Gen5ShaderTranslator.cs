@@ -18,14 +18,27 @@ public static partial class Gen5ShaderTranslator
     // reaching S_ENDPGM. Keep the malformed-shader guard, but size it to the
     // largest declared shader object accepted by the decoder (1 MiB).
     private const int MaxInstructions = (int)(MaximumDeclaredShaderSizeBytes / sizeof(uint));
+    private const ulong FusedContinuationAlignment = 0x100;
     private const ulong ShaderSizeOffset = 0x44;
     private const uint MaximumDeclaredShaderSizeBytes = 1024 * 1024;
     private static readonly ConditionalWeakTable<object, FusedProgramRegistry> _fusedProgramsByMemory = new();
 
     private sealed class FusedProgramRegistry
     {
-        public object Gate { get; } = new();
-        public Dictionary<ulong, FusedShaderParts> FusedPrograms { get; } = new();
+        private readonly object _gate = new();
+        private Dictionary<ulong, FusedShaderParts> _programs = new();
+
+        public bool TryGet(ulong entryAddress, out FusedShaderParts? parts) =>
+            Volatile.Read(ref _programs).TryGetValue(entryAddress, out parts);
+
+        public void Set(ulong entryAddress, FusedShaderParts parts)
+        {
+            lock (_gate)
+            {
+                var next = new Dictionary<ulong, FusedShaderParts>(_programs) { [entryAddress] = parts };
+                Volatile.Write(ref _programs, next);
+            }
+        }
     }
 
     private sealed record FusedShaderParts(
@@ -33,14 +46,16 @@ public static partial class Gen5ShaderTranslator
         ulong ContinuationAddress,
         ulong ContinuationHeaderAddress);
 
-    private static object CanonicalMemory(object memory)
+    private static FusedProgramRegistry GetFusedPrograms(ICpuMemory memory)
     {
+        // Each native guest thread has its own tracking wrapper, but all
+        // shader creation and render contexts share the underlying memory.
         while (memory is ICpuMemoryWrapper wrapper)
         {
             memory = wrapper.Inner;
         }
 
-        return memory;
+        return _fusedProgramsByMemory.GetValue(memory, static _ => new FusedProgramRegistry());
     }
 
     /// <summary>
@@ -62,16 +77,11 @@ public static partial class Gen5ShaderTranslator
             return;
         }
 
-        var registry = _fusedProgramsByMemory.GetValue(
-            CanonicalMemory(ctx.Memory),
-            static _ => new FusedProgramRegistry());
-        lock (registry.Gate)
-        {
-            registry.FusedPrograms[entryAddress] = new FusedShaderParts(
-                entryHeaderAddress,
-                continuationAddress,
-                continuationHeaderAddress);
-        }
+        var registry = GetFusedPrograms(ctx.Memory);
+        registry.Set(entryAddress, new FusedShaderParts(
+            entryHeaderAddress,
+            continuationAddress,
+            continuationHeaderAddress));
     }
 
     // The continuation registered for an entry address, when the guest joined two code objects.
@@ -81,15 +91,23 @@ public static partial class Gen5ShaderTranslator
         out ulong continuationAddress,
         out ulong continuationHeaderAddress)
     {
-        var registry = _fusedProgramsByMemory.GetValue(
-            CanonicalMemory(ctx.Memory),
-            static _ => new FusedProgramRegistry());
-        FusedShaderParts? parts;
-        lock (registry.Gate)
-        {
-            registry.FusedPrograms.TryGetValue(entryAddress, out parts);
-        }
+        var registry = GetFusedPrograms(ctx.Memory);
+        registry.TryGet(entryAddress, out var parts);
+        continuationAddress = parts?.ContinuationAddress ?? 0;
+        continuationHeaderAddress = parts?.ContinuationHeaderAddress ?? 0;
+        return parts is not null;
+    }
 
+    public static bool TryGetFusedProgramParts(
+        CpuContext ctx,
+        ulong entryAddress,
+        out ulong entryHeaderAddress,
+        out ulong continuationAddress,
+        out ulong continuationHeaderAddress)
+    {
+        var registry = GetFusedPrograms(ctx.Memory);
+        registry.TryGet(entryAddress, out var parts);
+        entryHeaderAddress = parts?.EntryHeaderAddress ?? 0;
         continuationAddress = parts?.ContinuationAddress ?? 0;
         continuationHeaderAddress = parts?.ContinuationHeaderAddress ?? 0;
         return parts is not null;
@@ -121,15 +139,8 @@ public static partial class Gen5ShaderTranslator
         out string error)
     {
         ValidateDppControlVectors();
-        var registry = _fusedProgramsByMemory.GetValue(
-            CanonicalMemory(ctx.Memory),
-            static _ => new FusedProgramRegistry());
-        FusedShaderParts? fusedParts;
-        lock (registry.Gate)
-        {
-            registry.FusedPrograms.TryGetValue(address, out fusedParts);
-        }
-
+        var registry = GetFusedPrograms(ctx.Memory);
+        registry.TryGet(address, out var fusedParts);
         if (fusedParts is not null)
         {
             return TryDecodeFusedProgram(ctx, address, fusedParts, out program, out error);
@@ -176,9 +187,8 @@ public static partial class Gen5ShaderTranslator
             return false;
         }
 
-        var guestContinuationOffset = unchecked(parts.ContinuationAddress - entryAddress);
-        if (parts.ContinuationAddress == entryAddress ||
-            (guestContinuationOffset & (sizeof(uint) - 1)) != 0)
+        var continuationDistance = unchecked(parts.ContinuationAddress - entryAddress);
+        if (parts.ContinuationAddress == entryAddress || (continuationDistance & (sizeof(uint) - 1)) != 0)
         {
             error = $"invalid-fused-layout entry=0x{entryAddress:X} " +
                 $"continuation=0x{parts.ContinuationAddress:X}";
@@ -218,14 +228,18 @@ public static partial class Gen5ShaderTranslator
             return false;
         }
 
+        var lastEntryInstruction = entryProgram.Instructions[^1];
+        var entryEnd = (ulong)lastEntryInstruction.Pc + (ulong)lastEntryInstruction.Words.Count * sizeof(uint);
+        var adjacent = parts.ContinuationAddress > entryAddress && continuationDistance <= uint.MaxValue &&
+            continuationDistance >= entryEnd;
+        var continuationPc = adjacent
+            ? (uint)continuationDistance
+            : (uint)((entryEnd + FusedContinuationAlignment - 1) & ~(FusedContinuationAlignment - 1));
         var instructions = new List<Gen5ShaderInstruction>(
             entryProgram.Instructions.Count + continuationProgram.Instructions.Count);
         instructions.AddRange(entryProgram.Instructions.Take(entryProgram.Instructions.Count - 1));
 
         var setProgramCounter = entryProgram.Instructions[^1];
-        var continuationPc = checked(
-            setProgramCounter.Pc +
-            (uint)(setProgramCounter.Words.Count * sizeof(uint)));
         instructions.Add(setProgramCounter with
         {
             Encoding = Gen5ShaderEncoding.Sopp,
@@ -246,12 +260,9 @@ public static partial class Gen5ShaderTranslator
                 return false;
             }
 
-            instructions.Add(instruction with
-            {
-                Pc = (uint)rebasedPc,
-                GuestProgramCounterOffset = unchecked(
-                    guestContinuationOffset + instruction.Pc),
-            });
+            instructions.Add(adjacent
+                ? instruction with { Pc = (uint)rebasedPc }
+                : instruction with { Pc = (uint)rebasedPc, AddressOffset = unchecked(continuationDistance + instruction.ProgramOffset) });
         }
 
         program = new Gen5ShaderProgram(entryAddress, instructions);
@@ -331,6 +342,21 @@ public static partial class Gen5ShaderTranslator
                     out error))
             {
                 return false;
+            }
+
+            // S_CODE_END pads the space after the last instruction. Code placed after the final
+            // S_ENDPGM that ends in a backward branch runs straight into it.
+            if (string.Equals(name, "SCodeEnd", StringComparison.Ordinal))
+            {
+                if (pc < furthestForwardBranchTarget || instructions.Count == 0)
+                {
+                    error = $"code-end-inside-program pc=0x{pc:X} branchTarget=0x{furthestForwardBranchTarget:X}";
+                    return false;
+                }
+
+                program = new Gen5ShaderProgram(address, instructions);
+                termination = ProgramTermination.EndProgram;
+                return true;
             }
 
             var instructionBytes = checked(sizeDwords * sizeof(uint));
@@ -807,6 +833,7 @@ public static partial class Gen5ShaderTranslator
             0x18 => "SCbranchCdbguser",
             0x19 => "SCbranchCdbgsysOrUser",
             0x1A => "SCbranchCdbgsysAndUser",
+            0x1F => "SCodeEnd",
             0x20 => "SInstPrefetch",
             0x21 => "SClause",
             0x23 => "SWaitcntDepctr",
@@ -2130,6 +2157,14 @@ public static partial class Gen5ShaderTranslator
             case Gen5ShaderEncoding.Sop1:
                 sources = [Gen5Operand.Source(word & 0xFF, literal)];
                 destinations = [Gen5Operand.Scalar((word >> 16) & 0x7F)];
+                if (opcode == "SCmovB64")
+                {
+                    // CMOV is CSELECT with the old destination as the false
+                    // source. Reuse its SCC, register-pair and EXEC handling.
+                    opcode = "SCselectB64";
+                    encoding = Gen5ShaderEncoding.Sop2;
+                    sources = [sources[0], destinations[0]];
+                }
                 break;
             case Gen5ShaderEncoding.Sop2:
                 sources =

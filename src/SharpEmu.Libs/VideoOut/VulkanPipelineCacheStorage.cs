@@ -10,6 +10,30 @@ internal static class VulkanPipelineCacheStorage
     private const string CacheFileName = "vulkan-pipeline-cache.bin";
     private const long MaxCacheFileBytes = 257L * 1024L * 1024L;
 
+    // A guest shader can produce many different native modules as translation
+    // and specialization change. Keep the emitted-code identity separate from
+    // the driver compatibility key used by the persistent cache.
+    internal static string CompiledShaderIdentity(ReadOnlySpan<byte> spirv) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(spirv));
+
+    // Used by shader-prewarm metadata, which is shared by all compatible native
+    // cache namespaces for the title.
+    internal static string ResolvePath(string? titleId, string? configuredPath)
+    {
+        if (!string.IsNullOrWhiteSpace(configuredPath))
+        {
+            return Path.GetFullPath(
+                Environment.ExpandEnvironmentVariables(configuredPath));
+        }
+
+        return Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "user",
+            "pipeline_cache",
+            SanitizeTitleId(titleId),
+            CacheFileName));
+    }
+
     internal static string ResolvePath(
         string? titleId,
         string compatibilityKey,
