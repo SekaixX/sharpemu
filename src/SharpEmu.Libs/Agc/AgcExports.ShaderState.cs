@@ -449,14 +449,14 @@ public static partial class AgcExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
+        if (!TryReadUInt64(ctx, frontAddress + ShaderShRegistersOffset, out var frontRegistersAddress) ||
+            !TryReadByte(ctx, frontAddress + ShaderNumShRegistersOffset, out var frontRegisterCount))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
         if (isGeometryPair || legacy)
         {
-            if (!TryReadUInt64(ctx, frontAddress + ShaderShRegistersOffset, out var frontRegistersAddress) ||
-                !TryReadByte(ctx, frontAddress + ShaderNumShRegistersOffset, out var frontRegisterCount))
-            {
-                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-            }
-
             var merged = legacy
                 ? MergeLegacyFusedShaderRegisters(ctx, frontRegistersAddress, frontRegisterCount, fusedRegistersAddress, registerCount, isGeometryPair)
                 : MergeFusedUserScalarCount(ctx, frontRegistersAddress, frontRegisterCount, fusedRegistersAddress, registerCount);

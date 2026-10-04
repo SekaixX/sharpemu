@@ -165,18 +165,6 @@ public static class NpWebApi2Exports
     }
 
     [SysAbiExport(
-        Nid = "3Tt9zL3tkoc",
-        ExportName = "sceNpWebApi2CheckTimeout",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceNpWebApi2")]
-    public static int NpWebApi2CheckTimeout(CpuContext ctx)
-    {
-        // Requests complete synchronously, so there is no pending timeout
-        // state for this maintenance tick to advance.
-        return ctx.SetReturn(0);
-    }
-
-    [SysAbiExport(
         Nid = "bEvXpcEk200",
         ExportName = "sceNpWebApi2Terminate",
         Target = Generation.Gen4 | Generation.Gen5,

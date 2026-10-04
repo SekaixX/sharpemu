@@ -729,7 +729,7 @@ internal static class GuestRedZonePatcher
         }
 
         if (siteIndex < 0 ||
-            !TryBuildPatchSpan(decoded, siteIndex, CollectBranchTargets(decoded), out var site, out _))
+            !TryBuildPatchSpan(decoded, siteIndex, CollectBranchTargets(decoded), true, out var site, out _))
         {
             return false;
         }
