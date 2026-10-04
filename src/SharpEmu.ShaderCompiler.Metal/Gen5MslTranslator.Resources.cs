@@ -217,6 +217,10 @@ public static partial class Gen5MslTranslator
             source.Append(MslTemplates.Render(
                 "resource_prelude",
                 ("address_mask", FormatULong(DeviceAddressPaging.AddressMask)),
+                ("lower_address_size", FormatULong(DeviceAddressPaging.LowerAddressSize)),
+                ("extended_address_base", FormatULong(DeviceAddressPaging.ExtendedAddressBase)),
+                ("extended_address_limit", FormatULong(DeviceAddressPaging.ExtendedAddressLimit)),
+                ("extended_address_bias", FormatULong(DeviceAddressPaging.ExtendedAddressBias)),
                 ("page_bits", DeviceAddressPaging.PageBits.ToString(CultureInfo.InvariantCulture)),
                 ("page_offset_mask", FormatULong(DeviceAddressPaging.PageOffsetMask)),
                 ("search_steps", AddressRangeSearchSteps.ToString(CultureInfo.InvariantCulture))));

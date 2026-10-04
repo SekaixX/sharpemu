@@ -459,7 +459,8 @@ public sealed partial class ResourceTracker
             // still hard-fail, since those aren't safe to silently zero.
             var dynamicImageFallback = expected is (ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle) &&
                 (controlDependent || HasUndefinedOrigin(source.Dwords[badDword], "BufferLoadFormat") ||
-                 (nonContiguousImage && source.Dwords.Any(dword => HasUndefinedOrigin(dword, "SAndB32"))));
+                 (nonContiguousImage && source.Dwords.Any(dword => HasUndefinedOrigin(dword, "SAndB32"))) ||
+                 (expected == ScalarValueKind.ImageHandle && IsGpuSelectedScalarBufferImage(source)));
             if (dynamicImageFallback)
             {
                 source = new DescriptorSource
@@ -530,6 +531,73 @@ public sealed partial class ResourceTracker
         }
 
         return true;
+    }
+
+    // Some bindless shaders select one image per active lane, make that lane's key
+    // wave-uniform, multiply it by the eight-dword descriptor size, and fetch the
+    // image through S_BUFFER_LOAD_DWORDX8. The key remains GPU-only, so the host
+    // cannot materialize a finite descriptor table unless a separate bounded-table
+    // proof succeeded earlier. Keep this fail-soft path limited to that exact record
+    // shape; arbitrary or malformed scalar-buffer image handles must still fail.
+    private bool IsGpuSelectedScalarBufferImage(DescriptorSource source)
+    {
+        if (source.DwordCount != 8)
+        {
+            return false;
+        }
+
+        ScalarValue? sharedHandle = null;
+        ScalarValue? sharedOffset = null;
+        for (var dword = 0; dword < source.Dwords.Length; dword++)
+        {
+            var read = source.Dwords[dword];
+            var memory = ScalarReadMemory(read, out _);
+            if (read.Kind != ScalarValueKind.ScalarBufferWord ||
+                read.Operands.Length != 2 ||
+                memory is not { Kind: MemoryResourceKind.ScalarBuffer } ||
+                memory.Offset != (uint)dword * sizeof(uint))
+            {
+                return false;
+            }
+
+            if (sharedHandle is null)
+            {
+                sharedHandle = read.Operands[0];
+                sharedOffset = read.Operands[1];
+            }
+            else if (!_graph.Equivalent(read.Operands[0], sharedHandle) ||
+                     !_graph.Equivalent(read.Operands[1], sharedOffset!))
+            {
+                return false;
+            }
+        }
+
+        if (!IsHostBufferHandle(sharedHandle))
+        {
+            return false;
+        }
+
+        var scaled = sharedOffset!;
+        if (scaled.Kind == ScalarValueKind.Operation &&
+            scaled.Operation == ScalarOperation.IAdd32 &&
+            scaled.Operands.Length == 2)
+        {
+            if (scaled.Operands[0].IsConstant)
+            {
+                scaled = scaled.Operands[1];
+            }
+            else if (scaled.Operands[1].IsConstant)
+            {
+                scaled = scaled.Operands[0];
+            }
+        }
+
+        return scaled.Kind == ScalarValueKind.Operation &&
+            scaled.Operation == ScalarOperation.ShiftLeft32 &&
+            scaled.Operands.Length == 2 &&
+            scaled.Operands[0].Kind == ScalarValueKind.FirstLane &&
+            scaled.Operands[1].IsConstant &&
+            scaled.Operands[1].ConstantU32 == DenseIndirectImageShift;
     }
 
     // A runtime V# is one whose four dwords cannot be resolved at plan time, but
@@ -1260,17 +1328,24 @@ public sealed partial class ResourceTracker
             }
         }
 
-        if (value.Kind != ScalarValueKind.Operation || value.Operation != ScalarOperation.IMul32)
+        if (value.Kind != ScalarValueKind.Operation || value.Operands.Length != 2)
         {
             return false;
         }
 
-        if (value.Operands[0].IsConstant)
+        if (value.Operation == ScalarOperation.ShiftLeft32 &&
+            value.Operands[1].IsConstant &&
+            value.Operands[1].ConstantU32 < 32)
+        {
+            selector = value.Operands[0];
+            stride = 1u << (int)value.Operands[1].ConstantU32;
+        }
+        else if (value.Operation == ScalarOperation.IMul32 && value.Operands[0].IsConstant)
         {
             stride = value.Operands[0].ConstantU32;
             selector = value.Operands[1];
         }
-        else if (value.Operands[1].IsConstant)
+        else if (value.Operation == ScalarOperation.IMul32 && value.Operands[1].IsConstant)
         {
             stride = value.Operands[1].ConstantU32;
             selector = value.Operands[0];
@@ -1280,7 +1355,16 @@ public sealed partial class ResourceTracker
             return false;
         }
 
-        return stride != 0 && selector.Kind == ScalarValueKind.FirstLane;
+        // The selector is scalar by construction. It does not have to originate
+        // in V_READFIRSTLANE: shaders may derive it from another scalar table
+        // read (for example, extracting a material index from a packed word).
+        // Materialization already scans the complete congruent record domain
+        // when no finite selector proof is available and fails closed above its
+        // bounded probe limit, so retaining only the U32/non-undefined contract
+        // is both sufficient and conservative here.
+        return stride != 0 &&
+            selector.Type == ScalarValueType.U32 &&
+            selector.Kind != ScalarValueKind.Undefined;
     }
 
     // A material-table key selects a heap record whose eight dwords are the image

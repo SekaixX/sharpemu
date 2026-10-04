@@ -3,6 +3,7 @@
 
 namespace SharpEmu.Libs.VideoOut;
 
+using SharpEmu.HLE;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.Gpu;
@@ -506,7 +507,7 @@ internal static unsafe partial class VulkanVideoPresenter
             foreach (var range in prepared.Stage.Resources.DeviceAddressRanges)
             {
                 if (!range.Planned || range.Size == 0 ||
-                    range.Base >= PageOwnerTable.AddressSpaceSize || range.Size > PageOwnerTable.AddressSpaceSize - range.Base ||
+                    !GuestMemoryLayout.ContainsGpuAddressRange(range.Base, range.Size) ||
                     (!range.Written && !_guestMemory.CanRead(range.Base, 1)))
                 {
                     continue;
@@ -764,7 +765,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     continue;
                 }
 
-                if (range.Base >= PageOwnerTable.AddressSpaceSize || range.Size > PageOwnerTable.AddressSpaceSize - range.Base)
+                if (!GuestMemoryLayout.ContainsGpuAddressRange(range.Base, range.Size))
                 {
                     throw SubmissionScheduler.Fatal($"A device-address range is outside the cache: handle={range.Handle} base=0x{range.Base:X16} size=0x{range.Size:X} hash=0x{program.Hash:X16}.");
                 }

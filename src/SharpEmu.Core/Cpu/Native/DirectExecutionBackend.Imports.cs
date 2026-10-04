@@ -1850,6 +1850,10 @@ public sealed partial class DirectExecutionBackend
 			"en7gNVnh878" or // sceSaveDataDialogIsReadyToDisplay
 			"jO8DM8oyego" or // sceNpEntitlementAccessInitialize
 			"TFyU+KFBv54" or // sceNpEntitlementAccessGetAddcontEntitlementInfoList
+			"uCZf2L27th8" or // sceNpEntitlementAccessRequestUnifiedEntitlementInfoList
+			"nAEqawEZG5s" or // sceNpEntitlementAccessPollUnifiedEntitlementInfoList
+			"HFcQl9TMcFQ" or // sceNpEntitlementAccessAbortRequest
+			"Z0eQj8m7XA8" or // sceNpEntitlementAccessDeleteRequest
 			"27bAgiJmOh0" or // pthread_cond_timedwait
 			"iQw3iQPhvUQ" or // sceNetCtlCheckCallback
 			"Q2V+iqvjgC0" or // vsnprintf

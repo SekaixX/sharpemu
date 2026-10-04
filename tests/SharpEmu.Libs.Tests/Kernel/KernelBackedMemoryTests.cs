@@ -15,6 +15,54 @@ namespace SharpEmu.Libs.Tests.Kernel;
 public sealed class KernelBackedMemoryTests
 {
     [Fact]
+    public void AutomaticBackingReturnsOnlyAfterItsFinalDirectAliasIsUnmapped()
+    {
+        const ulong grantSize = 0x20_0000;
+        using var test = new BackedKernelMemory();
+        const ulong aperture = GuestMemoryLayout.GuestExtendedAddressStart + 0x0400_0000;
+        var firstAlias = test.Reserve(grantSize, aperture);
+        var secondAlias = test.Reserve(grantSize, aperture + grantSize);
+        var automaticMap = test.Reserve(grantSize, aperture + grantSize * 2);
+
+        Assert.Equal(
+            0,
+            KernelMemoryCompatExports.AllocateAutomaticDirectMemory(
+                test.Context,
+                searchStartValue: 0,
+                searchEndValue: grantSize,
+                length: grantSize,
+                alignment: grantSize,
+                memoryType: 0,
+                outAddress: test.Output));
+        Assert.True(test.Context.TryReadUInt64(test.Output, out var physicalStart));
+        Assert.Equal(0UL, physicalStart);
+
+        Assert.Equal(firstAlias, test.Map(physicalStart, grantSize, firstAlias));
+        Assert.Equal(secondAlias, test.Map(physicalStart, grantSize, secondAlias));
+        Assert.Equal(0, test.Unmap(firstAlias, grantSize));
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN,
+            KernelMemoryCompatExports.MapAutomaticMemory(
+                test.Context,
+                automaticMap,
+                grantSize,
+                memoryType: 0x0C,
+                protection: 0x33));
+
+        Assert.Equal(0, test.Unmap(secondAlias, grantSize));
+        Assert.Equal(
+            0,
+            KernelMemoryCompatExports.MapAutomaticMemory(
+                test.Context,
+                automaticMap,
+                grantSize,
+                memoryType: 0x0C,
+                protection: 0x33));
+        Assert.Equal(0, test.Unmap(automaticMap, grantSize));
+        Assert.Equal(0, test.Release(physicalStart, grantSize));
+    }
+
+    [Fact]
     public void BatchRemapCanExtendAnUnmappedReservationWithoutOverwritingMappings()
     {
         using var test = new BackedKernelMemory();

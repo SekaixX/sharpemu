@@ -13,6 +13,10 @@ namespace SharpEmu.Libs.Network;
 public static class RudpExports
 {
     private const int MaxLivePolls = 4096;
+    private const ulong PollEventSize = 8;
+    private const int RudpErrorInvalidArgument = unchecked((int)0x80770004);
+    private const int RudpErrorInvalidPollId = unchecked((int)0x8077001F);
+    private const int RudpErrorOutOfMemory = unchecked((int)0x80770003);
     private static readonly object PollGate = new();
     private static readonly Dictionary<int, uint> PollCapacities = [];
     private static int _nextPollId;
@@ -30,14 +34,14 @@ public static class RudpExports
         var requestedEvents = ctx[CpuRegister.Rdi];
         if (requestedEvents is 0 or > uint.MaxValue)
         {
-            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return ctx.SetReturn(RudpErrorInvalidArgument);
         }
 
         lock (PollGate)
         {
             if (PollCapacities.Count >= MaxLivePolls)
             {
-                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN);
+                return ctx.SetReturn(RudpErrorOutOfMemory);
             }
 
             int pollId;
@@ -51,6 +55,57 @@ public static class RudpExports
             PollCapacities.Add(pollId, unchecked((uint)requestedEvents));
             return ctx.SetReturn(pollId);
         }
+    }
+
+    [SysAbiExport(
+        Nid = "M6ggviwXpLs",
+        ExportName = "sceRudpPollWait",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceRudp")]
+    public static int RudpPollWait(CpuContext ctx)
+    {
+        // ABI: int sceRudpPollWait(int pollId, SceRudpPollEvent* events,
+        //                         size_t maxEvents, size_t timeoutUsec).
+        // The offline transport has no events to publish, but a positive
+        // timeout must still park the guest thread. Returning immediately here
+        // turns middleware's normal one-second poll into a hot retry loop.
+        var pollId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var events = ctx[CpuRegister.Rsi];
+        var maxEvents = ctx[CpuRegister.Rdx];
+        var timeoutMicroseconds = ctx[CpuRegister.Rcx];
+
+        if (!TryGetPollCapacity(pollId, out _))
+        {
+            return ctx.SetReturn(RudpErrorInvalidPollId);
+        }
+
+        if (events == 0 ||
+            maxEvents == 0 ||
+            maxEvents > uint.MaxValue ||
+            maxEvents > ulong.MaxValue / PollEventSize ||
+            !ctx.Memory.CanRead(events, maxEvents * PollEventSize))
+        {
+            return ctx.SetReturn(RudpErrorInvalidArgument);
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        if (timeoutMicroseconds == 0 ||
+            !GuestThreadExecution.IsGuestThread ||
+            !GuestThreadExecution.TryGetCurrentImportCallFrame(out _))
+        {
+            return 0;
+        }
+
+        var timeout = timeoutMicroseconds > (ulong)(TimeSpan.MaxValue.Ticks / 10)
+            ? TimeSpan.MaxValue
+            : TimeSpan.FromTicks(checked((long)timeoutMicroseconds * 10));
+        _ = GuestThreadExecution.RequestCurrentThreadBlock(
+            ctx,
+            "sceRudpPollWait",
+            $"rudp-poll:{pollId}",
+            waiter: null,
+            blockDeadlineTimestamp: GuestThreadExecution.ComputeDeadlineTimestamp(timeout));
+        return 0;
     }
 
     public static void ResetRuntimeState()

@@ -381,7 +381,11 @@ public static class KernelSemaphoreCompatExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
         }
 
-        if (signalCount <= 0)
+        // A zero-count signal is a valid no-op. Some middleware uses it while
+        // publishing work and expects success; rejecting it can turn that
+        // publication loop into a busy retry. Negative counts remain invalid
+        // because they would consume tokens rather than signal the semaphore.
+        if (signalCount < 0)
         {
             signalTrace.Record(SemaphoreSignalProfile.Stage.Rejected,
                 result: (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);

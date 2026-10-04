@@ -20,7 +20,9 @@ public sealed unsafe partial class GuestSpaceOwnerTests
         FreeOwnedRange,
     }
 
-    private sealed class InitializationHostViews(bool reservePrimaryUserRange) : IHostViewMemory
+    private sealed class InitializationHostViews(
+        bool reservePrimaryUserRange,
+        bool reserveExtendedRange = true) : IHostViewMemory
     {
         public List<InitializationCall> Calls { get; } = new();
 
@@ -52,9 +54,15 @@ public sealed unsafe partial class GuestSpaceOwnerTests
         public ulong ReserveHole(ulong address, ulong size)
         {
             Calls.Add(InitializationCall.ReserveHole);
-            Assert.Equal(GuestMemoryLayout.GuestUserAddressStart, address);
-            Assert.Equal(GuestMemoryLayout.GuestPrimaryUserAddressLimit - address, size);
-            return reservePrimaryUserRange ? address : 0;
+            if (address == GuestMemoryLayout.GuestUserAddressStart)
+            {
+                Assert.Equal(GuestMemoryLayout.GuestPrimaryUserAddressSize, size);
+                return reservePrimaryUserRange ? address : 0;
+            }
+
+            Assert.Equal(GuestMemoryLayout.GuestExtendedAddressStart, address);
+            Assert.Equal(GuestMemoryLayout.GuestExtendedAddressSize, size);
+            return reserveExtendedRange ? address : 0;
         }
 
         public bool SplitHole(ulong address, ulong size) => false;
@@ -100,10 +108,21 @@ public sealed unsafe partial class GuestSpaceOwnerTests
         var size = GuestMemoryLayout.GuestPrimaryUserAddressLimit - address;
 
         Assert.Equal(
-            new[] { InitializationCall.ReserveHole, InitializationCall.CreateBacking },
+            new[]
+            {
+                InitializationCall.ReserveHole,
+                InitializationCall.ReserveHole,
+                InitializationCall.CreateBacking,
+            },
             host.Calls);
         Assert.True(owner.OwnsReservedRange(address, size));
         Assert.True(owner.ContainsFreeRange(address, size));
+        Assert.True(owner.OwnsReservedRange(
+            GuestMemoryLayout.GuestExtendedAddressStart,
+            GuestMemoryLayout.GuestExtendedAddressSize));
+        Assert.True(owner.ContainsFreeRange(
+            GuestMemoryLayout.GuestExtendedAddressStart,
+            GuestMemoryLayout.GuestExtendedAddressSize));
     }
 
     [Fact]
@@ -121,11 +140,19 @@ public sealed unsafe partial class GuestSpaceOwnerTests
             var size = GuestMemoryLayout.GuestPrimaryUserAddressLimit - address;
 
             Assert.Equal(
-                new[] { InitializationCall.ReserveHole, InitializationCall.CreateBacking },
+                new[]
+                {
+                    InitializationCall.ReserveHole,
+                    InitializationCall.ReserveHole,
+                    InitializationCall.CreateBacking,
+                },
                 host.Calls);
             Assert.Empty(fatalMessages);
             Assert.False(owner.OwnsReservedRange(address, size));
             Assert.False(owner.ContainsFreeRange(address, size));
+            Assert.True(owner.OwnsReservedRange(
+                GuestMemoryLayout.GuestExtendedAddressStart,
+                GuestMemoryLayout.GuestExtendedAddressSize));
         }
         finally
         {
@@ -146,7 +173,12 @@ public sealed unsafe partial class GuestSpaceOwnerTests
             using var owner = new GuestSpaceOwner(host, BackingSize, GuestVirtualAddressPlacement.Canonical);
 
             Assert.Equal(
-                new[] { InitializationCall.ReserveHole, InitializationCall.CreateBacking },
+                new[]
+                {
+                    InitializationCall.ReserveHole,
+                    InitializationCall.ReserveHole,
+                    InitializationCall.CreateBacking,
+                },
                 host.Calls);
             Assert.Single(fatalMessages);
             Assert.Contains("primary guest user address range", fatalMessages[0]);
@@ -166,4 +198,5 @@ public sealed unsafe partial class GuestSpaceOwnerTests
 
         Assert.Equal(new[] { InitializationCall.CreateBacking }, host.Calls);
     }
+
 }

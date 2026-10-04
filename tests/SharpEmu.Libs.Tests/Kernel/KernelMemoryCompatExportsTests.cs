@@ -236,6 +236,46 @@ public sealed class KernelMemoryCompatExportsTests
         Assert.Equal(2u, errno); // ENOENT
     }
 
+    [Theory]
+    [InlineData("/dev/random")]
+    [InlineData("/dev/urandom")]
+    public void PosixRandomDevice_OpenReadFstatAndClose(string path)
+    {
+        const ulong pathAddress = GuestMemoryBase + 0x100;
+        const ulong bufferAddress = GuestMemoryBase + 0x200;
+        const ulong statAddress = GuestMemoryBase + 0x400;
+        var memory = new FakeCpuMemory(GuestMemoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        memory.WriteCString(pathAddress, path);
+        context[CpuRegister.Rdi] = pathAddress;
+        context[CpuRegister.Rsi] = 0; // O_RDONLY
+
+        Assert.Equal(0, KernelMemoryCompatExports.PosixOpen(context));
+        var fd = unchecked((int)context[CpuRegister.Rax]);
+        Assert.True(fd >= 3);
+
+        context[CpuRegister.Rdi] = unchecked((ulong)fd);
+        context[CpuRegister.Rsi] = bufferAddress;
+        context[CpuRegister.Rdx] = 32;
+        Assert.Equal(0, KernelMemoryCompatExports.PosixRead(context));
+        Assert.Equal(32UL, context[CpuRegister.Rax]);
+        var randomBytes = new byte[32];
+        Assert.True(memory.TryRead(bufferAddress, randomBytes));
+        Assert.Contains(randomBytes, value => value != 0);
+
+        context[CpuRegister.Rdi] = unchecked((ulong)fd);
+        context[CpuRegister.Rsi] = statAddress;
+        Assert.Equal(0, KernelMemoryCompatExports.PosixFstat(context));
+
+        context[CpuRegister.Rdi] = unchecked((ulong)fd);
+        Assert.Equal(0, KernelMemoryCompatExports.PosixClose(context));
+
+        context[CpuRegister.Rdi] = unchecked((ulong)fd);
+        context[CpuRegister.Rsi] = bufferAddress;
+        context[CpuRegister.Rdx] = 1;
+        Assert.Equal(-1, KernelMemoryCompatExports.PosixRead(context));
+    }
+
     [Fact]
     public void KernelOpen_MissingFileKeepsRawKernelFailureAbi()
     {

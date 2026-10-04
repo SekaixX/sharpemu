@@ -40,6 +40,7 @@ public sealed class GuestSpaceOwner : IDisposable
     private readonly ulong _configuredMinimumReservationSize;
     private readonly PrimaryUserReservationMode _configuredPrimaryReservationMode;
     private readonly bool _restoreConfiguredReservationsAfterRelease;
+    private readonly bool _reserveExtendedAddressSpace;
     private bool _disposed;
 
     public GuestSpaceOwner(IHostViewMemory host, ulong backingSize, bool preReserveGuestAddressSpace = false)
@@ -56,7 +57,8 @@ public sealed class GuestSpaceOwner : IDisposable
             preReserveGuestAddressSpace && OperatingSystem.IsWindows()
                 ? PrimaryUserReservationMode.Required
                 : PrimaryUserReservationMode.None,
-            restoreConfiguredReservationsAfterRelease: preReserveGuestAddressSpace)
+            restoreConfiguredReservationsAfterRelease: preReserveGuestAddressSpace,
+            reserveExtendedAddressSpace: preReserveGuestAddressSpace)
     {
     }
 
@@ -80,7 +82,8 @@ public sealed class GuestSpaceOwner : IDisposable
                     : PrimaryUserReservationMode.Opportunistic
                 : PrimaryUserReservationMode.None,
             restoreConfiguredReservationsAfterRelease:
-                placement == GuestVirtualAddressPlacement.Canonical)
+                placement == GuestVirtualAddressPlacement.Canonical,
+            reserveExtendedAddressSpace: true)
     {
     }
 
@@ -97,7 +100,8 @@ public sealed class GuestSpaceOwner : IDisposable
             guestAddressLimit,
             minimumEarlyReservationSize,
             PrimaryUserReservationMode.None,
-            restoreConfiguredReservationsAfterRelease: false)
+            restoreConfiguredReservationsAfterRelease: false,
+            reserveExtendedAddressSpace: false)
     {
     }
 
@@ -108,7 +112,8 @@ public sealed class GuestSpaceOwner : IDisposable
         ulong guestAddressLimit,
         ulong minimumEarlyReservationSize,
         PrimaryUserReservationMode primaryUserReservationMode,
-        bool restoreConfiguredReservationsAfterRelease)
+        bool restoreConfiguredReservationsAfterRelease,
+        bool reserveExtendedAddressSpace)
     {
         _host = host;
         Granularity = host.Granularity;
@@ -117,6 +122,7 @@ public sealed class GuestSpaceOwner : IDisposable
         _configuredMinimumReservationSize = minimumEarlyReservationSize;
         _configuredPrimaryReservationMode = primaryUserReservationMode;
         _restoreConfiguredReservationsAfterRelease = restoreConfiguredReservationsAfterRelease;
+        _reserveExtendedAddressSpace = reserveExtendedAddressSpace;
         // Create lookup views before concurrent fault handlers can read the range table.
         _ = _mapped.Keys;
         _ = _mapped.Values;
@@ -147,6 +153,26 @@ public sealed class GuestSpaceOwner : IDisposable
                 _configuredGuestAddressLimit,
                 _configuredMinimumReservationSize);
         }
+
+        if (_reserveExtendedAddressSpace)
+        {
+            ReserveExtendedGuestAddressSpace();
+        }
+    }
+
+    private void ReserveExtendedGuestAddressSpace()
+    {
+        var address = GuestMemoryLayout.GuestExtendedAddressStart;
+        var size = GuestMemoryLayout.GuestExtendedAddressSize;
+        if (_host.ReserveHole(address, size) != address)
+        {
+            OnFatal($"Could not reserve the extended guest address range from " +
+                $"0x{address:X16} to 0x{GuestMemoryLayout.GuestExtendedAddressLimit:X16}.");
+            return;
+        }
+
+        _owned.Add((address, size));
+        AddFreeRange(address, size);
     }
 
     private bool TryReservePrimaryUserAddressSpace(
@@ -705,9 +731,9 @@ public sealed class GuestSpaceOwner : IDisposable
             _owned.Clear();
             _free.Clear();
             _mapped.Clear();
-            if (_restoreConfiguredReservationsAfterRelease)
+            if (_restoreConfiguredReservationsAfterRelease || _reserveExtendedAddressSpace)
             {
-                // A new image load needs the canonical guest address space again.
+                // A new image load needs the configured guest apertures again.
                 ReserveConfiguredGuestAddressSpace();
             }
         }

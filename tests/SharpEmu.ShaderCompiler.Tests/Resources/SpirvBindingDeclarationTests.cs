@@ -129,6 +129,17 @@ public sealed class SpirvBindingDeclarationTests
         var module = new SpirvModuleInspector(shader.Spirv);
         Assert.Contains((uint)SpirvCapability.PhysicalStorageBufferAddresses, module.Capabilities);
         Assert.Contains((ushort)SpirvOp.ConvertUToPtr, module.Opcodes);
+        Assert.Contains((ushort)SpirvOp.UGreaterThanEqual, module.Opcodes);
+        Assert.Contains((ushort)SpirvOp.ISub, module.Opcodes);
+        Assert.Contains((ushort)SpirvOp.Select, module.Opcodes);
+        Assert.Contains((ushort)SpirvOp.ShiftRightLogical, module.Opcodes);
+        Assert.Contains((ushort)SpirvOp.ULessThan, module.Opcodes);
+        Assert.Contains((ushort)SpirvOp.LogicalAnd, module.Opcodes);
+        Assert.Contains((ushort)SpirvOp.LogicalOr, module.Opcodes);
+        Assert.Contains(DeviceAddressPaging.LowerAddressSize, module.Constants64);
+        Assert.Contains(DeviceAddressPaging.ExtendedAddressBase, module.Constants64);
+        Assert.Contains(DeviceAddressPaging.ExtendedAddressLimit, module.Constants64);
+        Assert.Contains(DeviceAddressPaging.ExtendedAddressBias, module.Constants64);
     }
 
     [Fact]

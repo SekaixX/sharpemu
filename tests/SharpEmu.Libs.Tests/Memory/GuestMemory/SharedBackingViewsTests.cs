@@ -68,7 +68,7 @@ public sealed class SharedBackingViewsTests
     }
 
     [Fact]
-    public void ClearCommitsBackingBeforeTheFirstViewIsMapped()
+    public unsafe void ClearCommitsBackingBeforeTheFirstViewIsMapped()
     {
         if (!Supported)
         {

@@ -117,7 +117,7 @@ public sealed class GuestGpuMemoryTests
         Assert.True(_memory.Covers(0x10000, 0x4000));
         Assert.True(_memory.Covers(0x11000, 0x8));
         Assert.False(_memory.Covers(0x13FF8, 0x10));
-        Assert.False(_memory.Covers(1UL << 40, 0x8));
+        Assert.False(_memory.Covers(TrackerLayout.SpaceBytes, 0x8));
         Assert.Empty(_stores.Calls);
 
         _memory.Unregister(0x10000, 0x4000);

@@ -83,8 +83,17 @@ public static class GuestGpuMemoryHook
 
     public static bool IsWithinGpuAddressSpace(ulong address, ulong size)
     {
-        // Exclude the upper address limit here. GuestSpan.IsValid includes that limit.
-        return address != 0 && size != 0 && address < TrackerLayout.SpaceBytes && size < TrackerLayout.SpaceBytes - address;
+        if (address == 0 || size == 0 || !GuestMemoryLayout.ContainsGpuAddressRange(address, size))
+        {
+            return false;
+        }
+
+        // Keep the hook's existing end-exclusive guard at each real aperture
+        // boundary. GuestSpan itself permits a range ending exactly there.
+        var limit = address < GuestMemoryLayout.GuestGpuLowAddressLimit
+            ? GuestMemoryLayout.GuestGpuLowAddressLimit
+            : GuestMemoryLayout.GuestExtendedAddressLimit;
+        return size < limit - address;
     }
 
     public static void NoteMapped(ulong address, ulong size, GuestPageProtection protection)

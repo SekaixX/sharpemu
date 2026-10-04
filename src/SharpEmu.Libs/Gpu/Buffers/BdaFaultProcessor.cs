@@ -261,12 +261,13 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             var count = Math.Min((uint)faults[0], MaxPageFaults - 1);
             for (var index = 1; index <= count; index++)
             {
-                _faultRanges.Add(faults[index], _pageSize);
-                GuestGpuMemoryHook.SelectDeviceFaultTracePage(faults[index]);
-                if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Traces(faults[index], _pageSize))
-                    SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(faults[index], _pageSize,
-                        $"device-address-fault scan_tick={scanTick} callback_tick={_scheduler.CurrentTick} registered={_cache.IsRegionRegistered(faults[index], _pageSize)} reported_count={(uint)faults[0]} retained_count={count}");
-                Console.Error.WriteLine($"[GPU][INFO] Accessed non-GPU cached memory at 0x{faults[index]:X16}");
+                var address = PageOwnerTable.GuestAddress(faults[index]);
+                _faultRanges.Add(address, _pageSize);
+                GuestGpuMemoryHook.SelectDeviceFaultTracePage(address);
+                if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Traces(address, _pageSize))
+                    SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(address, _pageSize,
+                        $"device-address-fault scan_tick={scanTick} callback_tick={_scheduler.CurrentTick} registered={_cache.IsRegionRegistered(address, _pageSize)} reported_count={(uint)faults[0]} retained_count={count}");
+                Console.Error.WriteLine($"[GPU][INFO] Accessed non-GPU cached memory at 0x{address:X16}");
             }
 
             _faultRanges.ForEach((start, size) =>

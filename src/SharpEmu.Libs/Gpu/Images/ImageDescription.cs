@@ -398,8 +398,7 @@ public struct ImageDescription
 
                 break;
             case MetadataKind.Dcc:
-                if (Metadata.Range.Address == 0 || Metadata.Range.Address >= TrackerLayout.SpaceBytes ||
-                    Metadata.Range.Size > TrackerLayout.SpaceBytes - Metadata.Range.Address ||
+                if (!IsValidRange(Metadata.Range) ||
                     Metadata.Compression == DisplayCompression.Unsupported)
                 {
                     throw SubmissionScheduler.Fatal($"The DCC metadata is invalid: address=0x{Metadata.Range.Address:X16} size=0x{Metadata.Range.Size:X16} compression={Metadata.Compression}.");

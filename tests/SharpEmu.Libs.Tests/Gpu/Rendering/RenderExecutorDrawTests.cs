@@ -583,7 +583,7 @@ public sealed class RenderExecutorDrawTests : IDisposable
 
         Assert.Equal(1, _host.GuestReads);
         Assert.Equal(
-            [6u, 7u, 2u, 2u, (uint)(IndexBase + 8), (uint)((IndexBase + 8) >> 32)],
+            [6u, 7u, 2u, 2u, unchecked((uint)(IndexBase + 8)), (uint)((IndexBase + 8) >> 32)],
             _host.LastMeshDrawData);
         Assert.Contains($"register_device_address_range {IndexBase + 8:X} C", _host.Calls);
         Assert.Contains("draw_mesh_tasks 1 3 1", _host.Calls);

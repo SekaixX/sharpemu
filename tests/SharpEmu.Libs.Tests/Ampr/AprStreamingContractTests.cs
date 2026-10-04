@@ -15,6 +15,96 @@ public sealed class AprStreamingContractTests
     public AprStreamingContractTests() => AmprFileRegistry.ClearForTests();
 
     [Fact]
+    public void AprCommandBufferConstructor_ReturnsSuccessInRax()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong commandBufferAddress = memoryBase + 0x100;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rax] = ulong.MaxValue;
+        context[CpuRegister.Rdi] = commandBufferAddress;
+        context[CpuRegister.Rsi] = commandBufferAddress + 0x18;
+        context[CpuRegister.Rdx] = commandBufferAddress + 0x20;
+
+        Assert.Equal(0, AmprExports.AprCommandBufferConstructor(context));
+        Assert.Equal(0UL, context[CpuRegister.Rax]);
+        Assert.Equal(0UL, ReadUInt64(memory, commandBufferAddress + 0x18));
+        Assert.Equal(0UL, ReadUInt64(memory, commandBufferAddress + 0x20));
+    }
+
+    [Fact]
+    public void ConstructingAtBackingAlias_DoesNotDeleteOwnerState()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong ownerAddress = memoryBase + 0x100;
+        const ulong recordBufferAddress = memoryBase + 0x300;
+        const ulong completionAddress = memoryBase + 0x800;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        AmprExports.ResetRuntimeState();
+
+        context[CpuRegister.Rdi] = ownerAddress;
+        Assert.Equal(0, AmprExports.CommandBufferConstructor(context));
+        context[CpuRegister.Rdi] = ownerAddress;
+        context[CpuRegister.Rsi] = recordBufferAddress;
+        context[CpuRegister.Rdx] = 0x100;
+        Assert.Equal(0, AmprExports.CommandBufferSetBuffer(context));
+
+        // The backing address is an alias used when commands are submitted.
+        // Reusing that address as another command-buffer object must not remove
+        // the original owner's retained state.
+        context[CpuRegister.Rdi] = recordBufferAddress;
+        Assert.Equal(0, AmprExports.CommandBufferConstructor(context));
+
+        context[CpuRegister.Rdi] = ownerAddress;
+        context[CpuRegister.Rsi] = completionAddress;
+        context[CpuRegister.Rdx] = 1;
+        Assert.Equal(0, AmprExports.CommandBufferWriteAddress0400(context));
+        Assert.Equal(0x20U, ReadUInt32(memory, ownerAddress + 0x04));
+        Assert.Equal(1U, ReadUInt32(memory, ownerAddress + 0x08));
+    }
+
+    [Fact]
+    public void CommandBufferReset_RestoresRetainedStateAfterGuestHeaderRemap()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong commandBufferAddress = memoryBase + 0x100;
+        const ulong recordBufferAddress = memoryBase + 0x300;
+        const ulong completionAddress = memoryBase + 0x800;
+        const ulong recordBufferSize = 0x100;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        AmprExports.ResetRuntimeState();
+
+        context[CpuRegister.Rdi] = commandBufferAddress;
+        Assert.Equal(0, AmprExports.CommandBufferConstructor(context));
+        context[CpuRegister.Rdi] = commandBufferAddress;
+        context[CpuRegister.Rsi] = recordBufferAddress;
+        context[CpuRegister.Rdx] = recordBufferSize;
+        Assert.Equal(0, AmprExports.CommandBufferSetBuffer(context));
+
+        // An AMM remap may clear the guest-visible header while the APR object
+        // and its SetBuffer binding remain live in the host-side state.
+        Span<byte> clearedHeader = stackalloc byte[0x18];
+        clearedHeader.Clear();
+        Assert.True(memory.TryWrite(commandBufferAddress, clearedHeader));
+
+        context[CpuRegister.Rdi] = commandBufferAddress;
+        Assert.Equal(0, AmprExports.CommandBufferReset(context));
+        Assert.Equal((uint)recordBufferSize, ReadUInt32(memory, commandBufferAddress + 0x0C));
+        Assert.Equal(0U, ReadUInt32(memory, commandBufferAddress + 0x04));
+        Assert.Equal(0U, ReadUInt32(memory, commandBufferAddress + 0x08));
+        Assert.Equal(recordBufferAddress, ReadUInt64(memory, commandBufferAddress + 0x10));
+
+        context[CpuRegister.Rdi] = commandBufferAddress;
+        context[CpuRegister.Rsi] = completionAddress;
+        context[CpuRegister.Rdx] = 1;
+        Assert.Equal(0, AmprExports.CommandBufferWriteAddress0400(context));
+        Assert.Equal(0x20U, ReadUInt32(memory, commandBufferAddress + 0x04));
+        Assert.Equal(1U, ReadUInt32(memory, commandBufferAddress + 0x08));
+    }
+
+    [Fact]
     public void ResolveStatAndReadFile_UsesSharedAprFileId()
     {
         const ulong memoryBase = 0x1_0000_0000;

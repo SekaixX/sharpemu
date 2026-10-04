@@ -617,8 +617,7 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
                 continue;
             }
 
-            var limit = PageOwnerTable.AddressSpaceSize;
-            if (range.Base >= limit || range.Size > limit - range.Base)
+            if (!GuestMemoryLayout.ContainsGpuAddressRange(range.Base, range.Size))
             {
                 throw Fatal($"A device-address range is outside the address space: handle={range.Handle} base=0x{range.Base:X16} size=0x{range.Size:X} hash=0x{program.Hash:X16}.");
             }

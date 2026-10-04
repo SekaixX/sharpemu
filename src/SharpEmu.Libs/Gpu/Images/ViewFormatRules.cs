@@ -319,7 +319,8 @@ public static class ViewFormatRules
 
     public static bool IsSupportedSampledDepthView(Format imageFormat, Format viewFormat, uint swizzle) =>
         IsSupportedSampledDepthFormat(imageFormat, viewFormat) &&
-        (swizzle == PackDestinationSelect(4, 4, 4, 4) || swizzle == PackDestinationSelect(4, 0, 0, 0) || swizzle == PackDestinationSelect(4, 0, 0, 1));
+        (swizzle == PackDestinationSelect(4, 4, 4, 4) || swizzle == PackDestinationSelect(4, 4, 4, 1) ||
+         swizzle == PackDestinationSelect(4, 0, 0, 0) || swizzle == PackDestinationSelect(4, 0, 0, 1));
 
     public static uint SelectSampledDepthView(Format imageFormat, Format viewFormat, uint swizzle) =>
         IsSupportedSampledDepthView(imageFormat, viewFormat, swizzle)

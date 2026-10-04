@@ -159,6 +159,54 @@ public static partial class KernelMemoryCompatExports
         return slices?.ToArray() ?? [];
     }
 
+    internal static MappingRangeSnapshot CaptureMappingRangeSnapshot(ulong address, ulong length)
+    {
+        lock (_memoryGate)
+        {
+            return CaptureMappingRangeSnapshotLocked(address, length);
+        }
+    }
+
+    internal static bool[] MatchMappingRangeSnapshots(
+        IReadOnlyList<MappingRangeSnapshot> snapshots)
+    {
+        var matches = new bool[snapshots.Count];
+        lock (_memoryGate)
+        {
+            // Evaluate the whole command buffer against one pre-execution view.
+            // Comparing each record after earlier AMPR records run would falsely
+            // classify valid overlapping map/unmap sequences as stale.
+            for (var index = 0; index < snapshots.Count; index++)
+            {
+                var expected = snapshots[index];
+                var current = CaptureMappingRangeSnapshotLocked(expected.Address, expected.Length);
+                matches[index] = expected.Slices.AsSpan().SequenceEqual(current.Slices);
+            }
+        }
+        return matches;
+    }
+
+    private static MappingRangeSnapshot CaptureMappingRangeSnapshotLocked(ulong address, ulong length)
+    {
+        var regions = GetMappingSlices(address, length);
+        var slices = new MappingRangeSlice[regions.Length];
+        for (var index = 0; index < regions.Length; index++)
+        {
+            var region = regions[index];
+            slices[index] = new MappingRangeSlice(
+                region.Address,
+                region.Length,
+                region.Protection,
+                region.IsFlexible,
+                region.IsDirect,
+                region.DirectStart,
+                region.BackingOffset,
+                region.IsReserved,
+                region.Identity);
+        }
+        return new MappingRangeSnapshot(address, length, slices);
+    }
+
     private static bool MappingsCoverRange(MappedRegion[] regions, ulong address, ulong size)
     {
         var current = address;
@@ -246,6 +294,9 @@ public static partial class KernelMemoryCompatExports
             if (region.IsFlexible)
                 _flexibleBacking.Release(region.Address, region.Length);
         ReplaceMappedRegionRangeLocked(new MappedRegion(address, size, 0, false, false, 0, IsReserved: true));
+        foreach (var region in regions)
+            if (region.IsDirect)
+                ReclaimUnaliasedAutomaticRangeLocked(region.DirectStart, region.Length);
         return true;
     }
 
@@ -572,6 +623,36 @@ public static partial class KernelMemoryCompatExports
 
     private static bool HasPhysicalSpan(ulong start, ulong length)
         => _directAllocations.ContainsAllocatedRange(start, length);
+
+    private static void ReclaimUnaliasedAutomaticRangeLocked(ulong start, ulong length)
+    {
+        foreach (var automaticRange in _directAllocations.GetAutomaticRanges(start, length))
+        {
+            var automaticEnd = automaticRange.Start + automaticRange.Length;
+            var occupied = _mappedRegions.Values
+                .Where(region => region.IsDirect &&
+                    region.DirectStart < automaticEnd &&
+                    automaticRange.Start < region.DirectStart + region.Length)
+                .Select(region => new DirectMemoryAllocationMap.PhysicalRange(
+                    Math.Max(automaticRange.Start, region.DirectStart),
+                    Math.Min(automaticEnd, region.DirectStart + region.Length) -
+                    Math.Max(automaticRange.Start, region.DirectStart)))
+                .OrderBy(range => range.Start)
+                .ToArray();
+
+            var cursor = automaticRange.Start;
+            foreach (var alias in occupied)
+            {
+                if (alias.Start > cursor)
+                    _directAllocations.ReturnAutomatic(cursor, alias.Start - cursor);
+                cursor = Math.Max(cursor, alias.Start + alias.Length);
+                if (cursor >= automaticEnd)
+                    break;
+            }
+            if (cursor < automaticEnd)
+                _directAllocations.ReturnAutomatic(cursor, automaticEnd - cursor);
+        }
+    }
 
     private static bool TryReleaseDirectMemoryRangeLocked(CpuContext ctx, ulong start, ulong length)
     {

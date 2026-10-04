@@ -23,7 +23,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 {
     public const int CachingPageBits = 14;
     public const ulong CachingPageSize = 1UL << CachingPageBits;
-    public const ulong CachingPageCount = 1UL << (40 - CachingPageBits);
+    public const ulong CachingPageCount = PageOwnerTable.PackedPageCount;
     public const ulong BdaPageTableSize = CachingPageCount * sizeof(ulong);
     public static readonly ResourceSlotIdentifier NullBufferId = new(0, 1);
 
@@ -885,6 +885,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         var sizePages = lastExclusive - first;
+        var tableOffset = PageOwnerTable.PageIndex(buffer.CpuAddress) * sizeof(ulong);
         if (GuestGpuMemoryHook.Traces(buffer.CpuAddress, buffer.Size))
             GuestGpuMemoryHook.Trace(buffer.CpuAddress, buffer.Size,
                 $"device-address-registration insert={insert} buffer={bufferIdentifier} submission_tick={_scheduler.CurrentTick} collection_tick={_retirementPolicy.CurrentTick}");
@@ -897,12 +898,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 addresses[page] = buffer.DeviceAddress + (page << CachingPageBits);
             }
 
-            WriteDataBuffer(_bdaPageTable, first * sizeof(ulong), MemoryMarshal.AsBytes<ulong>(addresses));
+            WriteDataBuffer(_bdaPageTable, tableOffset, MemoryMarshal.AsBytes<ulong>(addresses));
         }
         else
         {
             _registry.BeginRetirement(bufferIdentifier);
-            _bdaPageTable.Fill(first * sizeof(ulong), sizePages * sizeof(ulong), 0);
+            _bdaPageTable.Fill(tableOffset, sizePages * sizeof(ulong), 0);
         }
     }
 

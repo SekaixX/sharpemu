@@ -17,11 +17,9 @@ public static class AudioOut2Exports
     // Clearing 0x80 bytes here overwrote the caller's stack canary immediately
     // following the 0x40-byte parameter block.
     private const int AudioOut2ContextParamSize = 0x40;
-    // Keep these modest. GTA V Enhanced stack-allocates QueryMemory results next
-    // to the frame canary: a 16-byte {size,align} write to [rbp-0x38] plants
-    // align at [rbp-0x30] (observed canary=0x100). Size-only (8 bytes) on stack.
+    // Keep this modest. ContextQueryMemory returns one size_t through its second
+    // argument; it does not return an adjacent alignment field.
     private const int AudioOut2ContextMemorySize = 0x4000;
-    private const int AudioOut2ContextMemoryAlignment = 0x100;
     // Exact object body size. Do not page-align to 64K — the RAGE Main Thread
     // stack-allocates this and a 64K VLA is what planted 0x10000 on the canary.
     private const int SpeakerArrayHeaderSize = 0x40;
@@ -251,8 +249,8 @@ public static class AudioOut2Exports
     public static int AudioOut2ContextQueryMemory(CpuContext ctx)
     {
         var paramAddress = ctx[CpuRegister.Rdi];
-        var memoryInfoAddress = ResolveGuestOutBuffer(ctx[CpuRegister.Rsi], ctx[CpuRegister.Rdx]);
-        if (paramAddress == 0 || memoryInfoAddress == 0)
+        var memorySizeAddress = ctx[CpuRegister.Rsi];
+        if (paramAddress == 0 || memorySizeAddress == 0)
         {
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
@@ -270,31 +268,16 @@ public static class AudioOut2Exports
             contextMemorySize = checked(0x10000UL + (queueDepth * 0x590UL));
         }
 
-        // Heap: {size, alignment} (16 bytes), matching sceAudioPropagationSystemQueryMemory.
-        // Stack: SIZE ONLY as a full ulong (8 bytes). Writing alignment at +8 is how
-        // [rbp-0x30] became 0x100 on GTA V Enhanced. Do NOT shrink this to uint32 —
-        // Main reads the out as a 64-bit size; a 4-byte write leaves a garbage high
-        // dword (observed 0x7<<32|0x4000) and the allocator aborts with int 0x41.
-        if (IsGuestStackAddress(memoryInfoAddress))
-        {
-            Span<byte> sizeOnly = stackalloc byte[sizeof(ulong)];
-            BinaryPrimitives.WriteUInt64LittleEndian(sizeOnly, contextMemorySize);
-            Console.Error.WriteLine(
-                $"[LOADER][TRACE] audio_out2.context-query-memory stack-size-only " +
-                $"out=0x{memoryInfoAddress:X} size=0x{contextMemorySize:X}");
-            return ctx.Memory.TryWrite(memoryInfoAddress, sizeOnly)
-                ? SetReturn(ctx, 0)
-                : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        Span<byte> memoryInfo = stackalloc byte[0x10];
-        memoryInfo.Clear();
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x00..], contextMemorySize);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x08..], AudioOut2ContextMemoryAlignment);
+        // The ABI output is exactly one size_t. Always bound the write to eight
+        // bytes: guest stacks are not confined to the high 0x7FFF... range, and
+        // treating a low-address stack local as a two-field structure overwrites
+        // the caller's adjacent frame data. RDX is not an alternate out pointer.
+        Span<byte> memorySize = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(memorySize, contextMemorySize);
         Console.Error.WriteLine(
-            $"[LOADER][TRACE] audio_out2.context-query-memory out=0x{memoryInfoAddress:X} " +
-            $"size=0x{contextMemorySize:X} align=0x{AudioOut2ContextMemoryAlignment:X}");
-        return ctx.Memory.TryWrite(memoryInfoAddress, memoryInfo)
+            $"[LOADER][TRACE] audio_out2.context-query-memory " +
+            $"out=0x{memorySizeAddress:X} size=0x{contextMemorySize:X}");
+        return ctx.Memory.TryWrite(memorySizeAddress, memorySize)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }

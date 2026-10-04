@@ -862,6 +862,8 @@ public static partial class Gen5SpirvTranslator
 
         private uint LogicalAnd(uint left, uint right) => _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, left, right);
 
+        private uint LogicalOr(uint left, uint right) => _module.AddInstruction(SpirvOp.LogicalOr, _boolType, left, right);
+
         // A signed immediate widened to the address width.
         private uint SignedOffset64(int offset) => ULong(unchecked((ulong)(long)offset));
 
@@ -874,9 +876,23 @@ public static partial class Gen5SpirvTranslator
         private (uint Pointer, uint Valid) ResolveDeviceAddress(uint address64)
         {
             var masked = And64(address64, ULong(DeviceAddressMask));
-            var pageIndex64 = _module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, masked, ULong(DeviceAddressPageBits));
+            var extended = _module.AddInstruction(
+                SpirvOp.UGreaterThanEqual,
+                _boolType,
+                masked,
+                ULong(DeviceAddressPaging.ExtendedAddressBase));
+            var inLowAperture = ULessThan64(masked, ULong(DeviceAddressPaging.LowerAddressSize));
+            var belowExtendedLimit = ULessThan64(masked, ULong(DeviceAddressPaging.ExtendedAddressLimit));
+            var inAperture = LogicalOr(inLowAperture, LogicalAnd(extended, belowExtendedLimit));
+            var packed = _module.AddInstruction(
+                SpirvOp.Select,
+                _ulongType,
+                extended,
+                ISub64(masked, ULong(DeviceAddressPaging.ExtendedAddressBias)),
+                masked);
+            var pageIndex64 = _module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, packed, ULong(DeviceAddressPageBits));
             var tableLength = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _pageTable, 0);
-            var inTable = ULessThan64(pageIndex64, Widen(tableLength));
+            var inTable = LogicalAnd(inAperture, ULessThan64(pageIndex64, Widen(tableLength)));
             var pageIndex = Narrow(pageIndex64);
             Store(_deviceEntryScratch, ULong(0));
             EmitConditional(inTable, () =>
